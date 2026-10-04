@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"sort"
 	"sync"
 )
 
@@ -98,7 +99,14 @@ func (d *SimDisk) Crash() {
 	// Vary how much is lost from one crash to the next: sometimes nothing
 	// unsynced survives, sometimes everything does.
 	keep := []float64{0, 0.5, 0.5, 0.9, 1}[d.rng.Intn(5)]
-	for _, f := range d.files {
+	// In name order, so that a given seed always loses the same writes.
+	names := make([]string, 0, len(d.files))
+	for name := range d.files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		f := d.files[name]
 		for _, w := range f.pending {
 			if d.rng.Float64() >= keep {
 				continue

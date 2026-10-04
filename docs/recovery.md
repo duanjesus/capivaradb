@@ -153,7 +153,9 @@ fails again *during recovery*, up to three times in a row. Then:
   only latitude is the transaction in flight at the moment of the crash,
   which may be on either side.
 
-A full run is about 800 crashes; CI runs it under the race detector.
+A full run is about 800 crashes; CI runs it under the race detector. The
+workload and the disk are both seeded and nothing depends on map order or
+on time, so a failure is reported with its seed and replays exactly.
 
 ### Killing a real process
 
@@ -184,11 +186,23 @@ one way at a time and requires the crash tests to fail each time:
 | Undo steps are not marked as done in the log | yes |
 | Trees dropped by a committed transaction are not freed after a crash | yes |
 
-It earned its keep while it was being written. The first version of the
-crash test passed with the write-ahead rule removed: with a pool of 48
-pages, nothing was ever evicted, so the rule was never exercised. And the
-"undo not marked as done" mutant survived until the workload gained schema
-changes inside transactions. Both gaps would otherwise have gone unnoticed.
+It earned its keep while it was being written, three times:
+
+- The first version of the crash test passed with the write-ahead rule
+  removed. With a pool of 48 pages nothing was ever evicted, so the rule
+  was never exercised. The pool is now twelve pages.
+- The "undo not marked as done" mutant survived until the workload gained
+  schema changes inside transactions.
+- That same mutant then survived on CI while being caught locally. The
+  crash test was not deterministic: the simulated disk, recovery and the
+  consistency checker each iterated over a Go map, so the same seed lost
+  different writes from run to run, and whether the mutant was caught was
+  luck. All three now iterate in a fixed order — a given seed replays
+  exactly — and the case the mutant breaks has a test of its own,
+  `TestStatementRollbackIsNotRepeatedByRecovery`, that does not depend on
+  chance.
+
+None of these would have been noticed by looking at a green test run.
 
 One mutation is deliberately not on the list: making redo ignore page LSNs
 and apply every record. That changes nothing observable, because replaying

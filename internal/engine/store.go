@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
@@ -480,7 +481,10 @@ func (db *DB) Verify() (CheckReport, error) {
 	if _, err := check("the catalog", db.catalog); err != nil {
 		return report, err
 	}
-	for _, t := range db.tables {
+	// In name order: the check reads pages, and which pages are cached
+	// afterwards should not depend on Go's map iteration.
+	for _, name := range db.tableNames() {
+		t := db.tables[name]
 		report.Tables++
 		if _, err := check("table "+t.name, t.tree); err != nil {
 			return report, err
@@ -518,4 +522,15 @@ func (db *DB) Verify() (CheckReport, error) {
 		return report, fmt.Errorf("%d of %d pages are accounted for: the rest are leaked", len(owner), report.Pages)
 	}
 	return report, nil
+}
+
+// tableNames returns the names of all tables, sorted. The caller must hold
+// db.mu.
+func (db *DB) tableNames() []string {
+	names := make([]string, 0, len(db.tables))
+	for name := range db.tables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

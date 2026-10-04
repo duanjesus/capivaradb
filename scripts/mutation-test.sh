@@ -23,7 +23,7 @@ restore() {
 }
 trap restore EXIT
 
-TESTS=(go test -count=1 -run 'TestCrashRecovery|TestCommitted|TestUncommitted|TestTorn|TestLogIs' ./internal/engine ./internal/storage)
+TESTS=(go test -count=1 -run 'TestCrashRecovery|TestStatementRollback|TestCommitted|TestUncommitted|TestTorn|TestLogIs' ./internal/engine ./internal/storage)
 
 echo "baseline: the unmodified code must pass"
 if ! "${TESTS[@]}" >/dev/null 2>&1; then

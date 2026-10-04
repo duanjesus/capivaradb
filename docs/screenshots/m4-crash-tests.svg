@@ -1,30 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="954" height="490" viewBox="0 0 954 490" role="img" aria-label="crash tests">
-<rect width="954" height="490" rx="10" fill="#0d1117"/>
-<path d="M0 10a10 10 0 0 1 10-10h934 a10 10 0 0 1 10 10v24 h-954 z" fill="#161b22"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="946" height="510" viewBox="0 0 946 510" role="img" aria-label="crash tests">
+<rect width="946" height="510" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h926 a10 10 0 0 1 10 10v24 h-946 z" fill="#161b22"/>
 <circle cx="20" cy="17" r="6" fill="#ff5f56"/>
 <circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
 <circle cx="60" cy="17" r="6" fill="#27c93f"/>
-<text x="477" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">crash tests</text>
+<text x="473" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">crash tests</text>
 <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
-<text x="18" y="66" fill="#7ee787">$ go test ./internal/engine -v -run &#34;TestCrashRecovery|TestKillProcess&#34;</text>
-<text x="18" y="86" fill="#e6edf3">    825 crashes survived (33279 units of work committed between them): 44167 page changes replayed, 1062</text>
-<text x="18" y="106" fill="#e6edf3">pages rebuilt from log images, 954 changes undone, 362 interrupted commits completed, 0 meta pages rebuilt</text>
+<text x="18" y="66" fill="#7ee787">$ go test ./internal/engine -v -run &#34;TestCrashRecovery|TestKillProcess|TestStatementRollback&#34;</text>
+<text x="18" y="86" fill="#e6edf3">    811 crashes survived (33385 units of work committed between them): 46164 page changes replayed, 1071</text>
+<text x="18" y="106" fill="#e6edf3">pages rebuilt from log images, 975 changes undone, 383 interrupted commits completed, 0 meta pages rebuilt</text>
 <text x="18" y="126" fill="#7ee787">--- PASS: TestCrashRecovery</text>
-<text x="18" y="146" fill="#e6edf3">    12 kills survived; 1167 transactions committed in all, none lost; recovery replayed 1280 page changes and</text>
-<text x="18" y="166" fill="#e6edf3">rolled back 3 unfinished transactions</text>
-<text x="18" y="186" fill="#7ee787">--- PASS: TestKillProcess</text>
-<text x="18" y="206" fill="#7ee787">PASS</text>
-<text x="18" y="226" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/engine</text>
-<text x="18" y="266" fill="#7ee787">$ go test ./internal/storage -v -run &#34;Committed|Uncommitted|Torn|LogIs|Broken&#34;</text>
-<text x="18" y="286" fill="#7ee787">--- PASS: TestCommittedSurvivesUncommittedVanishes</text>
-<text x="18" y="306" fill="#7ee787">--- PASS: TestUncommittedTreeIsFreed</text>
-<text x="18" y="326" fill="#7ee787">--- PASS: TestCommittedDropIsFinished</text>
-<text x="18" y="346" fill="#7ee787">--- PASS: TestTornLogTailIsIgnored</text>
-<text x="18" y="366" fill="#7ee787">--- PASS: TestTornPageIsRebuiltFromTheLog</text>
-<text x="18" y="386" fill="#7ee787">--- PASS: TestTornMetaPageIsRebuiltFromTheLog</text>
-<text x="18" y="406" fill="#7ee787">--- PASS: TestLogIsDiscardedOnlyWhenNoTransactionIsOpen</text>
-<text x="18" y="426" fill="#7ee787">--- PASS: TestBrokenAfterFailedWrite</text>
-<text x="18" y="446" fill="#7ee787">PASS</text>
-<text x="18" y="466" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/storage</text>
+<text x="18" y="146" fill="#7ee787">--- PASS: TestStatementRollbackIsNotRepeatedByRecovery</text>
+<text x="18" y="166" fill="#e6edf3">    12 kills survived; 665 transactions committed in all, none lost; recovery replayed 1397 page changes and</text>
+<text x="18" y="186" fill="#e6edf3">rolled back 3 unfinished transactions</text>
+<text x="18" y="206" fill="#7ee787">--- PASS: TestKillProcess</text>
+<text x="18" y="226" fill="#7ee787">PASS</text>
+<text x="18" y="246" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/engine</text>
+<text x="18" y="286" fill="#7ee787">$ go test ./internal/storage -v -run &#34;Committed|Uncommitted|Torn|LogIs|Broken&#34;</text>
+<text x="18" y="306" fill="#7ee787">--- PASS: TestCommittedSurvivesUncommittedVanishes</text>
+<text x="18" y="326" fill="#7ee787">--- PASS: TestUncommittedTreeIsFreed</text>
+<text x="18" y="346" fill="#7ee787">--- PASS: TestCommittedDropIsFinished</text>
+<text x="18" y="366" fill="#7ee787">--- PASS: TestTornLogTailIsIgnored</text>
+<text x="18" y="386" fill="#7ee787">--- PASS: TestTornPageIsRebuiltFromTheLog</text>
+<text x="18" y="406" fill="#7ee787">--- PASS: TestTornMetaPageIsRebuiltFromTheLog</text>
+<text x="18" y="426" fill="#7ee787">--- PASS: TestLogIsDiscardedOnlyWhenNoTransactionIsOpen</text>
+<text x="18" y="446" fill="#7ee787">--- PASS: TestBrokenAfterFailedWrite</text>
+<text x="18" y="466" fill="#7ee787">PASS</text>
+<text x="18" y="486" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/storage</text>
 </g>
 </svg>

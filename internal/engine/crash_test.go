@@ -511,7 +511,8 @@ func copyDatabase(t *testing.T, src, dst *DB) {
 	}
 	src.mu.RLock()
 	defer src.mu.RUnlock()
-	for _, tbl := range src.tables {
+	for _, name := range src.tableNames() {
+		tbl := src.tables[name]
 		var cols []string
 		for _, c := range tbl.cols {
 			def := fmt.Sprintf("%s %s", c.name, c.typ)
@@ -566,4 +567,67 @@ func TestCrashRecovery(t *testing.T) {
 		seeds = 10
 	}
 	testCrashes(t, seeds, rounds)
+}
+
+// TestStatementRollbackIsNotRepeatedByRecovery pins down the case that makes
+// "this undo has been carried out" worth writing in the log.
+//
+// A statement fails after allocating a tree, and is rolled back on the
+// spot: the tree's page is freed. The transaction stays open. Another
+// session then commits work that reuses the freed page. If the server now
+// crashes, the open transaction is a loser and recovery walks its undo
+// records — including "free the tree created by that statement". Were it
+// not marked as already done, recovery would free a page that by now
+// belongs to someone else's committed table.
+func TestStatementRollbackIsNotRepeatedByRecovery(t *testing.T) {
+	disk := storage.NewSimDisk(1)
+	open := func() *DB {
+		db, err := OpenFiles(disk.Open("data"), disk.Open("wal"), Options{PoolPages: 64})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	db := open()
+	a, _ := db.NewSession(map[string]string{"user": "a"})
+	b, _ := db.NewSession(map[string]string{"user": "b"})
+	run := func(sess pgwire.Session, q string) {
+		t.Helper()
+		if err := execSQL(sess, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+
+	// The name the second CREATE TABLE's unique index would need is taken,
+	// which is only discovered after the table's own tree was allocated.
+	run(a, "create table t_v_key (x int)")
+	run(a, "begin")
+	run(a, "insert into t_v_key values (1)")
+	if err := execSQL(a, "create table t (k int primary key, v text unique)"); code(err) != pgerr.DuplicateTable {
+		t.Fatalf("expected the statement to fail on the index name, got %v", err)
+	}
+
+	// Another session's committed work takes over the freed page and more.
+	run(b, "create table keep (id int primary key, payload text)")
+	for i := 0; i < 400; i++ {
+		run(b, fmt.Sprintf("insert into keep values (%d, '%s')", i, strings.Repeat("x", 200)))
+	}
+	want := dump(t, db)
+
+	// Power failure with session a's transaction still open. Everything
+	// session b did was committed, hence synced.
+	disk.Crash()
+	db = open()
+	if info := db.Recovery(); info.RolledBack != 1 {
+		t.Errorf("recovery: %+v", info)
+	}
+	if _, err := db.Verify(); err != nil {
+		t.Fatalf("after recovery: %v", err)
+	}
+	// Session a's insert is gone, session b's table is intact.
+	got := dump(t, db)
+	want = strings.Replace(want, "  [1]\n", "", 1)
+	if got != want {
+		t.Errorf("after recovery:\n%s\nwant:\n%s", got, want)
+	}
 }

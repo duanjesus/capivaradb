@@ -98,8 +98,8 @@ m4)
 
   # The crash tests, with what they report.
   {
-    echo '$ go test ./internal/engine -v -run "TestCrashRecovery|TestKillProcess"'
-    go test -count=1 ./internal/engine -v -run 'TestCrashRecovery|TestKillProcess' 2>&1 |
+    echo '$ go test ./internal/engine -v -run "TestCrashRecovery|TestKillProcess|TestStatementRollback"'
+    go test -count=1 ./internal/engine -v -run 'TestCrashRecovery|TestKillProcess|TestStatementRollback' 2>&1 |
       grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +[a-z_]+_test.go:[0-9]+: /    /' | fold -s -w 110
     echo
     echo '$ go test ./internal/storage -v -run "Committed|Uncommitted|Torn|LogIs|Broken"'

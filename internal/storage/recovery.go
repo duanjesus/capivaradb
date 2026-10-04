@@ -266,8 +266,16 @@ func (p *Pager) recover(recs []walRecord, metaOK bool) error {
 	// Undo: reverse what unfinished transactions did, newest change first
 	// across all of them, skipping what was already reversed before the
 	// crash.
+	// In ID order, so that recovery writes the same log every time.
+	ids := make([]uint64, 0, len(txs))
+	for tx := range txs {
+		ids = append(ids, tx)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
 	var pending []undoItem
-	for tx, st := range txs {
+	for _, tx := range ids {
+		st := txs[tx]
 		if st.ended {
 			continue
 		}
@@ -292,7 +300,8 @@ func (p *Pager) recover(recs []walRecord, metaOK bool) error {
 
 	// Finish committed transactions that were interrupted while freeing
 	// the trees they dropped, then close every transaction.
-	for tx, st := range txs {
+	for _, tx := range ids {
+		st := txs[tx]
 		if st.ended {
 			continue
 		}

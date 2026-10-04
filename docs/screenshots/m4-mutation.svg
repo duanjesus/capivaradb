@@ -24,9 +24,9 @@
 <text x="18" y="366" fill="#e6edf3">mutant: a checkpoint discards the log while a transaction is still open</text>
 <text x="18" y="386" fill="#e6edf3">  killed</text>
 <text x="18" y="406" fill="#e6edf3">mutant: undo steps are not marked as done in the log</text>
-<text x="18" y="426" fill="#e6edf3">  SURVIVED: the tests did not notice</text>
+<text x="18" y="426" fill="#e6edf3">  killed</text>
 <text x="18" y="446" fill="#e6edf3">mutant: trees dropped by a committed transaction are not freed after a crash</text>
 <text x="18" y="466" fill="#e6edf3">  killed</text>
-<text x="18" y="506" fill="#e6edf3">1 mutant(s) survived</text>
+<text x="18" y="506" fill="#e6edf3">every mutant was killed</text>
 </g>
 </svg>
