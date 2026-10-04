@@ -17,10 +17,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          cache-dependency-path: compat/pgx/go.sum
 
       - name: The core must not have dependencies
         shell: bash
@@ -52,11 +53,12 @@ jobs:
     name: psql and JDBC
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - uses: actions/setup-java@v4
+          cache-dependency-path: compat/pgx/go.sum
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
