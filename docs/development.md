@@ -15,9 +15,12 @@
 | Core tests with the race detector | `go test -race ./...` (needs a C compiler) |
 | pgx driver tests | `cd compat/pgx && go test ./...` |
 | JDBC smoke test | `bash scripts/jdbc-smoke.sh` |
-| psql smoke test | `bash scripts/psql-smoke.sh` |
+| psql smoke tests | `bash scripts/psql-smoke.sh` |
+| sqllogictest | `bash scripts/slt.sh` (add `-v 20` to see failing records) |
+| Accept new sqllogictest counts | `bash scripts/slt.sh --update` (also rewrites `docs/sqllogictest.md`) |
+| Fuzz the parser | `go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m` |
 | Accept new psql output | `bash scripts/psql-smoke.sh --update` |
-| Regenerate screenshots | `bash scripts/screenshots.sh m1` |
+| Regenerate screenshots | `bash scripts/screenshots.sh m2` |
 | Format check | `gofmt -l .` (must print nothing) |
 
 The scripts are bash and run unchanged on Linux and under Git Bash on
@@ -61,3 +64,19 @@ the project stays visible.
   `postgres:17-alpine` image and reaches the server through
   `host.docker.internal`, so for that test only the server listens on all
   interfaces. Windows may show a firewall prompt the first time.
+
+## Adding SQL
+
+A new construct usually touches four places, in this order:
+
+1. `internal/sql/ast.go` and `parser.go` — the node and its grammar.
+2. `internal/sql/format.go` — how it prints. Add a line to the corpus in
+   `parser_test.go` with its canonical form; the round-trip test and the
+   fuzzer then cover it automatically.
+3. `internal/engine/bind.go` — name resolution and typing.
+4. A table-driven case in `internal/engine/query_test.go`, error cases
+   included, and `bash scripts/slt.sh` to see that nothing regressed.
+
+A crasher found by the fuzzer is saved under
+`internal/sql/testdata/fuzz/FuzzParse/`; commit it with the fix so that it
+runs as a regression test from then on.

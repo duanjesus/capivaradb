@@ -10,19 +10,28 @@ Startup, simple query, extended query, cancellation, text and binary
 formats. Acceptance: psql, pgx and pgjdbc connect and run queries, checked
 by automated tests. See [wire-protocol.md](wire-protocol.md).
 
-## 2. SQL parser
+## 2. SQL parser and binder — done
 
-Grow the hand-written parser to the SQL the later milestones need:
+The hand-written parser now covers `SELECT` with `INNER`/`LEFT`/`CROSS`
+joins, subqueries in `FROM` and in expressions, `GROUP BY`, `HAVING`,
+`DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`; `CASE`, `IN`, `BETWEEN`, `LIKE`,
+aggregates; `CREATE INDEX`, table-level constraints, `DEFAULT`;
+`INSERT ... SELECT`; transaction statements with isolation levels.
 
-- `SELECT` with joins (`INNER`, `LEFT`, `CROSS`), `GROUP BY`, `HAVING`,
-  `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`, subqueries in `FROM`
-- Aggregates, `CASE`, `IN`, `BETWEEN`, `LIKE`
-- `CREATE INDEX`, table-level constraints, `DEFAULT`
-- Transaction statements with isolation levels
+So that the SQL could be checked by running it, the in-memory engine learned
+to execute all of it, in the simplest way that is correct.
 
-Acceptance: a parser test corpus, a round-trip property (parse → print →
-parse gives the same tree), and fuzzing with `go test -fuzz` that never
-panics.
+Acceptance, all automated:
+
+- a parser corpus pinned to canonical forms, and the round-trip property
+  (parse → print → parse gives the same tree);
+- a fuzzer that checks "never panics" and the round trip on arbitrary input;
+- 104 121 sqllogictest records at 99.99%, with a baseline CI enforces
+  ([sqllogictest.md](sqllogictest.md));
+- psql transcripts and pgx tests for the new queries.
+
+Left for later milestones: `UNION`/`INTERSECT`/`EXCEPT`, `RIGHT`/`FULL`
+joins and `USING` (milestone 7), `EXPLAIN` (milestone 6).
 
 ## 3. Storage engine
 
@@ -72,11 +81,12 @@ the chosen plan beating the alternative.
 
 - Volcano iterators behind the existing `Rows` interface
 - Hash join, merge join, hash aggregation, external merge sort
+- Set operations (`UNION`, `INTERSECT`, `EXCEPT`), `RIGHT`/`FULL` joins
 - Vectorised execution if time allows
 
 ## Throughout
 
-- **sqllogictest**: a runner for a subset of SQLite's sqllogictest corpus,
+- **sqllogictest**: `tools/slt` runs a slice of SQLite's sqllogictest corpus,
   with the pass rate published in the README and tracked per milestone.
 - **Benchmarks**: reproducible scripts, results reported with the hardware
   and commit they were measured on.

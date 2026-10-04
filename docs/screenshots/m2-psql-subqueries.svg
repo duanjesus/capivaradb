@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="828" height="1210" viewBox="0 0 828 1210" role="img" aria-label="psql: subqueries, CASE, DISTINCT, LIMIT">
+<rect width="828" height="1210" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h808 a10 10 0 0 1 10 10v24 h-828 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="414" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">psql: subqueries, CASE, DISTINCT, LIMIT</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">-- Subqueries: scalar, correlated, EXISTS, IN.</text>
+<text x="18" y="86" fill="#e6edf3">select name, salary from emp where salary = (select max(salary) from emp);</text>
+<text x="18" y="106" fill="#e6edf3"> name | salary</text>
+<text x="18" y="126" fill="#8b949e">------+--------</text>
+<text x="18" y="146" fill="#e6edf3"> Ana  |    100</text>
+<text x="18" y="166" fill="#e6edf3">(1 row)</text>
+<text x="18" y="206" fill="#e6edf3">select name from emp e where salary &gt; (select avg(salary) from emp where dept_id = e.dept_id);</text>
+<text x="18" y="226" fill="#e6edf3"> name</text>
+<text x="18" y="246" fill="#8b949e">------</text>
+<text x="18" y="266" fill="#e6edf3"> Ana</text>
+<text x="18" y="286" fill="#e6edf3"> Bia</text>
+<text x="18" y="306" fill="#e6edf3">(2 rows)</text>
+<text x="18" y="346" fill="#e6edf3">select name from dept d where not exists (select 1 from emp e where e.dept_id = d.id);</text>
+<text x="18" y="366" fill="#e6edf3"> name</text>
+<text x="18" y="386" fill="#8b949e">-------</text>
+<text x="18" y="406" fill="#e6edf3"> vazio</text>
+<text x="18" y="426" fill="#e6edf3">(1 row)</text>
+<text x="18" y="466" fill="#e6edf3">select s.dept_id, s.total</text>
+<text x="18" y="486" fill="#e6edf3">from (select dept_id, sum(salary) as total from emp group by dept_id) s</text>
+<text x="18" y="506" fill="#e6edf3">where s.total &gt; 150;</text>
+<text x="18" y="526" fill="#e6edf3"> dept_id | total</text>
+<text x="18" y="546" fill="#8b949e">---------+-------</text>
+<text x="18" y="566" fill="#e6edf3">       1 |   230</text>
+<text x="18" y="586" fill="#e6edf3">(1 row)</text>
+<text x="18" y="626" fill="#8b949e">-- CASE, IN, BETWEEN, LIKE, DISTINCT, LIMIT.</text>
+<text x="18" y="646" fill="#e6edf3">select name,</text>
+<text x="18" y="666" fill="#e6edf3">       case when salary &gt;= 100 then &#39;alto&#39; when salary &gt;= 70 then &#39;médio&#39;</text>
+<text x="18" y="686" fill="#e6edf3">            when salary is null then &#39;?&#39; else &#39;baixo&#39; end as faixa</text>
+<text x="18" y="706" fill="#e6edf3">from emp</text>
+<text x="18" y="726" fill="#e6edf3">order by salary desc nulls last, name</text>
+<text x="18" y="746" fill="#e6edf3">limit 4;</text>
+<text x="18" y="766" fill="#e6edf3"> name | faixa</text>
+<text x="18" y="786" fill="#8b949e">------+-------</text>
+<text x="18" y="806" fill="#e6edf3"> Ana  | alto</text>
+<text x="18" y="826" fill="#e6edf3"> Bia  | médio</text>
+<text x="18" y="846" fill="#e6edf3"> Caio | baixo</text>
+<text x="18" y="866" fill="#e6edf3"> Duda | baixo</text>
+<text x="18" y="886" fill="#e6edf3">(4 rows)</text>
+<text x="18" y="926" fill="#e6edf3">select distinct salary from emp where salary between 50 and 90 order by salary;</text>
+<text x="18" y="946" fill="#e6edf3"> salary</text>
+<text x="18" y="966" fill="#8b949e">--------</text>
+<text x="18" y="986" fill="#e6edf3">     50</text>
+<text x="18" y="1006" fill="#e6edf3">     60</text>
+<text x="18" y="1026" fill="#e6edf3">     80</text>
+<text x="18" y="1046" fill="#e6edf3">(3 rows)</text>
+<text x="18" y="1086" fill="#e6edf3">select name from emp where name like &#39;%a&#39; and dept_id in (1, 2) order by name offset 1;</text>
+<text x="18" y="1106" fill="#e6edf3"> name</text>
+<text x="18" y="1126" fill="#8b949e">------</text>
+<text x="18" y="1146" fill="#e6edf3"> Bia</text>
+<text x="18" y="1166" fill="#e6edf3"> Duda</text>
+<text x="18" y="1186" fill="#e6edf3">(2 rows)</text>
+</g>
+</svg>

@@ -38,28 +38,53 @@ func Parse(src string) ([]*Stmt, error) {
 	}
 }
 
+// maxDepth bounds the nesting of expressions and subqueries. The parser is
+// recursive, so without a limit a query made of a hundred thousand opening
+// parentheses would overflow the stack, which in Go kills the whole process.
+const maxDepth = 250
+
 type parser struct {
 	toks     []Token
 	i        int
 	maxParam int
+	depth    int
 }
 
 // reserved lists the keywords that cannot be used as a bare identifier or as
 // an alias without AS. It is what lets "SELECT a FROM t" stop reading the
-// select item at FROM instead of treating FROM as an alias.
+// select item at FROM instead of treating FROM as an alias. The list follows
+// PostgreSQL's reserved and type_func_name keywords, limited to the ones this
+// grammar knows.
 var reserved = map[string]bool{
-	"select": true, "from": true, "where": true, "and": true, "or": true,
-	"not": true, "null": true, "true": true, "false": true, "is": true,
-	"as": true, "into": true, "create": true, "table": true, "primary": true,
-	"group": true, "order": true, "limit": true, "offset": true, "join": true,
-	"on": true, "inner": true, "left": true, "right": true, "having": true,
-	"union": true, "distinct": true, "default": true,
+	"all": true, "and": true, "as": true, "asc": true, "case": true,
+	"cast": true, "create": true, "cross": true, "default": true,
+	"desc": true, "distinct": true, "else": true, "end": true,
+	"except": true, "exists": true, "false": true, "from": true,
+	"full": true, "group": true, "having": true, "ilike": true,
+	"in": true, "inner": true, "intersect": true, "into": true,
+	"is": true, "join": true, "left": true, "like": true, "limit": true,
+	"natural": true, "not": true, "null": true, "offset": true, "on": true,
+	"or": true, "order": true, "outer": true, "primary": true,
+	"right": true, "select": true, "table": true, "then": true,
+	"true": true, "union": true, "unique": true, "using": true,
+	"when": true, "where": true,
 	// Not reserved in PostgreSQL, but reserving it is the simplest way to
 	// keep "UPDATE t SET ..." from reading SET as an alias for t.
 	"set": true,
 }
 
+// IsReserved reports whether word cannot be used as a bare identifier.
+func IsReserved(word string) bool { return reserved[word] }
+
 func (p *parser) peek() Token { return p.toks[p.i] }
+
+// peekAt looks n tokens ahead; past the end it returns the EOF token.
+func (p *parser) peekAt(n int) Token {
+	if p.i+n >= len(p.toks) {
+		return p.toks[len(p.toks)-1]
+	}
+	return p.toks[p.i+n]
+}
 
 func (p *parser) next() Token {
 	t := p.toks[p.i]
@@ -119,13 +144,68 @@ func (p *parser) syntaxError() error {
 	return pgerr.New(pgerr.SyntaxError, "syntax error at or near %q", t.Raw).At(t.Pos)
 }
 
-func (p *parser) ident() (Ident, error) {
+func (p *parser) unsupported(what string, pos int) error {
+	return pgerr.New(pgerr.FeatureNotSupported, "%s is not supported", what).At(pos)
+}
+
+// enter and leave bracket every recursive production.
+func (p *parser) enter() error {
+	p.depth++
+	if p.depth > maxDepth {
+		return pgerr.New(pgerr.StatementTooComplex, "statement is nested too deeply").At(p.peek().Pos)
+	}
+	return nil
+}
+
+func (p *parser) leave() { p.depth-- }
+
+func (p *parser) isIdent() bool {
 	t := p.peek()
-	if t.Kind == TQuotedIdent || (t.Kind == TIdent && !reserved[t.Text]) {
-		p.i++
+	return t.Kind == TQuotedIdent || (t.Kind == TIdent && !reserved[t.Text])
+}
+
+func (p *parser) ident() (Ident, error) {
+	if p.isIdent() {
+		t := p.next()
 		return Ident{Name: t.Text, Pos: t.Pos}, nil
 	}
 	return Ident{}, p.syntaxError()
+}
+
+// identList parses "( a, b, c )".
+func (p *parser) identList() ([]Ident, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var ids []Ident
+	for {
+		id, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return ids, p.expectOp(")")
+}
+
+// optAlias parses "[AS] alias". After AS any word is an alias, even a
+// reserved one; without AS a reserved word ends the item instead.
+func (p *parser) optAlias() (string, error) {
+	if p.acceptKw("as") {
+		t := p.peek()
+		if t.Kind != TIdent && t.Kind != TQuotedIdent {
+			return "", p.syntaxError()
+		}
+		p.i++
+		return t.Text, nil
+	}
+	if p.isIdent() {
+		return p.next().Text, nil
+	}
+	return "", nil
 }
 
 func (p *parser) statement() (Node, error) {
@@ -143,19 +223,19 @@ func (p *parser) statement() (Node, error) {
 	case "delete":
 		return p.deleteStmt()
 	case "create":
-		return p.createTable()
+		return p.createStmt()
 	case "drop":
-		return p.dropTable()
+		return p.dropStmt()
 	case "begin":
 		p.i++
 		p.txnNoise()
-		return &Begin{}, nil
+		return p.beginOptions()
 	case "start":
 		p.i++
 		if err := p.expectKw("transaction"); err != nil {
 			return nil, err
 		}
-		return &Begin{}, nil
+		return p.beginOptions()
 	case "commit", "end":
 		p.i++
 		p.txnNoise()
@@ -179,49 +259,290 @@ func (p *parser) txnNoise() {
 	}
 }
 
-func (p *parser) selectStmt() (Node, error) {
-	p.i++ // select
-	s := &Select{}
+// beginOptions parses the transaction modes that may follow BEGIN.
+func (p *parser) beginOptions() (Node, error) {
+	b := &Begin{}
 	for {
-		if p.acceptOp("*") {
-			s.Items = append(s.Items, SelectItem{Star: true})
-		} else {
-			e, err := p.expr(0)
+		switch {
+		case p.acceptKw("isolation"):
+			level, err := p.isolationLevel()
 			if err != nil {
 				return nil, err
 			}
-			item := SelectItem{Expr: e}
-			if p.acceptKw("as") {
-				// After AS any word is an alias, even a reserved one.
-				t := p.peek()
-				if t.Kind != TIdent && t.Kind != TQuotedIdent {
-					return nil, p.syntaxError()
-				}
-				p.i++
-				item.Alias = t.Text
-			} else if t := p.peek(); t.Kind == TQuotedIdent || (t.Kind == TIdent && !reserved[t.Text]) {
-				p.i++
-				item.Alias = t.Text
+			b.Isolation = level
+		case p.acceptKw("read"):
+			if !p.acceptKw("write") && !p.acceptKw("only") {
+				return nil, p.syntaxError()
 			}
-			s.Items = append(s.Items, item)
+		default:
+			return b, nil
 		}
+		p.acceptOp(",")
+	}
+}
+
+// isolationLevel parses "LEVEL <name>", ISOLATION having been consumed.
+func (p *parser) isolationLevel() (string, error) {
+	if err := p.expectKw("level"); err != nil {
+		return "", err
+	}
+	switch {
+	case p.acceptKw("serializable"):
+		return "serializable", nil
+	case p.acceptKw("repeatable"):
+		return "repeatable read", p.expectKw("read")
+	case p.acceptKw("read"):
+		if p.acceptKw("committed") {
+			return "read committed", nil
+		}
+		return "read uncommitted", p.expectKw("uncommitted")
+	}
+	return "", p.syntaxError()
+}
+
+// ---- SELECT ----
+
+func (p *parser) selectStmt() (*Select, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+
+	p.i++ // select
+	s := &Select{}
+	if p.acceptKw("distinct") {
+		s.Distinct = true
+	} else {
+		p.acceptKw("all")
+	}
+	for {
+		item, err := p.selectItem()
+		if err != nil {
+			return nil, err
+		}
+		s.Items = append(s.Items, item)
 		if !p.acceptOp(",") {
 			break
 		}
 	}
 	if p.acceptKw("from") {
+		from, err := p.fromList()
+		if err != nil {
+			return nil, err
+		}
+		s.From = from
+	}
+	var err error
+	if s.Where, err = p.optWhere(); err != nil {
+		return nil, err
+	}
+	if p.acceptKw("group") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		if s.GroupBy, err = p.exprList(); err != nil {
+			return nil, err
+		}
+	}
+	if p.acceptKw("having") {
+		if s.Having, err = p.expr(0); err != nil {
+			return nil, err
+		}
+	}
+	if p.acceptKw("order") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		for {
+			item, err := p.orderItem()
+			if err != nil {
+				return nil, err
+			}
+			s.OrderBy = append(s.OrderBy, item)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	// PostgreSQL accepts LIMIT and OFFSET in either order.
+	for {
+		switch {
+		case s.Limit == nil && p.acceptKw("limit"):
+			if p.acceptKw("all") {
+				continue
+			}
+			if s.Limit, err = p.expr(0); err != nil {
+				return nil, err
+			}
+		case s.Offset == nil && p.acceptKw("offset"):
+			if s.Offset, err = p.expr(0); err != nil {
+				return nil, err
+			}
+			if !p.acceptKw("rows") {
+				p.acceptKw("row")
+			}
+		default:
+			if t := p.peek(); t.Kind == TIdent && (t.Text == "union" || t.Text == "intersect" || t.Text == "except") {
+				return nil, p.unsupported(strings.ToUpper(t.Text), t.Pos)
+			}
+			return s, nil
+		}
+	}
+}
+
+func (p *parser) selectItem() (SelectItem, error) {
+	t := p.peek()
+	if p.acceptOp("*") {
+		return SelectItem{Star: true, Pos: t.Pos}, nil
+	}
+	// "t.*"
+	if p.isIdent() {
+		if dot, star := p.peekAt(1), p.peekAt(2); dot.Kind == TOp && dot.Text == "." && star.Kind == TOp && star.Text == "*" {
+			p.i += 3
+			return SelectItem{Star: true, Table: t.Text, Pos: t.Pos}, nil
+		}
+	}
+	e, err := p.expr(0)
+	if err != nil {
+		return SelectItem{}, err
+	}
+	alias, err := p.optAlias()
+	if err != nil {
+		return SelectItem{}, err
+	}
+	return SelectItem{Expr: e, Alias: alias, Pos: t.Pos}, nil
+}
+
+func (p *parser) orderItem() (OrderItem, error) {
+	e, err := p.expr(0)
+	if err != nil {
+		return OrderItem{}, err
+	}
+	item := OrderItem{Expr: e}
+	if p.acceptKw("desc") {
+		item.Desc = true
+	} else {
+		p.acceptKw("asc")
+	}
+	if p.acceptKw("nulls") {
+		first := p.acceptKw("first")
+		if !first {
+			if err := p.expectKw("last"); err != nil {
+				return OrderItem{}, err
+			}
+		}
+		item.NullsFirst = &first
+	}
+	return item, nil
+}
+
+// fromList parses the comma-separated FROM list. "a, b" is a cross join.
+func (p *parser) fromList() (TableExpr, error) {
+	left, err := p.joinedTable()
+	if err != nil {
+		return nil, err
+	}
+	for p.isOp(",") {
+		pos := p.next().Pos
+		right, err := p.joinedTable()
+		if err != nil {
+			return nil, err
+		}
+		left = &Join{Kind: CrossJoin, Left: left, Right: right, Pos: pos}
+	}
+	return left, nil
+}
+
+// joinedTable parses a table followed by any number of joins, which
+// associate to the left: a JOIN b JOIN c is (a JOIN b) JOIN c.
+func (p *parser) joinedTable() (TableExpr, error) {
+	left, err := p.tablePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		t := p.peek()
+		kind := InnerJoin
+		switch {
+		case p.acceptKw("join"):
+		case p.acceptKw("inner"):
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+		case p.acceptKw("left"):
+			p.acceptKw("outer")
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+			kind = LeftJoin
+		case p.acceptKw("cross"):
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+			kind = CrossJoin
+		case p.isKw("right"), p.isKw("full"), p.isKw("natural"):
+			return nil, p.unsupported(strings.ToUpper(t.Text)+" JOIN", t.Pos)
+		default:
+			return left, nil
+		}
+		right, err := p.tablePrimary()
+		if err != nil {
+			return nil, err
+		}
+		join := &Join{Kind: kind, Left: left, Right: right, Pos: t.Pos}
+		if kind != CrossJoin {
+			if p.isKw("using") {
+				return nil, p.unsupported("JOIN ... USING", p.peek().Pos)
+			}
+			if err := p.expectKw("on"); err != nil {
+				return nil, err
+			}
+			if join.On, err = p.expr(0); err != nil {
+				return nil, err
+			}
+		}
+		left = join
+	}
+}
+
+// tablePrimary parses a table name, a subquery with its alias, or a
+// parenthesised join.
+func (p *parser) tablePrimary() (TableExpr, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+
+	t := p.peek()
+	if !p.acceptOp("(") {
 		ref, err := p.tableRef(true)
 		if err != nil {
 			return nil, err
 		}
-		s.From = &ref
+		return &ref, nil
 	}
-	where, err := p.optWhere()
+	if p.isKw("select") {
+		sel, err := p.selectStmt()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		alias, err := p.optAlias()
+		if err != nil {
+			return nil, err
+		}
+		if alias == "" {
+			return nil, pgerr.New(pgerr.SyntaxError, "subquery in FROM must have an alias").At(t.Pos)
+		}
+		return &DerivedTable{Select: sel, Alias: alias, Pos: t.Pos}, nil
+	}
+	inner, err := p.fromList()
 	if err != nil {
 		return nil, err
 	}
-	s.Where = where
-	return s, nil
+	return inner, p.expectOp(")")
 }
 
 func (p *parser) tableRef(allowAlias bool) (TableRef, error) {
@@ -233,15 +554,12 @@ func (p *parser) tableRef(allowAlias bool) (TableRef, error) {
 	if !allowAlias {
 		return ref, nil
 	}
-	if p.acceptKw("as") {
-		a, err := p.ident()
-		if err != nil {
-			return TableRef{}, err
-		}
-		ref.Alias = a.Name
-	} else if t := p.peek(); t.Kind == TQuotedIdent || (t.Kind == TIdent && !reserved[t.Text]) {
-		p.i++
-		ref.Alias = t.Text
+	alias, err := p.optAlias()
+	if err != nil {
+		return TableRef{}, err
+	}
+	if alias != "" {
+		ref.Alias = alias
 	}
 	return ref, nil
 }
@@ -253,6 +571,22 @@ func (p *parser) optWhere() (Expr, error) {
 	return p.expr(0)
 }
 
+func (p *parser) exprList() ([]Expr, error) {
+	var list []Expr
+	for {
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, e)
+		if !p.acceptOp(",") {
+			return list, nil
+		}
+	}
+}
+
+// ---- data modification ----
+
 func (p *parser) insertStmt() (Node, error) {
 	p.i++ // insert
 	if err := p.expectKw("into"); err != nil {
@@ -263,20 +597,17 @@ func (p *parser) insertStmt() (Node, error) {
 		return nil, err
 	}
 	ins := &Insert{Table: ref}
-	if p.acceptOp("(") {
-		for {
-			id, err := p.ident()
-			if err != nil {
-				return nil, err
-			}
-			ins.Cols = append(ins.Cols, id)
-			if !p.acceptOp(",") {
-				break
-			}
-		}
-		if err := p.expectOp(")"); err != nil {
+	// "(" here starts a column list unless it starts a parenthesised SELECT.
+	if p.isOp("(") && !(p.peekAt(1).Kind == TIdent && p.peekAt(1).Text == "select") {
+		if ins.Cols, err = p.identList(); err != nil {
 			return nil, err
 		}
+	}
+	if p.isKw("select") {
+		if ins.Select, err = p.selectStmt(); err != nil {
+			return nil, err
+		}
+		return ins, nil
 	}
 	if err := p.expectKw("values"); err != nil {
 		return nil, err
@@ -288,11 +619,15 @@ func (p *parser) insertStmt() (Node, error) {
 		}
 		var row []Expr
 		for {
-			e, err := p.expr(0)
-			if err != nil {
-				return nil, err
+			if t := p.peek(); p.acceptKw("default") {
+				row = append(row, &DefaultValue{Pos: t.Pos})
+			} else {
+				e, err := p.expr(0)
+				if err != nil {
+					return nil, err
+				}
+				row = append(row, e)
 			}
-			row = append(row, e)
 			if !p.acceptOp(",") {
 				break
 			}
@@ -327,8 +662,10 @@ func (p *parser) updateStmt() (Node, error) {
 		if err := p.expectOp("="); err != nil {
 			return nil, err
 		}
-		val, err := p.expr(0)
-		if err != nil {
+		var val Expr
+		if t := p.peek(); p.acceptKw("default") {
+			val = &DefaultValue{Pos: t.Pos}
+		} else if val, err = p.expr(0); err != nil {
 			return nil, err
 		}
 		u.Sets = append(u.Sets, Assignment{Col: col, Value: val})
@@ -358,26 +695,127 @@ func (p *parser) deleteStmt() (Node, error) {
 	return d, nil
 }
 
-func (p *parser) createTable() (Node, error) {
+// ---- data definition ----
+
+func (p *parser) createStmt() (Node, error) {
 	p.i++ // create
-	if err := p.expectKw("table"); err != nil {
+	switch {
+	case p.acceptKw("table"):
+		return p.createTable()
+	case p.acceptKw("unique"):
+		if err := p.expectKw("index"); err != nil {
+			return nil, err
+		}
+		return p.createIndex(true)
+	case p.acceptKw("index"):
+		return p.createIndex(false)
+	}
+	return nil, p.syntaxError()
+}
+
+func (p *parser) ifNotExists() (bool, error) {
+	if !p.acceptKw("if") {
+		return false, nil
+	}
+	if err := p.expectKw("not"); err != nil {
+		return false, err
+	}
+	return true, p.expectKw("exists")
+}
+
+func (p *parser) createTable() (Node, error) {
+	ct := &CreateTable{}
+	var err error
+	if ct.IfNotExists, err = p.ifNotExists(); err != nil {
 		return nil, err
 	}
-	ct := &CreateTable{}
-	if p.acceptKw("if") {
-		if err := p.expectKw("not"); err != nil {
-			return nil, err
-		}
-		if err := p.expectKw("exists"); err != nil {
-			return nil, err
-		}
-		ct.IfNotExists = true
+	if ct.Name, err = p.ident(); err != nil {
+		return nil, err
 	}
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	for {
+		t := p.peek()
+		switch {
+		case p.isKw("primary"), p.isKw("unique"):
+			p.i++
+			tc := TableConstraint{PrimaryKey: t.Text == "primary", Pos: t.Pos}
+			if tc.PrimaryKey {
+				if err := p.expectKw("key"); err != nil {
+					return nil, err
+				}
+			}
+			if tc.Cols, err = p.identList(); err != nil {
+				return nil, err
+			}
+			ct.Constraints = append(ct.Constraints, tc)
+		default:
+			def, err := p.columnDef()
+			if err != nil {
+				return nil, err
+			}
+			ct.Cols = append(ct.Cols, def)
+		}
+		if !p.acceptOp(",") {
+			break
+		}
+	}
+	return ct, p.expectOp(")")
+}
+
+func (p *parser) columnDef() (ColumnDef, error) {
 	name, err := p.ident()
 	if err != nil {
+		return ColumnDef{}, err
+	}
+	typ, err := p.typeName()
+	if err != nil {
+		return ColumnDef{}, err
+	}
+	def := ColumnDef{Name: name, Type: typ}
+	for {
+		switch {
+		case p.acceptKw("primary"):
+			if err := p.expectKw("key"); err != nil {
+				return ColumnDef{}, err
+			}
+			def.PrimaryKey = true
+		case p.acceptKw("unique"):
+			def.Unique = true
+		case p.acceptKw("not"):
+			if err := p.expectKw("null"); err != nil {
+				return ColumnDef{}, err
+			}
+			def.NotNull = true
+		case p.acceptKw("null"):
+		case p.acceptKw("default"):
+			if def.Default, err = p.expr(0); err != nil {
+				return ColumnDef{}, err
+			}
+		default:
+			return def, nil
+		}
+	}
+}
+
+func (p *parser) createIndex(unique bool) (Node, error) {
+	ci := &CreateIndex{Unique: unique}
+	var err error
+	if ci.IfNotExists, err = p.ifNotExists(); err != nil {
 		return nil, err
 	}
-	ct.Name = name
+	if ci.Name, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("on"); err != nil {
+		return nil, err
+	}
+	if ci.Table, err = p.tableRef(false); err != nil {
+		return nil, err
+	}
+	// Each column may carry a direction, which is accepted and ignored: it
+	// only matters for multi-column ordering of scans, decided by the planner.
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
@@ -386,65 +824,50 @@ func (p *parser) createTable() (Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		typ, err := p.typeName()
-		if err != nil {
-			return nil, err
+		ci.Cols = append(ci.Cols, col)
+		if !p.acceptKw("asc") {
+			p.acceptKw("desc")
 		}
-		def := ColumnDef{Name: col, Type: typ}
-	constraints:
-		for {
-			switch {
-			case p.acceptKw("primary"):
-				if err := p.expectKw("key"); err != nil {
-					return nil, err
-				}
-				def.PrimaryKey = true
-			case p.acceptKw("not"):
-				if err := p.expectKw("null"); err != nil {
-					return nil, err
-				}
-				def.NotNull = true
-			case p.acceptKw("null"):
-			default:
-				break constraints
-			}
-		}
-		ct.Cols = append(ct.Cols, def)
 		if !p.acceptOp(",") {
 			break
 		}
 	}
-	if err := p.expectOp(")"); err != nil {
-		return nil, err
-	}
-	return ct, nil
+	return ci, p.expectOp(")")
 }
 
-func (p *parser) dropTable() (Node, error) {
+func (p *parser) dropStmt() (Node, error) {
 	p.i++ // drop
-	if err := p.expectKw("table"); err != nil {
-		return nil, err
+	index := p.acceptKw("index")
+	if !index {
+		if err := p.expectKw("table"); err != nil {
+			return nil, err
+		}
 	}
-	dt := &DropTable{}
+	ifExists := false
 	if p.acceptKw("if") {
 		if err := p.expectKw("exists"); err != nil {
 			return nil, err
 		}
-		dt.IfExists = true
+		ifExists = true
 	}
 	name, err := p.ident()
 	if err != nil {
 		return nil, err
 	}
-	dt.Name = name
-	return dt, nil
+	if index {
+		return &DropIndex{Name: name, IfExists: ifExists}, nil
+	}
+	return &DropTable{Name: name, IfExists: ifExists}, nil
 }
 
-// setStmt parses SET [SESSION|LOCAL] name {=|TO} value [, ...], plus the two
-// spellings drivers actually send: SET TIME ZONE and SET NAMES.
+// ---- SET / SHOW ----
+
+// setStmt parses SET [SESSION|LOCAL] name {=|TO} value [, ...], plus the
+// special spellings drivers actually send.
 func (p *parser) setStmt() (Node, error) {
 	p.i++ // set
-	if !p.acceptKw("session") {
+	session := p.acceptKw("session")
+	if !session {
 		p.acceptKw("local")
 	}
 	t := p.peek()
@@ -458,6 +881,20 @@ func (p *parser) setStmt() (Node, error) {
 		name = "timezone"
 	case name == "names":
 		name = "client_encoding"
+	case name == "transaction" && p.acceptKw("isolation"):
+		// SET TRANSACTION ISOLATION LEVEL ...
+		level, err := p.isolationLevel()
+		return &Set{Name: "transaction_isolation", Value: level}, err
+	case session && name == "characteristics":
+		// SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...,
+		// which is what JDBC's setTransactionIsolation sends.
+		for _, kw := range []string{"as", "transaction", "isolation"} {
+			if err := p.expectKw(kw); err != nil {
+				return nil, err
+			}
+		}
+		level, err := p.isolationLevel()
+		return &Set{Name: "default_transaction_isolation", Value: level}, err
 	default:
 		if !p.acceptOp("=") && !p.acceptKw("to") {
 			return nil, p.syntaxError()
@@ -500,6 +937,8 @@ func (p *parser) showStmt() (Node, error) {
 	return &Show{Name: name, Pos: t.Pos}, nil
 }
 
+// ---- types ----
+
 func (p *parser) typeName() (Type, error) {
 	t := p.peek()
 	if t.Kind != TIdent {
@@ -528,7 +967,8 @@ func (p *parser) typeName() (Type, error) {
 			}
 		}
 		return Text, nil
-	case "float", "float8":
+	case "float", "float8", "real", "float4":
+		// real is widened to double precision; there is no 4-byte float.
 		return Float8, nil
 	case "double":
 		if err := p.expectKw("precision"); err != nil {
@@ -539,6 +979,8 @@ func (p *parser) typeName() (Type, error) {
 	return Unknown, pgerr.New(pgerr.UndefinedObject, "type %q does not exist", t.Raw).At(t.Pos)
 }
 
+// ---- expressions ----
+
 // Binding powers, lowest to highest, mirroring PostgreSQL's precedence table.
 const (
 	bpOr      = 1
@@ -546,14 +988,29 @@ const (
 	bpNot     = 3
 	bpIs      = 4
 	bpCompare = 5
-	bpConcat  = 6
-	bpAdd     = 7
-	bpMul     = 8
-	bpUnary   = 9
-	bpCast    = 10
+	bpIn      = 6 // IN, BETWEEN, LIKE
+	bpConcat  = 7
+	bpAdd     = 8
+	bpMul     = 9
+	bpUnary   = 10
+	bpCast    = 11
 )
 
-func infixPower(t Token) int {
+func isMembershipKw(t Token) bool {
+	if t.Kind != TIdent {
+		return false
+	}
+	switch t.Text {
+	case "in", "between", "like", "ilike":
+		return true
+	}
+	return false
+}
+
+// infixPower returns the binding power of the operator at the current
+// position, or 0 if what follows cannot continue an expression.
+func (p *parser) infixPower() int {
+	t := p.peek()
 	switch t.Kind {
 	case TIdent:
 		switch t.Text {
@@ -563,6 +1020,15 @@ func infixPower(t Token) int {
 			return bpAnd
 		case "is":
 			return bpIs
+		case "not":
+			// NOT is only an infix operator as part of NOT IN / NOT
+			// BETWEEN / NOT LIKE.
+			if isMembershipKw(p.peekAt(1)) {
+				return bpIn
+			}
+		}
+		if isMembershipKw(t) {
+			return bpIn
 		}
 	case TOp:
 		switch t.Text {
@@ -583,17 +1049,21 @@ func infixPower(t Token) int {
 
 // expr parses an expression whose operators all bind tighter than minBP.
 func (p *parser) expr(minBP int) (Expr, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+
 	left, err := p.prefix()
 	if err != nil {
 		return nil, err
 	}
 	for {
-		t := p.peek()
-		bp := infixPower(t)
+		bp := p.infixPower()
 		if bp == 0 || bp <= minBP {
 			return left, nil
 		}
-		p.i++
+		t := p.next()
 		switch {
 		case t.Kind == TIdent && t.Text == "is":
 			not := p.acceptKw("not")
@@ -601,6 +1071,14 @@ func (p *parser) expr(minBP int) (Expr, error) {
 				return nil, err
 			}
 			left = &IsNull{X: left, Not: not, Pos: t.Pos}
+		case t.Kind == TIdent && bp == bpIn:
+			not := t.Text == "not"
+			if not {
+				t = p.next()
+			}
+			if left, err = p.membership(left, t, not); err != nil {
+				return nil, err
+			}
 		case t.Text == "::":
 			typ, err := p.typeName()
 			if err != nil {
@@ -623,6 +1101,47 @@ func (p *parser) expr(minBP int) (Expr, error) {
 	}
 }
 
+// membership parses the rest of IN, BETWEEN or LIKE; kw is that keyword.
+func (p *parser) membership(left Expr, kw Token, not bool) (Expr, error) {
+	switch kw.Text {
+	case "in":
+		in := &In{X: left, Not: not, Pos: kw.Pos}
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		var err error
+		if p.isKw("select") {
+			in.Sub, err = p.selectStmt()
+		} else {
+			in.List, err = p.exprList()
+		}
+		if err != nil {
+			return nil, err
+		}
+		return in, p.expectOp(")")
+	case "between":
+		// The bounds are parsed above AND's precedence, so that the AND
+		// separating them is not taken for a logical operator.
+		lo, err := p.expr(bpIn)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("and"); err != nil {
+			return nil, err
+		}
+		hi, err := p.expr(bpIn)
+		if err != nil {
+			return nil, err
+		}
+		return &Between{X: left, Lo: lo, Hi: hi, Not: not, Pos: kw.Pos}, nil
+	}
+	pattern, err := p.expr(bpIn)
+	if err != nil {
+		return nil, err
+	}
+	return &Like{X: left, Pattern: pattern, Not: not, ILike: kw.Text == "ilike", Pos: kw.Pos}, nil
+}
+
 func (p *parser) prefix() (Expr, error) {
 	t := p.peek()
 	switch t.Kind {
@@ -630,14 +1149,18 @@ func (p *parser) prefix() (Expr, error) {
 		switch t.Text {
 		case "(":
 			p.i++
+			if p.isKw("select") {
+				sel, err := p.selectStmt()
+				if err != nil {
+					return nil, err
+				}
+				return &SubqueryExpr{Select: sel, Pos: t.Pos}, p.expectOp(")")
+			}
 			e, err := p.expr(0)
 			if err != nil {
 				return nil, err
 			}
-			if err := p.expectOp(")"); err != nil {
-				return nil, err
-			}
-			return e, nil
+			return e, p.expectOp(")")
 		case "-", "+":
 			p.i++
 			x, err := p.expr(bpUnary)
@@ -652,7 +1175,9 @@ func (p *parser) prefix() (Expr, error) {
 			if lit, ok := x.(*Literal); ok {
 				switch v := lit.Val.(type) {
 				case int64:
-					return intLiteral(-v, t.Pos), nil
+					if v != math.MinInt64 {
+						return intLiteral(-v, t.Pos), nil
+					}
 				case float64:
 					return &Literal{Val: -v, Type: Float8, Pos: t.Pos}, nil
 				}
@@ -703,6 +1228,23 @@ func (p *parser) prefix() (Expr, error) {
 				return nil, err
 			}
 			return &Unary{Op: "not", X: x, Pos: t.Pos}, nil
+		case "case":
+			return p.caseExpr()
+		case "cast":
+			return p.castExpr()
+		case "exists":
+			p.i++
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			if !p.isKw("select") {
+				return nil, p.syntaxError()
+			}
+			sel, err := p.selectStmt()
+			if err != nil {
+				return nil, err
+			}
+			return &Exists{Select: sel, Pos: t.Pos}, p.expectOp(")")
 		}
 		if reserved[t.Text] {
 			return nil, p.syntaxError()
@@ -714,29 +1256,80 @@ func (p *parser) prefix() (Expr, error) {
 	return nil, p.syntaxError()
 }
 
+func (p *parser) caseExpr() (Expr, error) {
+	c := &Case{Pos: p.next().Pos}
+	var err error
+	if !p.isKw("when") {
+		if c.Operand, err = p.expr(0); err != nil {
+			return nil, err
+		}
+	}
+	for p.acceptKw("when") {
+		var w When
+		if w.Cond, err = p.expr(0); err != nil {
+			return nil, err
+		}
+		if err := p.expectKw("then"); err != nil {
+			return nil, err
+		}
+		if w.Then, err = p.expr(0); err != nil {
+			return nil, err
+		}
+		c.Whens = append(c.Whens, w)
+	}
+	if len(c.Whens) == 0 {
+		return nil, p.syntaxError()
+	}
+	if p.acceptKw("else") {
+		if c.Else, err = p.expr(0); err != nil {
+			return nil, err
+		}
+	}
+	return c, p.expectKw("end")
+}
+
+// castExpr parses CAST(x AS type), the standard spelling of x::type.
+func (p *parser) castExpr() (Expr, error) {
+	pos := p.next().Pos
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	x, err := p.expr(0)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKw("as"); err != nil {
+		return nil, err
+	}
+	typ, err := p.typeName()
+	if err != nil {
+		return nil, err
+	}
+	return &Cast{X: x, To: typ, Pos: pos}, p.expectOp(")")
+}
+
 // nameExpr parses what follows an identifier in expression position: a
 // function call, a qualified column or a plain column.
 func (p *parser) nameExpr() (Expr, error) {
 	t := p.next()
 	if t.Kind == TIdent && p.acceptOp("(") {
 		call := &FuncCall{Name: t.Text, Pos: t.Pos}
-		if p.acceptOp(")") {
+		switch {
+		case p.acceptOp(")"):
 			return call, nil
+		case p.acceptOp("*"):
+			call.Star = true
+			return call, p.expectOp(")")
+		case p.acceptKw("distinct"):
+			call.Distinct = true
+		default:
+			p.acceptKw("all")
 		}
-		for {
-			arg, err := p.expr(0)
-			if err != nil {
-				return nil, err
-			}
-			call.Args = append(call.Args, arg)
-			if !p.acceptOp(",") {
-				break
-			}
-		}
-		if err := p.expectOp(")"); err != nil {
+		var err error
+		if call.Args, err = p.exprList(); err != nil {
 			return nil, err
 		}
-		return call, nil
+		return call, p.expectOp(")")
 	}
 	if p.acceptOp(".") {
 		col, err := p.ident()

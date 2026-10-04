@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="718" height="210" viewBox="0 0 718 210" role="img" aria-label="parser fuzzing: parse, print, parse again">
+<rect width="718" height="210" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h698 a10 10 0 0 1 10 10v24 h-718 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="359" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">parser fuzzing: parse, print, parse again</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 30s</text>
+<text x="18" y="86" fill="#e6edf3">fuzz: elapsed: 0s, gathering baseline coverage: 0/739 completed</text>
+<text x="18" y="106" fill="#e6edf3">fuzz: elapsed: 15s, execs: 2298743 (157851/sec), new interesting: 9 (total: 748)</text>
+<text x="18" y="126" fill="#e6edf3">fuzz: elapsed: 30s, execs: 3474941 (112716/sec), new interesting: 17 (total: 756)</text>
+<text x="18" y="146" fill="#e6edf3">fuzz: elapsed: 30s, execs: 3474941 (0/sec), new interesting: 17 (total: 756)</text>
+<text x="18" y="166" fill="#7ee787">PASS</text>
+<text x="18" y="186" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/sql</text>
+</g>
+</svg>

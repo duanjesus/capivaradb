@@ -1,0 +1,21 @@
+# Records passing per sqllogictest script. CI fails if a count drops.
+# Regenerate with: bash scripts/slt.sh --update
+select1.test 1031 1031
+select2.test 1031 1031
+select3.test 3351 3351
+evidence/in1.test 128 132
+evidence/in2.test 45 53
+evidence/slt_lang_aggfunc.test 5 5
+evidence/slt_lang_update.test 24 27
+evidence/slt_lang_droptable.test 12 12
+evidence/slt_lang_dropindex.test 8 8
+index/between/1/slt_good_0.test 10022 10022
+index/commute/10/slt_good_0.test 10034 10034
+index/in/10/slt_good_0.test 10035 10035
+index/orderby/10/slt_good_0.test 10053 10053
+index/orderby_nosort/10/slt_good_0.test 10053 10053
+index/delete/1/slt_good_0.test 10907 10907
+random/select/slt_good_0.test 9175 9175
+random/expr/slt_good_0.test 10012 10012
+random/aggregates/slt_good_0.test 9130 9130
+random/groupby/slt_good_0.test 9050 9050

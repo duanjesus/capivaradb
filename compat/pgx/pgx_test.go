@@ -396,3 +396,48 @@ func TestDatabaseSQL(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// Joins, aggregates and subqueries through the extended protocol: result
+// types must be described correctly before any row exists.
+func TestAnalyticalQueries(t *testing.T) {
+	conn, ctx := connect(t, startServer(t))
+	seed(t, conn, ctx)
+	if _, err := conn.Exec(ctx, `create table orders (id int primary key, user_id int, total float8);
+		insert into orders values (1, 1, 10.5), (2, 1, 4.5), (3, 3, 100)`); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := conn.Query(ctx, `
+		select u.name, count(o.id), coalesce(sum(o.total), 0), max(o.total)
+		from users u left join orders o on o.user_id = u.id
+		where u.id <= $1
+		group by u.name
+		having count(o.id) >= $2
+		order by 2 desc, u.name
+		limit $3`, 10, 0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type rec struct {
+		Name  string
+		N     int64
+		Total float64
+		Max   *float64
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[rec])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Name != "ana" || got[0].N != 2 || got[0].Total != 15 ||
+		got[1].Name != "caio" || *got[1].Max != 100 || got[2].Name != "bia" || got[2].Max != nil {
+		t.Errorf("rows: %+v", got)
+	}
+
+	var name string
+	err = conn.QueryRow(ctx, `select name from users u
+		where exists (select 1 from orders o where o.user_id = u.id and o.total > $1)
+		  and name like $2`, 50.0, "c%").Scan(&name)
+	if err != nil || name != "caio" {
+		t.Errorf("got %q, %v", name, err)
+	}
+}

@@ -45,6 +45,10 @@ jobs:
         if: runner.os != 'Linux'
         run: go test -count=1 ./...
 
+      - name: Fuzz the parser briefly
+        if: runner.os == 'Linux'
+        run: go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 30s
+
       - name: pgx driver tests
         working-directory: compat/pgx
         run: go test -count=1 ./...
@@ -68,3 +72,21 @@ jobs:
 
       - name: psql smoke test
         run: bash scripts/psql-smoke.sh
+
+  sqllogictest:
+    name: sqllogictest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: compat/pgx/go.sum
+      - name: Restore the downloaded scripts
+        uses: actions/cache@v4
+        with:
+          path: .cache/slt
+          key: slt-${{ hashFiles('scripts/slt.sh') }}
+
+      - name: Run and compare with the baseline
+        run: bash scripts/slt.sh

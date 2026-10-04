@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="811" height="470" viewBox="0 0 811 470" role="img" aria-label="psql: constraints and binder errors">
+<rect width="811" height="470" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h791 a10 10 0 0 1 10 10v24 h-811 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="405" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">psql: constraints and binder errors</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">-- Constraints with their PostgreSQL names.</text>
+<text x="18" y="86" fill="#e6edf3">insert into dept values (4, &#39;vazio&#39;);</text>
+<text x="18" y="106" fill="#ff7b72">ERROR:  duplicate key value violates unique constraint &#34;dept_name_key&#34;</text>
+<text x="18" y="126" fill="#ffa198">DETAIL:  Key (name)=(vazio) already exists.</text>
+<text x="18" y="146" fill="#e6edf3">create unique index emp_name on emp (name);</text>
+<text x="18" y="166" fill="#e6edf3">CREATE INDEX</text>
+<text x="18" y="186" fill="#e6edf3">insert into emp values (7, &#39;Ana&#39;, 1, 1, null);</text>
+<text x="18" y="206" fill="#ff7b72">ERROR:  duplicate key value violates unique constraint &#34;emp_name&#34;</text>
+<text x="18" y="226" fill="#ffa198">DETAIL:  Key (name)=(Ana) already exists.</text>
+<text x="18" y="246" fill="#8b949e">-- Errors that only a real binder can give.</text>
+<text x="18" y="266" fill="#e6edf3">select name, count(*) from emp;</text>
+<text x="18" y="286" fill="#ff7b72">ERROR:  column &#34;name&#34; must appear in the GROUP BY clause or be used in an aggregate function</text>
+<text x="18" y="306" fill="#ffa198">LINE 1: select name, count(*) from emp;</text>
+<text x="18" y="326" fill="#ffa198">               ^</text>
+<text x="18" y="346" fill="#e6edf3">select id from emp join dept on emp.dept_id = dept.id;</text>
+<text x="18" y="366" fill="#ff7b72">ERROR:  column reference &#34;id&#34; is ambiguous</text>
+<text x="18" y="386" fill="#ffa198">LINE 1: select id from emp join dept on emp.dept_id = dept.id;</text>
+<text x="18" y="406" fill="#ffa198">               ^</text>
+<text x="18" y="426" fill="#e6edf3">select * from emp where salary = (select salary from emp);</text>
+<text x="18" y="446" fill="#ff7b72">ERROR:  more than one row returned by a subquery used as an expression</text>
+</g>
+</svg>

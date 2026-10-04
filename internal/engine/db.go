@@ -1,15 +1,17 @@
-// Package engine is the milestone-1 execution engine: tables are slices of
-// rows held in memory behind one database-wide lock.
+// Package engine is the in-memory execution engine: tables are slices of
+// rows behind one database-wide lock.
 //
-// It exists so that the wire protocol can be exercised end to end by real
-// clients. It is deliberately naive — no persistence, no isolation between
-// concurrent transactions, full scans only — and is replaced piece by piece
-// by the storage engine, WAL, MVCC and planner of the later milestones. The
-// part that is meant to last is the boundary: everything the protocol layer
-// needs goes through the pgwire.Session interface.
+// It exists so that the SQL front end and the wire protocol can be exercised
+// end to end by real clients. It is deliberately naive — no persistence, no
+// isolation between concurrent transactions, full scans and nested-loop
+// joins only — and is replaced piece by piece by the storage engine, WAL,
+// MVCC and planner of the later milestones. What is meant to last is the
+// semantic layer (name resolution, typing, grouping rules) and the boundary:
+// everything the protocol layer needs goes through pgwire.Session.
 package engine
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
@@ -20,28 +22,49 @@ import (
 
 // DB is an in-memory database. It implements pgwire.Handler.
 type DB struct {
-	// mu guards tables and everything reachable from it. Writers hold it
-	// for a whole statement; readers only while copying the row slice.
-	mu     sync.RWMutex
-	tables map[string]*table
+	// mu guards tables, indexes and everything reachable from them.
+	// Writers hold it for a whole statement; readers only while copying
+	// the row slice.
+	mu      sync.RWMutex
+	tables  map[string]*table
+	indexes map[string]*index
 }
 
 // New returns an empty database.
 func New() *DB {
-	return &DB{tables: make(map[string]*table)}
+	return &DB{tables: make(map[string]*table), indexes: make(map[string]*index)}
 }
 
 type table struct {
 	name string
 	cols []column
 	rows []*row
+	// uniques lists the column sets that must be unique: the primary key,
+	// UNIQUE constraints and unique indexes.
+	uniques []*unique
 }
 
 type column struct {
 	name    string
 	typ     sql.Type
 	notNull bool
-	pk      bool
+	// def computes the column's DEFAULT, already converted to the column
+	// type; nil means the default is NULL.
+	def evalFn
+}
+
+type unique struct {
+	name string
+	cols []int
+}
+
+// index records a CREATE INDEX. Until the B+tree exists (milestone 3) an
+// index is only a catalog entry: a unique one is enforced by scanning, and a
+// plain one changes nothing.
+type index struct {
+	name   string
+	table  *table
+	unique *unique // nil for a non-unique index
 }
 
 // row is a pointer so that a row keeps its identity across updates, which is
@@ -59,6 +82,16 @@ func (t *table) colIndex(name string) int {
 		}
 	}
 	return -1
+}
+
+// colNames joins the names of the given columns, for constraint names and
+// error details.
+func (t *table) colNames(cols []int, sep string) string {
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = t.cols[c].name
+	}
+	return strings.Join(names, sep)
 }
 
 // Session is the state of one client connection. It implements
@@ -92,8 +125,9 @@ func (db *DB) NewSession(params map[string]string) (pgwire.Session, error) {
 			"standard_conforming_strings": "on",
 			"search_path":                 "public",
 			"application_name":            params["application_name"],
-			// Honest answer for this milestone: statements from other
+			// Honest answer until MVCC lands: statements from other
 			// sessions are visible as soon as they run, committed or not.
+			// Requesting another level is accepted and changes nothing.
 			"transaction_isolation": "read uncommitted",
 		},
 	}
