@@ -33,17 +33,28 @@ Acceptance, all automated:
 Left for later milestones: `UNION`/`INTERSECT`/`EXCEPT`, `RIGHT`/`FULL`
 joins and `USING` (milestone 7), `EXPLAIN` (milestone 6).
 
-## 3. Storage engine
+## 3. Storage engine — done
 
-- 8 kB slotted pages with a checksum
+- 8 kB slotted pages with a CRC-32C checksum
 - Buffer pool with pin counts and clock eviction
-- B+tree keyed by primary key for tables; secondary indexes as B+trees
-  pointing at primary keys
-- Persistent catalog stored in its own tables
+- B+trees with variable-length keys, overflow pages and linked leaves;
+  tables clustered by primary key, secondary and unique indexes as B+trees
+- Persistent catalog stored in a B+tree of its own
+- A consistency checker for trees, indexes and page ownership
 
-Acceptance: data survives a clean restart; B+tree invariants checked by a
-verifier after randomised insert/delete workloads; the buffer pool works
-with a pool far smaller than the data.
+Acceptance, all automated:
+
+- data, constraints, defaults and indexes survive a restart, at the engine
+  level and through psql against a real file;
+- B+tree invariants verified during randomised and fuzzed workloads, with
+  a map as the oracle and no page allowed to leak;
+- a 9 MB table worked through a 256 kB buffer pool;
+- every earlier test and all of sqllogictest run on the new storage with
+  no regression, with the consistency checker run after each.
+
+Details in [storage.md](storage.md) and
+[decisions/0005](decisions/0005-storage-layout.md). Not crash-safe yet:
+that is the next milestone.
 
 ## 4. Write-ahead log and recovery
 
@@ -88,6 +99,6 @@ the chosen plan beating the alternative.
 
 - **sqllogictest**: `tools/slt` runs a slice of SQLite's sqllogictest corpus,
   with the pass rate published in the README and tracked per milestone.
-- **Benchmarks**: reproducible scripts, results reported with the hardware
-  and commit they were measured on.
+- **Benchmarks**: `scripts/bench.sh`, results in [benchmarks.md](benchmarks.md) with the hardware
+  they were measured on.
 - **No dependencies in the core**, enforced by CI.

@@ -9,7 +9,7 @@
 # looked like at the time.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-MILESTONE="${1:?usage: screenshots.sh m1|m2}"
+MILESTONE="${1:?usage: screenshots.sh m1|m2|m3}"
 OUT="$ROOT/docs/screenshots"
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -65,6 +65,29 @@ m2)
     go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 30s 2>&1 |
       grep -E '^(fuzz: elapsed: (0s|15s|30s),|PASS|ok|FAIL)' | sed -E 's/\t[0-9.]+s$//' | awk '!seen[$0]++'
   } | shot fuzz "parser fuzzing: parse, print, parse again"
+  ;;
+
+m3)
+  # Data surviving the server process, through psql.
+  bash scripts/restart-smoke.sh >/dev/null
+  sed -n '1,/^## a new server/p' "$CACHE/restart.out" | sed '$d' |
+    shot restart-before "first server: write, checkpoint, kill"
+  sed -n '/^## a new server/,$p' "$CACHE/restart.out" |
+    shot restart-after "second server, same file"
+
+  # The storage tests, with what they report about the tree and the pool.
+  {
+    echo '$ go test ./internal/storage -v -run "TestRandomOperations|TestPersistence|TestChecksum"'
+    go test -count=1 ./internal/storage -v -run 'TestRandomOperations|TestPersistence|TestChecksum' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +btree_test.go:[0-9]+: /    /'
+    echo
+    echo '$ go test ./internal/engine -v -run "Restart|BufferPool"'
+    go test -count=1 ./internal/engine -v -run 'Restart|BufferPool' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +persist_test.go:[0-9]+: /    /'
+  } | shot storage-tests "storage engine tests"
+
+  { echo '$ scripts/bench.sh'; bash scripts/bench.sh 2>&1 | grep -vE '^(PASS|ok)'; } |
+    shot bench "B+tree benchmarks"
   ;;
 
 *)

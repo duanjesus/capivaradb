@@ -9,6 +9,7 @@ import (
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
 	"github.com/duanjesus/capivaradb/internal/sql"
+	"github.com/duanjesus/capivaradb/internal/storage"
 )
 
 // prepared implements pgwire.Prepared.
@@ -164,15 +165,24 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 		// only one behaviour until MVCC exists, and SHOW reports it.
 		return command(func() string { s.begin(); return "BEGIN" }), nil
 	case *sql.Commit:
-		return command(func() string {
+		return &prepared{run: func(context.Context, []any) (*result, error) {
 			// COMMIT of a failed transaction rolls it back and says so.
 			if s.failed {
 				s.rollback()
-				return "ROLLBACK"
+				return &result{tag: "ROLLBACK"}, nil
 			}
-			s.commit()
-			return "COMMIT"
-		}), nil
+			if err := s.commit(); err != nil {
+				return nil, err
+			}
+			return &result{tag: "COMMIT"}, nil
+		}}, nil
+	case *sql.Checkpoint:
+		return &prepared{run: func(context.Context, []any) (*result, error) {
+			if err := s.db.Checkpoint(); err != nil {
+				return nil, err
+			}
+			return &result{tag: "CHECKPOINT"}, nil
+		}}, nil
 	case *sql.Rollback:
 		return command(func() string { s.rollback(); return "ROLLBACK" }), nil
 	case *sql.Set:
@@ -261,74 +271,6 @@ func storeAs(be bound, c column, pos int) (evalFn, error) {
 	}, nil
 }
 
-// checkConstraints validates a new row version. self is the row being
-// replaced on UPDATE, or nil on INSERT. The caller must hold db.mu.
-func (t *table) checkConstraints(vals []any, self *row) error {
-	for i, c := range t.cols {
-		if c.notNull && vals[i] == nil {
-			return pgerr.New(pgerr.NotNullViolation,
-				"null value in column %q of relation %q violates not-null constraint", c.name, t.name)
-		}
-	}
-next:
-	for _, u := range t.uniques {
-		unchanged := self != nil
-		for _, c := range u.cols {
-			// NULLs are distinct from each other: a key containing one
-			// never conflicts.
-			if vals[c] == nil {
-				continue next
-			}
-			if self != nil && self.vals[c] != vals[c] {
-				unchanged = false
-			}
-		}
-		if unchanged {
-			continue
-		}
-		// Linear scan: there are no real indexes until the B+tree lands.
-	scan:
-		for _, r := range t.rows {
-			if r == self {
-				continue
-			}
-			for _, c := range u.cols {
-				if r.vals[c] != vals[c] {
-					continue scan
-				}
-			}
-			key := make([]string, len(u.cols))
-			for i, c := range u.cols {
-				key[i] = pgwire.TextValue(vals[c])
-			}
-			return pgerr.New(pgerr.UniqueViolation, "duplicate key value violates unique constraint %q", u.name).
-				WithDetail("Key (%s)=(%s) already exists.", t.colNames(u.cols, ", "), strings.Join(key, ", "))
-		}
-	}
-	return nil
-}
-
-// insert validates and appends a row. The caller must hold db.mu.
-func (t *table) insert(vals []any, undo *[]func()) error {
-	if err := t.checkConstraints(vals, nil); err != nil {
-		return err
-	}
-	r := &row{vals: vals}
-	t.rows = append(t.rows, r)
-	*undo = append(*undo, func() { t.remove(r) })
-	return nil
-}
-
-// remove deletes r from the table. The caller must hold db.mu.
-func (t *table) remove(r *row) {
-	for i := len(t.rows) - 1; i >= 0; i-- {
-		if t.rows[i] == r {
-			t.rows = append(t.rows[:i], t.rows[i+1:]...)
-			return
-		}
-	}
-}
-
 func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, error) {
 	t, _, err := s.targetTable(n.Table, ptypes)
 	if err != nil {
@@ -407,7 +349,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 			}
 		}
 		return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-			return s.write(func(undo *[]func()) (string, error) {
+			return s.write(func(ch *changes) (string, error) {
 				if err := s.db.stillCurrent(t); err != nil {
 					return "", err
 				}
@@ -431,7 +373,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 						}
 						vals[target[i]] = v
 					}
-					if err := t.insert(vals, undo); err != nil {
+					if err := t.insertRow(vals, ch); err != nil {
 						return "", err
 					}
 				}
@@ -454,7 +396,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 		}
 	}
 	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
+		return s.write(func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
@@ -469,7 +411,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 						return "", err
 					}
 				}
-				if err := t.insert(vals, undo); err != nil {
+				if err := t.insertRow(vals, ch); err != nil {
 					return "", err
 				}
 			}
@@ -505,13 +447,19 @@ func (s *Session) buildUpdate(n *sql.Update, ptypes []sql.Type) (*prepared, erro
 	}
 
 	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
+		return s.write(func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
+				return "", err
+			}
+			// The rows are read in full before any is changed: an updated
+			// row may move in the tree, and must not be met a second time.
+			rows, err := s.db.scan(t)
+			if err != nil {
 				return "", err
 			}
 			en := &env{ctx: ctx, params: params, locked: true}
 			count := 0
-			for _, r := range t.rows {
+			for _, r := range rows {
 				en.row = r.vals
 				ok, err := matches(where, en)
 				if err != nil {
@@ -528,12 +476,9 @@ func (s *Session) buildUpdate(n *sql.Update, ptypes []sql.Type) (*prepared, erro
 						return "", err
 					}
 				}
-				if err := t.checkConstraints(vals, r); err != nil {
+				if err := t.updateRow(r, vals, ch); err != nil {
 					return "", err
 				}
-				old := r.vals
-				r.vals = vals
-				*undo = append(*undo, func() { r.vals = old })
 				count++
 			}
 			return fmt.Sprintf("UPDATE %d", count), nil
@@ -552,61 +497,60 @@ func (s *Session) buildDelete(n *sql.Delete, ptypes []sql.Type) (*prepared, erro
 	}
 
 	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
+		return s.write(func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
-			en := &env{ctx: ctx, params: params, locked: true}
-			type removed struct {
-				at int
-				r  *row
+			rows, err := s.db.scan(t)
+			if err != nil {
+				return "", err
 			}
-			var gone []removed
-			kept := make([]*row, 0, len(t.rows))
-			for i, r := range t.rows {
+			en := &env{ctx: ctx, params: params, locked: true}
+			count := 0
+			for _, r := range rows {
 				en.row = r.vals
 				ok, err := matches(where, en)
 				if err != nil {
 					return "", err
 				}
-				if ok {
-					gone = append(gone, removed{i, r})
-				} else {
-					kept = append(kept, r)
+				if !ok {
+					continue
 				}
+				if err := t.deleteRow(r, ch); err != nil {
+					return "", err
+				}
+				count++
 			}
-			t.rows = kept
-			// Undo puts the rows back where they were, lowest position
-			// first so that each insertion index is still valid.
-			*undo = append(*undo, func() {
-				for _, g := range gone {
-					at := min(g.at, len(t.rows))
-					t.rows = append(t.rows, nil)
-					copy(t.rows[at+1:], t.rows[at:])
-					t.rows[at] = g.r
-				}
-			})
-			return fmt.Sprintf("DELETE %d", len(gone)), nil
+			return fmt.Sprintf("DELETE %d", count), nil
 		})
 	}}, nil
 }
 
+// indexDef is an index of a table that is yet to be created.
+type indexDef struct {
+	name   string
+	cols   []int
+	unique bool
+}
+
 func (s *Session) buildCreateTable(n *sql.CreateTable, ptypes []sql.Type) (*prepared, error) {
-	t := &table{name: n.Name.Name}
-	var pk *unique
+	name := n.Name.Name
+	// colIndex needs a table to look columns up in while it is assembled.
+	draft := &table{name: name}
+	var pk []int
+	var uniques []indexDef
 	setPrimaryKey := func(cols []int, pos int) error {
 		if pk != nil {
 			return pgerr.New(pgerr.InvalidTableDefinition,
-				"multiple primary keys for table %q are not allowed", t.name).At(pos)
+				"multiple primary keys for table %q are not allowed", name).At(pos)
 		}
-		pk = &unique{name: t.name + "_pkey", cols: cols}
-		t.uniques = append(t.uniques, pk)
+		pk = cols
 		return nil
 	}
 
 	b := &binder{sess: s, scope: &scope{}, ptypes: ptypes}
 	for _, c := range n.Cols {
-		if t.colIndex(c.Name.Name) >= 0 {
+		if draft.colIndex(c.Name.Name) >= 0 {
 			return nil, pgerr.New(pgerr.DuplicateColumn, "column %q specified more than once", c.Name.Name).At(c.Name.Pos)
 		}
 		col := column{name: c.Name.Name, typ: c.Type, notNull: c.NotNull}
@@ -618,8 +562,9 @@ func (s *Session) buildCreateTable(n *sql.CreateTable, ptypes []sql.Type) (*prep
 			if col.def, err = storeAs(be, col, c.Default.Position()); err != nil {
 				return nil, err
 			}
+			col.defSQL = sql.FormatExpr(c.Default)
 		}
-		t.cols = append(t.cols, col)
+		draft.cols = append(draft.cols, col)
 	}
 	// Constraints are processed after all columns exist, in the order
 	// PostgreSQL names them: column constraints first.
@@ -630,13 +575,13 @@ func (s *Session) buildCreateTable(n *sql.CreateTable, ptypes []sql.Type) (*prep
 			}
 		}
 		if c.Unique {
-			t.uniques = append(t.uniques, &unique{name: t.name + "_" + c.Name.Name + "_key", cols: []int{i}})
+			uniques = append(uniques, indexDef{name + "_" + c.Name.Name + "_key", []int{i}, true})
 		}
 	}
 	for _, tc := range n.Constraints {
 		cols := make([]int, len(tc.Cols))
 		for i, id := range tc.Cols {
-			if cols[i] = t.colIndex(id.Name); cols[i] < 0 {
+			if cols[i] = draft.colIndex(id.Name); cols[i] < 0 {
 				return nil, pgerr.New(pgerr.UndefinedColumn, "column %q named in key does not exist", id.Name).At(id.Pos)
 			}
 		}
@@ -645,35 +590,104 @@ func (s *Session) buildCreateTable(n *sql.CreateTable, ptypes []sql.Type) (*prep
 				return nil, err
 			}
 		} else {
-			t.uniques = append(t.uniques, &unique{name: t.name + "_" + t.colNames(cols, "_") + "_key", cols: cols})
+			uniques = append(uniques, indexDef{name + "_" + draft.colNames(cols, "_") + "_key", cols, true})
 		}
 	}
-	if pk != nil {
-		for _, c := range pk.cols {
-			t.cols[c].notNull = true
-		}
+	for _, c := range pk {
+		draft.cols[c].notNull = true
 	}
 
 	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
-			if s.db.nameTaken(t.name) {
+		return s.write(func(ch *changes) (string, error) {
+			if s.db.nameTaken(name) {
 				if n.IfNotExists {
 					return "CREATE TABLE", nil
 				}
-				return "", pgerr.New(pgerr.DuplicateTable, "relation %q already exists", t.name)
+				return "", pgerr.New(pgerr.DuplicateTable, "relation %q already exists", name)
 			}
 			// A fresh table per execution: a prepared CREATE TABLE that is
-			// run again after a DROP must not resurrect the old rows.
-			created := &table{name: t.name, cols: t.cols, uniques: append([]*unique(nil), t.uniques...)}
-			s.db.tables[t.name] = created
-			*undo = append(*undo, func() {
-				if s.db.tables[t.name] == created {
-					delete(s.db.tables, t.name)
-				}
-			})
+			// run again after a DROP gets storage of its own.
+			t := &table{name: name, cols: draft.cols, pk: pk}
+			if err := s.db.createTable(t, uniques, ch); err != nil {
+				return "", err
+			}
 			return "CREATE TABLE", nil
 		})
 	}}, nil
+}
+
+// createTable allocates the storage of t and of the indexes backing its
+// UNIQUE constraints, and registers them. The caller must hold db.mu.
+func (db *DB) createTable(t *table, uniques []indexDef, ch *changes) (err error) {
+	var trees []*storage.Tree
+	// If anything fails half-way, give back the pages already allocated.
+	defer func() {
+		if err != nil {
+			for _, tree := range trees {
+				tree.Drop()
+			}
+		}
+	}()
+	newTree := func() (*storage.Tree, error) {
+		tree, err := storage.CreateTree(db.pager)
+		if err == nil {
+			trees = append(trees, tree)
+		}
+		return tree, err
+	}
+
+	if t.tree, err = newTree(); err != nil {
+		return err
+	}
+	for _, def := range uniques {
+		if db.nameTaken(def.name) {
+			return pgerr.New(pgerr.DuplicateTable, "relation %q already exists", def.name)
+		}
+		tree, err := newTree()
+		if err != nil {
+			return err
+		}
+		t.indexes = append(t.indexes, &index{name: def.name, table: t, cols: def.cols, unique: true, tree: tree})
+	}
+	if err = db.register(t); err != nil {
+		return err
+	}
+	ch.undo = append(ch.undo, func() {
+		must(db.unregister(t))
+		for _, tree := range trees {
+			must(tree.Drop())
+		}
+	})
+	return nil
+}
+
+// register adds a table and its indexes to the catalog, in memory and on
+// disk. The caller must hold db.mu.
+func (db *DB) register(t *table) error {
+	if err := db.saveTable(t); err != nil {
+		return err
+	}
+	db.tables[t.name] = t
+	for _, ix := range t.indexes {
+		if err := db.saveIndex(ix); err != nil {
+			return err
+		}
+		db.indexes[ix.name] = ix
+	}
+	return nil
+}
+
+// unregister removes a table and its indexes from the catalog, leaving
+// their pages alone.
+func (db *DB) unregister(t *table) error {
+	for _, ix := range t.indexes {
+		if err := db.forget('i', ix.name); err != nil {
+			return err
+		}
+		delete(db.indexes, ix.name)
+	}
+	delete(db.tables, t.name)
+	return db.forget('t', t.name)
 }
 
 // nameTaken reports whether a table or index has this name; like PostgreSQL,
@@ -685,7 +699,7 @@ func (db *DB) nameTaken(name string) bool {
 func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
 	name := n.Name.Name
 	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
+		return s.write(func(ch *changes) (string, error) {
 			t, exists := s.db.tables[name]
 			if !exists {
 				if n.IfExists {
@@ -693,25 +707,20 @@ func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
 				}
 				return "", pgerr.New(pgerr.UndefinedTable, "table %q does not exist", name)
 			}
-			// The table's indexes go with it.
-			var dropped []*index
-			for _, ix := range s.db.indexes {
-				if ix.table == t {
-					dropped = append(dropped, ix)
-				}
+			// The table and its indexes leave the catalog now, but their
+			// pages are only freed once the drop can no longer be rolled
+			// back.
+			if err := s.db.unregister(t); err != nil {
+				return "", err
 			}
-			for _, ix := range dropped {
-				delete(s.db.indexes, ix.name)
-			}
-			delete(s.db.tables, name)
-			*undo = append(*undo, func() {
-				if s.db.nameTaken(name) {
-					return
+			ch.undo = append(ch.undo, func() { must(s.db.register(t)) })
+			ch.onCommit = append(ch.onCommit, func() error {
+				for _, ix := range t.indexes {
+					if err := ix.tree.Drop(); err != nil {
+						return err
+					}
 				}
-				s.db.tables[name] = t
-				for _, ix := range dropped {
-					s.db.indexes[ix.name] = ix
-				}
+				return t.tree.Drop()
 			})
 			return "DROP TABLE", nil
 		})
@@ -721,7 +730,7 @@ func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
 func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 	name := n.Name.Name
 	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
+		return s.write(func(ch *changes) (string, error) {
 			t, err := s.db.lookup(n.Table)
 			if err != nil {
 				return "", err
@@ -738,56 +747,76 @@ func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 					return "", pgerr.New(pgerr.UndefinedColumn, "column %q does not exist", id.Name).At(id.Pos)
 				}
 			}
-			ix := &index{name: name, table: t}
-			if n.Unique {
-				// The existing rows must already satisfy the constraint.
-				seen := make(map[string]bool, len(t.rows))
-			rows:
-				for _, r := range t.rows {
-					var key []byte
-					for _, c := range cols {
-						if r.vals[c] == nil {
-							continue rows
-						}
-						key = appendKey(key, r.vals[c])
-					}
-					if seen[string(key)] {
-						return "", pgerr.New(pgerr.UniqueViolation, "could not create unique index %q", name).
-							WithDetail("Key (%s) is duplicated.", t.colNames(cols, ", "))
-					}
-					seen[string(key)] = true
-				}
-				ix.unique = &unique{name: name, cols: cols}
-				t.uniques = append(t.uniques, ix.unique)
+			ix := &index{name: name, table: t, cols: cols, unique: n.Unique}
+			if err := s.db.buildIndex(ix); err != nil {
+				return "", err
+			}
+			if err := s.db.saveIndex(ix); err != nil {
+				ix.tree.Drop()
+				return "", err
 			}
 			s.db.indexes[name] = ix
-			*undo = append(*undo, func() { s.db.dropIndex(ix) })
+			t.indexes = append(t.indexes[:len(t.indexes):len(t.indexes)], ix)
+			ch.undo = append(ch.undo, func() {
+				must(s.db.detachIndex(ix))
+				must(ix.tree.Drop())
+			})
 			return "CREATE INDEX", nil
 		})
 	}}, nil
 }
 
-// dropIndex removes an index and the uniqueness it enforced. The caller must
-// hold db.mu.
-func (db *DB) dropIndex(ix *index) {
-	if db.indexes[ix.name] == ix {
-		delete(db.indexes, ix.name)
+// buildIndex creates the index's tree and fills it from the table's rows.
+// For a unique index the existing rows must already satisfy it.
+func (db *DB) buildIndex(ix *index) error {
+	t := ix.table
+	rows, err := db.scan(t)
+	if err != nil {
+		return err
 	}
-	if ix.unique != nil {
-		t := ix.table
-		for i, u := range t.uniques {
-			if u == ix.unique {
-				t.uniques = append(t.uniques[:i:i], t.uniques[i+1:]...)
-				break
+	if ix.tree, err = storage.CreateTree(db.pager); err != nil {
+		return err
+	}
+	fail := func(err error) error {
+		ix.tree.Drop()
+		return err
+	}
+	seen := make(map[string]bool)
+	for _, r := range rows {
+		if ix.unique && !hasNull(ix.cols, r.vals) {
+			prefix := string(encodeKey(ix.cols, r.vals))
+			if seen[prefix] {
+				return fail(pgerr.New(pgerr.UniqueViolation, "could not create unique index %q", ix.name).
+					WithDetail("Key (%s) is duplicated.", t.colNames(ix.cols, ", ")))
 			}
+			seen[prefix] = true
+		}
+		if err := ix.tree.Put(ix.entryKey(r.vals, r.key), nil); err != nil {
+			return fail(storageError(err))
 		}
 	}
+	return nil
+}
+
+// detachIndex removes an index from the catalog and from its table, leaving
+// its pages alone. The caller must hold db.mu.
+func (db *DB) detachIndex(ix *index) error {
+	t := ix.table
+	kept := make([]*index, 0, len(t.indexes))
+	for _, other := range t.indexes {
+		if other != ix {
+			kept = append(kept, other)
+		}
+	}
+	t.indexes = kept
+	delete(db.indexes, ix.name)
+	return db.forget('i', ix.name)
 }
 
 func (s *Session) buildDropIndex(n *sql.DropIndex) (*prepared, error) {
 	name := n.Name.Name
 	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(undo *[]func()) (string, error) {
+		return s.write(func(ch *changes) (string, error) {
 			ix, exists := s.db.indexes[name]
 			if !exists {
 				if n.IfExists {
@@ -795,16 +824,15 @@ func (s *Session) buildDropIndex(n *sql.DropIndex) (*prepared, error) {
 				}
 				return "", pgerr.New(pgerr.UndefinedObject, "index %q does not exist", name)
 			}
-			s.db.dropIndex(ix)
-			*undo = append(*undo, func() {
-				if s.db.nameTaken(name) {
-					return
-				}
+			if err := s.db.detachIndex(ix); err != nil {
+				return "", err
+			}
+			ch.undo = append(ch.undo, func() {
+				must(s.db.saveIndex(ix))
 				s.db.indexes[name] = ix
-				if ix.unique != nil {
-					ix.table.uniques = append(ix.table.uniques, ix.unique)
-				}
+				ix.table.indexes = append(ix.table.indexes[:len(ix.table.indexes):len(ix.table.indexes)], ix)
 			})
+			ch.onCommit = append(ch.onCommit, ix.tree.Drop)
 			return "DROP INDEX", nil
 		})
 	}}, nil

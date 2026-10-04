@@ -143,24 +143,6 @@ func (t *table) scopeCols(alias string) []scopeCol {
 	return cols
 }
 
-// snapshot returns the current rows of t. The returned slices are safe to
-// read after the lock is released because row values are never modified in
-// place.
-func (db *DB) snapshot(t *table, locked bool) ([][]any, error) {
-	if !locked {
-		db.mu.RLock()
-		defer db.mu.RUnlock()
-	}
-	if err := db.stillCurrent(t); err != nil {
-		return nil, err
-	}
-	rows := make([][]any, len(t.rows))
-	for i, r := range t.rows {
-		rows[i] = r.vals
-	}
-	return rows, nil
-}
-
 // sortKey is one ORDER BY entry.
 type sortKey struct {
 	// out is the index of the output column to sort by, or -1 if the key is

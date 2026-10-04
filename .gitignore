@@ -4,3 +4,5 @@
 *.test
 *.out
 !compat/psql/*.out
+!compat/restart/*.out
+*.cdb

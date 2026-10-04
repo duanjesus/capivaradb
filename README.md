@@ -10,11 +10,11 @@ logging with crash recovery, MVCC transactions, and a query planner and
 executor. **The core has no dependencies outside the Go standard library**;
 CI fails if one is added.
 
-> **Status: milestone 2 of 7.** The wire protocol and the SQL front end are
-> done and verified against real clients and against SQLite's sqllogictest
-> corpus. Behind them sits a deliberately simple in-memory engine that the
-> following milestones replace. Nothing is persisted yet. See
-> [Limitations](#limitations) for exactly what that means.
+> **Status: milestone 3 of 7.** The wire protocol, the SQL front end and the
+> storage engine are done: data lives in B+trees in a page file, behind a
+> buffer pool, and survives a restart. It is **not crash-safe yet** — that is
+> the write-ahead log, next — and transactions are not isolated from each
+> other. See [Limitations](#limitations) for exactly what that means.
 
 ![psql running joins and aggregates against CapivaraDB](docs/screenshots/m2-psql-joins.svg)
 
@@ -24,8 +24,8 @@ CI fails if one is added.
 |---|-----------|-------|
 | 1 | PostgreSQL wire protocol v3: startup, simple and extended query, cancellation | **done** |
 | 2 | Hand-written SQL parser and binder: joins, grouping, subqueries, DDL; fuzzing; sqllogictest | **done** |
-| 3 | Storage engine: slotted pages, buffer pool, B+tree tables and secondary indexes | next |
-| 4 | Write-ahead log, ARIES-style recovery, kill-the-process crash tests | planned |
+| 3 | Storage engine: slotted pages, buffer pool, B+tree tables and secondary indexes, persistent catalog | **done** |
+| 4 | Write-ahead log, ARIES-style recovery, kill-the-process crash tests | next |
 | 5 | MVCC with snapshot isolation, concurrent transactions, isolation tests | planned |
 | 6 | Cost-based planner: index selection, join ordering, `EXPLAIN` | planned |
 | 7 | Volcano executor: hash and merge joins, aggregation, external sort, set operations | planned |
@@ -37,8 +37,11 @@ Details in [docs/roadmap.md](docs/roadmap.md).
 Requires Go 1.27 or newer.
 
 ```bash
-go run ./cmd/capivaradb -addr 127.0.0.1:5432
+go run ./cmd/capivaradb -data capi.cdb
 ```
+
+Without `-data` the database lives in memory. `-cache 64` sets the buffer
+pool to 64 MB, `-addr` the listening address (default `127.0.0.1:5432`).
 
 Then, from any PostgreSQL client:
 
@@ -54,6 +57,9 @@ select name, weight * 2 from capivaras where weight > 50;
 
 Any user name is accepted and no password is asked for, which is why the
 server listens on loopback only unless told otherwise.
+
+Changes reach the file at `CHECKPOINT` and on a clean shutdown (Ctrl+C).
+`capivaradb -data capi.cdb -check` verifies a file offline.
 
 ## What works today
 
@@ -88,6 +94,26 @@ psql turns into a caret:
 
 ![constraint violations and binder errors in psql](docs/screenshots/m2-psql-binder.svg)
 
+### Storage ([details](docs/storage.md))
+
+- One file of 8 kB pages, each with a CRC-32C checksum verified on read.
+- A buffer pool with pinning and clock eviction; the database can be far
+  larger than the cache.
+- B+trees with slotted pages, variable-length keys and values, overflow
+  pages for large values, linked leaves for range scans, and page reuse
+  through a free list.
+- Tables are clustered B+trees keyed by primary key, in an order-preserving
+  key encoding; secondary and unique indexes are B+trees too.
+- A persistent catalog, itself a B+tree.
+- A consistency checker that validates every tree, matches every index
+  against its table and accounts for every page of the file.
+
+The same storage engine runs under an in-memory database, so every test in
+the repository — and all of sqllogictest — goes through the pager and the
+B+tree.
+
+![a second server process reading what the first one wrote](docs/screenshots/m3-restart-after.svg)
+
 ### Protocol ([details](docs/wire-protocol.md))
 
 - Startup, including the `SSLRequest`/`GSSENCRequest` refusal and protocol
@@ -108,6 +134,9 @@ psql turns into a caret:
 | Compatibility of results | **104 121 sqllogictest records, 99.99% passing**; CI fails on any regression | [docs/sqllogictest.md](docs/sqllogictest.md) |
 | The parser | A corpus pinned to its canonical form, a parse → print → parse round trip, and a fuzzer that checks both on arbitrary input | [internal/sql](internal/sql) |
 | The binder and executor | Table-driven tests of every construct, including the error cases | [internal/engine](internal/engine) |
+| The B+tree and buffer pool | Long random operation sequences checked against a map, with a 16-page pool to force eviction; a fuzzer; invariants verified throughout; no page may leak | [internal/storage](internal/storage) |
+| Persistence | Restart tests at the engine level and through psql against a real file; corruption must be detected by checksum | [internal/engine](internal/engine), [compat/restart](compat/restart) |
+| Storage integrity under SQL | The consistency checker runs after every engine test and after each sqllogictest script | `DB.Verify` |
 | The protocol | A raw client written in the test from the specification, asserting exact message sequences | [internal/pgwire](internal/pgwire) |
 | psql 17 | Scripted sessions compared with checked-in transcripts | [compat/psql](compat/psql) |
 | pgx v5 (Go) | Every query execution mode, prepared statements, batches, transactions, cancellation, `database/sql` | [compat/pgx](compat/pgx) |
@@ -128,6 +157,14 @@ as invalid SQL); the input is now a regression seed.
 
 ![parser fuzzing](docs/screenshots/m2-fuzz.svg)
 
+The storage tests report what the tree and the pool did — here, trees of
+thousands of entries kept correct through tens of thousands of evictions:
+
+![storage engine tests](docs/screenshots/m3-storage-tests.svg)
+
+B+tree benchmarks, with their conditions and caveats, are in
+[docs/benchmarks.md](docs/benchmarks.md).
+
 Screenshots from the first milestone (protocol, JDBC) are in
 [docs/screenshots](docs/screenshots).
 
@@ -142,13 +179,15 @@ Screenshots from the first milestone (protocol, JDBC) are in
         └──────────┬──────────┘
                    │  Handler / Session / Prepared / Rows interfaces
         ┌──────────▼──────────┐
-        │   internal/engine   │  binder: scopes, types, grouping rules
-        │                     │  executor: in-memory, materialising (for now)
+        │   internal/engine   │──▶ internal/sql: lexer, parser, printer
+        │                     │  binder: scopes, types, grouping rules
+        │                     │  executor: materialising, nested loops (for now)
+        │                     │  rows ⇄ keys and tuples, catalog
         └──────────┬──────────┘
-                   │
+                   │  Get / Put / Delete / Seek on byte strings
         ┌──────────▼──────────┐
-        │    internal/sql     │  lexer, AST, recursive-descent + Pratt parser,
-        │                     │  canonical printer
+        │  internal/storage   │  B+trees, slotted pages, overflow pages,
+        │                     │  buffer pool, page file, checksums
         └─────────────────────┘
 ```
 
@@ -162,12 +201,15 @@ choices is recorded in [docs/decisions](docs/decisions).
 ## Running the tests
 
 ```bash
-go test ./...                          # core: parser, engine, raw protocol
+go test ./...                          # core: parser, engine, storage, raw protocol
 (cd compat/pgx && go test ./...)       # pgx driver
 bash scripts/slt.sh                    # sqllogictest; downloads the scripts once
 bash scripts/jdbc-smoke.sh             # pgjdbc; needs a JDK and curl
 bash scripts/psql-smoke.sh             # psql; uses Docker if psql is not installed
+bash scripts/restart-smoke.sh          # write, kill the server, reopen, read
+bash scripts/bench.sh                  # B+tree benchmarks
 go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m
+go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m
 ```
 
 CI runs all of it on Linux (core suite under the race detector), plus the core
@@ -178,8 +220,12 @@ and pgx suites on Windows. See [docs/development.md](docs/development.md).
 Stated plainly, because a database that overstates what it guarantees is
 worse than useless.
 
-- **No durability.** Data lives in memory and is gone when the process
-  exits. (Milestones 3 and 4.)
+- **Not crash-safe.** Data is on disk, but modified pages are written when
+  they are evicted, at `CHECKPOINT` and at clean shutdown — in no particular
+  order and with no log. `COMMIT` does not make anything durable. If the
+  process is killed between checkpoints, recent changes are lost and the
+  file may be left inconsistent; checksums and `-check` will detect that,
+  not repair it. (Milestone 4.)
 - **No isolation.** Changes are visible to other sessions the moment a
   statement runs, before `COMMIT`. `BEGIN ISOLATION LEVEL ...` is parsed and
   ignored; `SHOW transaction_isolation` answers `read uncommitted`, which is
@@ -193,9 +239,15 @@ worse than useless.
   that would materialise more than two million intermediate rows is refused
   rather than allowed to exhaust memory. Correlated subqueries are
   re-executed for every outer row. (Milestones 6 and 7.)
-- **Indexes are catalog entries.** `CREATE INDEX` is accepted; a unique
-  index is enforced by scanning, and no index speeds anything up until the
-  B+tree exists. (Milestone 3.)
+- **Indexes are maintained but not used by queries.** They enforce
+  uniqueness with a B+tree lookup; no `SELECT` reads through one until the
+  planner can choose to. (Milestone 6.)
+- **Queries hold whole tables in memory.** The executor materialises every
+  table it reads, so the buffer pool bounds the storage engine's memory but
+  not a query's. (Milestone 7.)
+- **Storage details:** a key (primary key or indexed columns) may be at most
+  1024 bytes; pages are freed when empty but never merged; the file does
+  not shrink; an `UPDATE` rewrites the whole row and its index entries.
 - **Missing SQL:** `UNION` / `INTERSECT` / `EXCEPT`, `RIGHT` and `FULL`
   joins, `JOIN ... USING`, window functions, CTEs, `ALTER TABLE`, foreign
   keys, `CHECK` constraints, views.
@@ -217,7 +269,8 @@ worse than useless.
 cmd/capivaradb     the server binary
 internal/pgwire    PostgreSQL wire protocol
 internal/sql       lexer, AST, parser, printer
-internal/engine    binder and executor (in-memory for now)
+internal/engine    binder, executor, row and key encoding, catalog
+internal/storage   page file, buffer pool, B+tree, consistency checker
 internal/pgerr     errors with SQLSTATE codes
 compat/            tests against real clients and sqllogictest baselines
 tools/slt          sqllogictest runner

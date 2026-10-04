@@ -1,0 +1,69 @@
+## server started on an empty file
+-- First server process: create and fill a database on disk.
+create table capivaras (
+    id      int primary key,
+    name    text not null unique,
+    weight  double precision default 45.5,
+    wild    boolean default true
+);
+CREATE TABLE
+create index capivaras_weight on capivaras (weight);
+CREATE INDEX
+insert into capivaras (id, name, weight) values (1, 'Filó', 48.5), (2, 'Bolota', 61), (3, 'Pingo', 35.2);
+INSERT 0 3
+insert into capivaras (id, name) values (4, 'Padrão');
+INSERT 0 1
+update capivaras set wild = false where name = 'Bolota';
+UPDATE 1
+delete from capivaras where id = 3;
+DELETE 1
+select * from capivaras;
+ id |  name  | weight | wild 
+----+--------+--------+------
+  1 | Filó   |   48.5 | t
+  2 | Bolota |     61 | f
+  4 | Padrão |   45.5 | t
+(3 rows)
+
+-- Without a write-ahead log, a checkpoint (or a clean shutdown) is what
+-- puts the changes on disk. The server is killed right after this.
+checkpoint;
+CHECKPOINT
+
+## server killed; checking the file offline
+ok: 1 tables, 2 indexes, 3 rows; N pages
+
+## a new server opens the same file
+-- Second server process, same file: everything is still there.
+select * from capivaras;
+ id |  name  | weight | wild 
+----+--------+--------+------
+  1 | Filó   |   48.5 | t
+  2 | Bolota |     61 | f
+  4 | Padrão |   45.5 | t
+(3 rows)
+
+-- So are the rules: the primary key, the unique name, the defaults.
+insert into capivaras values (1, 'Outra', 1, true);
+ERROR:  duplicate key value violates unique constraint "capivaras_pkey"
+DETAIL:  Key (id)=(1) already exists.
+insert into capivaras (id, name) values (5, 'Filó');
+ERROR:  duplicate key value violates unique constraint "capivaras_name_key"
+DETAIL:  Key (name)=(Filó) already exists.
+insert into capivaras (id, name) values (5, 'Nova');
+INSERT 0 1
+select name, weight, wild from capivaras where id = 5;
+ name | weight | wild 
+------+--------+------
+ Nova |   45.5 | t
+(1 row)
+
+-- The offline check above compared the index with the rows, entry by entry.
+-- (Queries do not use indexes yet: choosing one is the planner's job.)
+select name from capivaras where weight > 46 order by weight;
+  name  
+--------
+ Filó
+ Bolota
+(2 rows)
+

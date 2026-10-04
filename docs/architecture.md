@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the code as it stands at milestone 2 and marks what
+This document describes the code as it stands at milestone 3 and marks what
 each later milestone changes. It is updated with every milestone.
 
 ## Layers
@@ -9,7 +9,8 @@ each later milestone changes. It is updated with every milestone.
 |---------|----------------|-------------|
 | `cmd/capivaradb` | Flags, listener, signal handling | everything |
 | `internal/pgwire` | Wire protocol: bytes ⇄ interface calls | `pgerr` |
-| `internal/engine` | Scopes, type checking, grouping rules, execution, transactions | `pgwire` interfaces, `sql`, `pgerr` |
+| `internal/engine` | Scopes, type checking, grouping rules, execution, transactions, row and key encoding, catalog | `pgwire` interfaces, `sql`, `storage`, `pgerr` |
+| `internal/storage` | Page file, buffer pool, B+trees, consistency checks | nothing |
 | `internal/sql` | Lexer, AST, parser, canonical printer | `pgerr` |
 | `internal/pgerr` | Error type carrying a SQLSTATE | nothing |
 
@@ -150,15 +151,16 @@ implementation: it is the reference that the planner (milestone 6) and the
 iterator executor (milestone 7) must agree with, and sqllogictest pins its
 answers.
 
-A table is a slice of row pointers behind one `sync.RWMutex` for the whole
-database. Readers copy the slice of row references under the read lock and
-release it before evaluating anything; that is safe because a row's value
-slice is never modified in place — an update swaps in a new slice. Writers
-hold the write lock for the statement, and a subquery inside a writing
-statement is told the lock is already held.
+**Storage.** Each table is a B+tree and so is each index; see
+[storage.md](storage.md). A scan decodes every row of the tree under the
+database's read lock; writers hold the write lock for the statement, and a
+subquery inside a writing statement is told the lock is already held. An
+`UPDATE` or `DELETE` reads all the rows it might touch before changing any,
+because a changed row can move within the tree.
 
-**Constraints.** `NOT NULL`, `PRIMARY KEY` and `UNIQUE` (including unique
-indexes) are checked on every insert and update by scanning the table. As in
+**Constraints.** `NOT NULL` is checked on the row; `PRIMARY KEY` is the
+table's own key, so a duplicate is found by a lookup; `UNIQUE` constraints
+are unique indexes, checked by seeking the indexed values. As in
 PostgreSQL, NULLs never conflict with each other, and constraints get the
 names PostgreSQL would generate (`t_pkey`, `t_a_b_key`).
 
@@ -186,9 +188,8 @@ otherwise, as in PostgreSQL.
 
 | Today | Replaced by |
 |-------|-------------|
-| Catalog entries for indexes, constraints checked by scanning | B+tree indexes (M3) |
-| `[]*row` in memory | Slotted pages, buffer pool, B+tree (M3) |
-| Undo closures | WAL records with redo and undo (M4) |
+| Pages written at eviction and checkpoint, undo as closures in memory | WAL records with redo and undo (M4) |
+| Indexes maintained but never read by queries | Index scans chosen by the planner (M6) |
 | One global lock, no isolation | MVCC snapshots, row versions, vacuum (M5) |
 | Joins in the order written, filters applied last | Cost-based planner (M6) |
 | Every step materialised, nested-loop joins | Iterator tree behind the same `Rows` interface (M7) |

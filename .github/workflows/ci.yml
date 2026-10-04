@@ -49,6 +49,10 @@ jobs:
         if: runner.os == 'Linux'
         run: go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 30s
 
+      - name: Fuzz the B+tree briefly
+        if: runner.os == 'Linux'
+        run: go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 30s
+
       - name: pgx driver tests
         working-directory: compat/pgx
         run: go test -count=1 ./...
@@ -72,6 +76,9 @@ jobs:
 
       - name: psql smoke test
         run: bash scripts/psql-smoke.sh
+
+      - name: Restart test (data survives the server process)
+        run: bash scripts/restart-smoke.sh
 
   sqllogictest:
     name: sqllogictest

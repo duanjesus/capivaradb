@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="921" height="750" viewBox="0 0 921 750" role="img" aria-label="first server: write, checkpoint, kill">
+<rect width="921" height="750" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h901 a10 10 0 0 1 10 10v24 h-921 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="460" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">first server: write, checkpoint, kill</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">## server started on an empty file</text>
+<text x="18" y="86" fill="#8b949e">-- First server process: create and fill a database on disk.</text>
+<text x="18" y="106" fill="#e6edf3">create table capivaras (</text>
+<text x="18" y="126" fill="#e6edf3">    id      int primary key,</text>
+<text x="18" y="146" fill="#e6edf3">    name    text not null unique,</text>
+<text x="18" y="166" fill="#e6edf3">    weight  double precision default 45.5,</text>
+<text x="18" y="186" fill="#e6edf3">    wild    boolean default true</text>
+<text x="18" y="206" fill="#e6edf3">);</text>
+<text x="18" y="226" fill="#e6edf3">CREATE TABLE</text>
+<text x="18" y="246" fill="#e6edf3">create index capivaras_weight on capivaras (weight);</text>
+<text x="18" y="266" fill="#e6edf3">CREATE INDEX</text>
+<text x="18" y="286" fill="#e6edf3">insert into capivaras (id, name, weight) values (1, &#39;Filó&#39;, 48.5), (2, &#39;Bolota&#39;, 61), (3, &#39;Pingo&#39;, 35.2);</text>
+<text x="18" y="306" fill="#e6edf3">INSERT 0 3</text>
+<text x="18" y="326" fill="#e6edf3">insert into capivaras (id, name) values (4, &#39;Padrão&#39;);</text>
+<text x="18" y="346" fill="#e6edf3">INSERT 0 1</text>
+<text x="18" y="366" fill="#e6edf3">update capivaras set wild = false where name = &#39;Bolota&#39;;</text>
+<text x="18" y="386" fill="#e6edf3">UPDATE 1</text>
+<text x="18" y="406" fill="#e6edf3">delete from capivaras where id = 3;</text>
+<text x="18" y="426" fill="#e6edf3">DELETE 1</text>
+<text x="18" y="446" fill="#e6edf3">select * from capivaras;</text>
+<text x="18" y="466" fill="#e6edf3"> id |  name  | weight | wild</text>
+<text x="18" y="486" fill="#8b949e">----+--------+--------+------</text>
+<text x="18" y="506" fill="#e6edf3">  1 | Filó   |   48.5 | t</text>
+<text x="18" y="526" fill="#e6edf3">  2 | Bolota |     61 | f</text>
+<text x="18" y="546" fill="#e6edf3">  4 | Padrão |   45.5 | t</text>
+<text x="18" y="566" fill="#e6edf3">(3 rows)</text>
+<text x="18" y="606" fill="#8b949e">-- Without a write-ahead log, a checkpoint (or a clean shutdown) is what</text>
+<text x="18" y="626" fill="#8b949e">-- puts the changes on disk. The server is killed right after this.</text>
+<text x="18" y="646" fill="#e6edf3">checkpoint;</text>
+<text x="18" y="666" fill="#e6edf3">CHECKPOINT</text>
+<text x="18" y="706" fill="#8b949e">## server killed; checking the file offline</text>
+<text x="18" y="726" fill="#e6edf3">ok: 1 tables, 2 indexes, 3 rows; N pages</text>
+</g>
+</svg>

@@ -174,6 +174,8 @@ type Begin struct {
 type (
 	Commit   struct{}
 	Rollback struct{}
+	// Checkpoint asks for every modified page to be written to disk.
+	Checkpoint struct{}
 )
 
 type Set struct {

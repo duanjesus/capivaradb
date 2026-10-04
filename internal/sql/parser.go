@@ -244,6 +244,9 @@ func (p *parser) statement() (Node, error) {
 		p.i++
 		p.txnNoise()
 		return &Rollback{}, nil
+	case "checkpoint":
+		p.i++
+		return &Checkpoint{}, nil
 	case "set":
 		return p.setStmt()
 	case "show":
@@ -1163,6 +1166,12 @@ func (p *parser) prefix() (Expr, error) {
 			return e, p.expectOp(")")
 		case "-", "+":
 			p.i++
+			// The smallest bigint has no positive counterpart, so its digits
+			// only make sense together with the sign.
+			if next := p.peek(); t.Text == "-" && next.Kind == TInt && next.Text == "9223372036854775808" {
+				p.i++
+				return &Literal{Val: int64(math.MinInt64), Type: Int8, Pos: t.Pos}, nil
+			}
 			x, err := p.expr(bpUnary)
 			if err != nil {
 				return nil, err

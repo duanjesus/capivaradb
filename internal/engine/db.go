@@ -1,47 +1,114 @@
-// Package engine is the in-memory execution engine: tables are slices of
-// rows behind one database-wide lock.
+// Package engine binds and executes SQL on top of the storage layer.
 //
-// It exists so that the SQL front end and the wire protocol can be exercised
-// end to end by real clients. It is deliberately naive — no persistence, no
-// isolation between concurrent transactions, full scans and nested-loop
-// joins only — and is replaced piece by piece by the storage engine, WAL,
-// MVCC and planner of the later milestones. What is meant to last is the
-// semantic layer (name resolution, typing, grouping rules) and the boundary:
-// everything the protocol layer needs goes through pgwire.Session.
+// Rows live in B+trees (see store.go); the catalog is persistent. What is
+// still deliberately naive is everything about concurrency and planning: one
+// database-wide lock, no isolation between concurrent transactions, full
+// scans and nested-loop joins only. Those are the subjects of the later
+// milestones. Everything the protocol layer needs goes through
+// pgwire.Session.
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
 	"github.com/duanjesus/capivaradb/internal/sql"
+	"github.com/duanjesus/capivaradb/internal/storage"
 	"github.com/duanjesus/capivaradb/internal/version"
 )
 
-// DB is an in-memory database. It implements pgwire.Handler.
+// DefaultPoolPages is the default size of the buffer pool: 4096 pages of
+// 8 kB, or 32 MB.
+const DefaultPoolPages = 4096
+
+// DB is a database. It implements pgwire.Handler.
 type DB struct {
-	// mu guards tables, indexes and everything reachable from them.
-	// Writers hold it for a whole statement; readers only while copying
-	// the row slice.
+	// mu guards the catalog maps and, for now, every page: writers hold it
+	// for a whole statement, readers while they scan.
 	mu      sync.RWMutex
+	pager   *storage.Pager
+	closed  bool
+	catalog *storage.Tree
 	tables  map[string]*table
 	indexes map[string]*index
 }
 
-// New returns an empty database.
+// New returns an empty database held in memory. It uses the same storage
+// engine as a database on disk, on top of an in-memory file.
 func New() *DB {
-	return &DB{tables: make(map[string]*table), indexes: make(map[string]*index)}
+	db, err := open(storage.NewMemFile(), DefaultPoolPages)
+	if err != nil {
+		panic(fmt.Sprintf("engine: opening an in-memory database: %v", err))
+	}
+	return db
+}
+
+// Open opens the database stored in the file at path, creating it if it
+// does not exist. poolPages is the size of the buffer pool in pages.
+func Open(path string, poolPages int) (*DB, error) {
+	file, err := storage.OpenFile(path)
+	if err != nil {
+		return nil, err
+	}
+	db, err := open(file, poolPages)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func open(file storage.File, poolPages int) (*DB, error) {
+	pager, err := storage.Open(file, poolPages)
+	if err != nil {
+		return nil, err
+	}
+	db := &DB{pager: pager, tables: make(map[string]*table), indexes: make(map[string]*index)}
+	if root := pager.CatalogRoot(); root != 0 {
+		db.catalog = storage.OpenTree(pager, root)
+		return db, db.loadCatalog()
+	}
+	if db.catalog, err = storage.CreateTree(pager); err != nil {
+		return nil, err
+	}
+	pager.SetCatalogRoot(db.catalog.Root())
+	return db, pager.Flush()
+}
+
+// Checkpoint writes every modified page to the file and syncs it.
+func (db *DB) Checkpoint() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.pager.Flush()
+}
+
+// Close checkpoints and closes the database file.
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.closed = true
+	return db.pager.Close()
+}
+
+// Stats reports the buffer pool counters and the size of the file in pages.
+func (db *DB) Stats() (stats storage.Stats, pages, poolPages int) {
+	return db.pager.Stats(), db.pager.PageCount(), db.pager.PoolPages()
 }
 
 type table struct {
 	name string
 	cols []column
-	rows []*row
-	// uniques lists the column sets that must be unique: the primary key,
-	// UNIQUE constraints and unique indexes.
-	uniques []*unique
+	// pk lists the primary key columns; nil means rows are keyed by a
+	// hidden row ID, handed out from nextRowID.
+	pk        []int
+	tree      *storage.Tree
+	nextRowID int64
+	// indexes are the secondary indexes, including the ones that back
+	// UNIQUE constraints. The slice is replaced, never modified in place.
+	indexes []*index
 }
 
 type column struct {
@@ -49,30 +116,20 @@ type column struct {
 	typ     sql.Type
 	notNull bool
 	// def computes the column's DEFAULT, already converted to the column
-	// type; nil means the default is NULL.
-	def evalFn
+	// type; nil means the default is NULL. defSQL is its source text, which
+	// is what the catalog stores.
+	def    evalFn
+	defSQL string
 }
 
-type unique struct {
-	name string
-	cols []int
-}
-
-// index records a CREATE INDEX. Until the B+tree exists (milestone 3) an
-// index is only a catalog entry: a unique one is enforced by scanning, and a
-// plain one changes nothing.
+// index is a secondary index: a B+tree whose keys are the indexed columns
+// followed by the key of the row in the table.
 type index struct {
 	name   string
 	table  *table
-	unique *unique // nil for a non-unique index
-}
-
-// row is a pointer so that a row keeps its identity across updates, which is
-// what the undo log refers to. The vals slice itself is never modified in
-// place: an update swaps in a new slice. Readers can therefore keep using a
-// slice they copied out under the lock after releasing it.
-type row struct {
-	vals []any
+	cols   []int
+	unique bool
+	tree   *storage.Tree
 }
 
 func (t *table) colIndex(name string) int {
@@ -84,14 +141,25 @@ func (t *table) colIndex(name string) int {
 	return -1
 }
 
-// colNames joins the names of the given columns, for constraint names and
-// error details.
+// colNames joins the names of the given columns.
 func (t *table) colNames(cols []int, sep string) string {
 	names := make([]string, len(cols))
 	for i, c := range cols {
 		names[i] = t.cols[c].name
 	}
 	return strings.Join(names, sep)
+}
+
+// changes collects what a statement did, so that it can be undone or, at
+// commit, finished.
+type changes struct {
+	// undo holds one function per change; rolling back runs them newest
+	// first.
+	undo []func()
+	// onCommit holds work that must wait until the change is final, such
+	// as freeing the pages of a dropped table: until then a rollback has
+	// to be able to bring the table back.
+	onCommit []func() error
 }
 
 // Session is the state of one client connection. It implements
@@ -104,9 +172,8 @@ type Session struct {
 
 	inTx   bool
 	failed bool
-	// undo holds one function per change made by the open transaction;
-	// ROLLBACK runs them newest first.
-	undo []func()
+	// tx accumulates the changes of the open transaction block.
+	tx changes
 }
 
 // NewSession implements pgwire.Handler.
@@ -177,37 +244,57 @@ func (s *Session) begin() {
 	s.inTx = true
 }
 
-func (s *Session) commit() {
-	s.inTx, s.failed, s.undo = false, false, nil
+// finish runs the work that was waiting for the changes to become final.
+// The caller must hold db.mu.
+func (ch *changes) finish() error {
+	for _, fn := range ch.onCommit {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// revert undoes the changes, newest first. The caller must hold db.mu.
+func (ch *changes) revert() {
+	for i := len(ch.undo) - 1; i >= 0; i-- {
+		ch.undo[i]()
+	}
+}
+
+func (s *Session) commit() error {
+	s.db.mu.Lock()
+	err := s.tx.finish()
+	s.db.mu.Unlock()
+	s.inTx, s.failed, s.tx = false, false, changes{}
+	return err
 }
 
 func (s *Session) rollback() {
 	s.db.mu.Lock()
-	for i := len(s.undo) - 1; i >= 0; i-- {
-		s.undo[i]()
-	}
+	s.tx.revert()
 	s.db.mu.Unlock()
-	s.inTx, s.failed, s.undo = false, false, nil
+	s.inTx, s.failed, s.tx = false, false, changes{}
 }
 
-// write runs a data-modifying statement under the write lock. fn appends an
-// undo function for every change it makes. If fn fails, its changes are
-// undone on the spot, so a statement either happens entirely or not at all;
-// if it succeeds inside a transaction block, the undo functions are kept for
-// a possible ROLLBACK.
-func (s *Session) write(fn func(undo *[]func()) (string, error)) (*result, error) {
+// write runs a data-modifying statement under the write lock. fn records
+// every change it makes. If fn fails, its changes are undone on the spot,
+// so a statement either happens entirely or not at all; if it succeeds
+// inside a transaction block, the record is kept for COMMIT or ROLLBACK.
+func (s *Session) write(fn func(ch *changes) (string, error)) (*result, error) {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
-	var undo []func()
-	tag, err := fn(&undo)
+	var ch changes
+	tag, err := fn(&ch)
 	if err != nil {
-		for i := len(undo) - 1; i >= 0; i-- {
-			undo[i]()
-		}
+		ch.revert()
 		return nil, err
 	}
 	if s.inTx {
-		s.undo = append(s.undo, undo...)
+		s.tx.undo = append(s.tx.undo, ch.undo...)
+		s.tx.onCommit = append(s.tx.onCommit, ch.onCommit...)
+	} else if err := ch.finish(); err != nil {
+		return nil, err
 	}
 	return &result{tag: tag}, nil
 }

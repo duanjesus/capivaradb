@@ -316,7 +316,8 @@ func (r *runner) runFile(path, root string) (fileResult, error) {
 	}
 
 	// Every script gets a database of its own.
-	sess, err := engine.New().NewSession(map[string]string{"user": "slt", "database": "slt"})
+	db := engine.New()
+	sess, err := db.NewSession(map[string]string{"user": "slt", "database": "slt"})
 	if err != nil {
 		return res, err
 	}
@@ -339,6 +340,14 @@ func (r *runner) runFile(path, root string) (fileResult, error) {
 		}
 	}
 	res.elapsed = time.Since(start)
+
+	// After tens of thousands of statements the storage must still be
+	// intact: every B+tree valid, every index matching its table, no page
+	// leaked. A violation is a bug, so it stops the run.
+	sess.Close()
+	if _, err := db.Verify(); err != nil {
+		return res, fmt.Errorf("%s left the database inconsistent: %w", res.name, err)
+	}
 	return res, nil
 }
 

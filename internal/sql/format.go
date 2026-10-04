@@ -182,6 +182,8 @@ func (f *formatter) stmt(node Node) {
 		}
 	case *Commit:
 		f.w("commit")
+	case *Checkpoint:
+		f.w("checkpoint")
 	case *Rollback:
 		f.w("rollback")
 	case *Set:

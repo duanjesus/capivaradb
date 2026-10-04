@@ -70,6 +70,7 @@ func TestExpressionPrecedence(t *testing.T) {
 		{"t.id % 2", "(t.id % 2)"},
 		{"upper(name || '!')", "upper((name || '!'))"},
 		{"- 5", "(-5)"},
+		{"-9223372036854775808", "(-9223372036854775808)"},
 		{"+ 5", "5"},
 		{"1 - -5", "(1 - (-5))"},
 		{"-2147483648", "(-2147483648)"},
@@ -246,6 +247,7 @@ var corpus = []struct{ src, canonical string }{
 		"set default_transaction_isolation = 'read uncommitted'"},
 	{"set search_path to public, extra", "set search_path = 'public, extra'"},
 	{"show time zone", "show timezone"},
+	{"CHECKPOINT", "checkpoint"},
 }
 
 func TestCorpus(t *testing.T) {

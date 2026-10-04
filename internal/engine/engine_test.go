@@ -25,6 +25,17 @@ func newHarness(t *testing.T, db *DB) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Registered first so that it runs last, after the session has closed:
+	// whatever the test did, the file must still be consistent and every
+	// page accounted for.
+	t.Cleanup(func() {
+		if db.closed {
+			return // the test closed it, and checked it before doing so
+		}
+		if _, err := db.Verify(); err != nil {
+			t.Errorf("database is inconsistent after the test: %v", err)
+		}
+	})
 	t.Cleanup(sess.Close)
 	return &harness{t: t, sess: sess}
 }

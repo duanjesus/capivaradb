@@ -20,7 +20,11 @@
 | Accept new sqllogictest counts | `bash scripts/slt.sh --update` (also rewrites `docs/sqllogictest.md`) |
 | Fuzz the parser | `go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m` |
 | Accept new psql output | `bash scripts/psql-smoke.sh --update` |
-| Regenerate screenshots | `bash scripts/screenshots.sh m2` |
+| Restart test | `bash scripts/restart-smoke.sh` |
+| Fuzz the B+tree | `go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m` |
+| Benchmarks | `bash scripts/bench.sh` |
+| Check a database file | `go run ./cmd/capivaradb -data file.cdb -check` |
+| Regenerate screenshots | `bash scripts/screenshots.sh m3` |
 | Format check | `gofmt -l .` (must print nothing) |
 
 The scripts are bash and run unchanged on Linux and under Git Bash on
