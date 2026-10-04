@@ -1,0 +1,5 @@
+# LF everywhere, regardless of the platform's default: the shell scripts and
+# the psql expected output break with CRLF.
+* text=auto eol=lf
+*.svg text eol=lf
+*.jar binary

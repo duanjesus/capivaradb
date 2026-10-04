@@ -1,0 +1,6 @@
+# Build output, downloaded driver jars and smoke-test scratch files.
+/.cache/
+*.exe
+*.test
+*.out
+!compat/psql/expected.out

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: The core must not have dependencies
+        shell: bash
+        run: |
+          modules="$(go list -m all)"
+          echo "$modules"
+          test "$(echo "$modules" | wc -l)" -eq 1
+
+      - name: Formatting
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with the race detector
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
+
+      - name: Test
+        if: runner.os != 'Linux'
+        run: go test -count=1 ./...
+
+      - name: pgx driver tests
+        working-directory: compat/pgx
+        run: go test -count=1 ./...
+
+  clients:
+    name: psql and JDBC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: JDBC smoke test
+        run: bash scripts/jdbc-smoke.sh
+
+      - name: psql smoke test
+        run: bash scripts/psql-smoke.sh

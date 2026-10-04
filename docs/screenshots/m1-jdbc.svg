@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="701" height="490" viewBox="0 0 701 490" role="img" aria-label="pgjdbc smoke test">
+<rect width="701" height="490" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h681 a10 10 0 0 1 10 10v24 h-701 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="350" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">pgjdbc smoke test</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ scripts/jdbc-smoke.sh</text>
+<text x="18" y="86" fill="#e6edf3">driver: PostgreSQL JDBC Driver 42.7.7</text>
+<text x="18" y="106" fill="#7ee787">ok    server version seen by the driver              16.0</text>
+<text x="18" y="126" fill="#e6edf3">server: CapivaraDB 0.1.0 (PostgreSQL 16.0 wire-compatible)</text>
+<text x="18" y="146" fill="#7ee787">ok    insert ana                                     1</text>
+<text x="18" y="166" fill="#7ee787">ok    insert bia                                     1</text>
+<text x="18" y="186" fill="#7ee787">ok    insert caio                                    1</text>
+<text x="18" y="206" fill="#7ee787">ok    column types (run 1)                           int4,text,int8,float8,bool</text>
+<text x="18" y="226" fill="#7ee787">ok    row (run 1)                                    3,caio,41,0.0,true</text>
+<text x="18" y="246" fill="#7ee787">ok    no more rows (run 1)                           false</text>
+<text x="18" y="266" fill="#7ee787">ok    column types (run 7)                           int4,text,int8,float8,bool</text>
+<text x="18" y="286" fill="#7ee787">ok    row (run 7)                                    3,caio,41,0.0,true</text>
+<text x="18" y="306" fill="#7ee787">ok    no more rows (run 7)                           false</text>
+<text x="18" y="326" fill="#7ee787">ok    NULL is reported by wasNull()                  true</text>
+<text x="18" y="346" fill="#7ee787">ok    duplicate key SQLSTATE                         23505</text>
+<text x="18" y="366" fill="#7ee787">ok    unknown column SQLSTATE                        42703</text>
+<text x="18" y="386" fill="#7ee787">ok    delete inside a transaction                    2</text>
+<text x="18" y="406" fill="#7ee787">ok    rows after rollback                            3</text>
+<text x="18" y="426" fill="#7ee787">ok    batch update counts                            [1, 1, 1]</text>
+<text x="18" y="446" fill="#7ee787">ok    score after committed batch                    10.5</text>
+<text x="18" y="466" fill="#7ee787">all checks passed</text>
+</g>
+</svg>

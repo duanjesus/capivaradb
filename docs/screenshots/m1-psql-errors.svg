@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="769" height="990" viewBox="0 0 769 990" role="img" aria-label="psql: transactions and error positions">
+<rect width="769" height="990" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h749 a10 10 0 0 1 10 10v24 h-769 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="384" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">psql: transactions and error positions</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">-- Transactions: the prompt-less psql still tracks the status byte.</text>
+<text x="18" y="86" fill="#e6edf3">begin;</text>
+<text x="18" y="106" fill="#e6edf3">BEGIN</text>
+<text x="18" y="126" fill="#e6edf3">insert into capivaras values (4, &#39;Temporária&#39;, 1, true);</text>
+<text x="18" y="146" fill="#e6edf3">INSERT 0 1</text>
+<text x="18" y="166" fill="#e6edf3">select name from capivaras where id = 4;</text>
+<text x="18" y="186" fill="#e6edf3">    name</text>
+<text x="18" y="206" fill="#8b949e">------------</text>
+<text x="18" y="226" fill="#e6edf3"> Temporária</text>
+<text x="18" y="246" fill="#e6edf3">(1 row)</text>
+<text x="18" y="286" fill="#e6edf3">rollback;</text>
+<text x="18" y="306" fill="#e6edf3">ROLLBACK</text>
+<text x="18" y="326" fill="#e6edf3">select name from capivaras where id = 4;</text>
+<text x="18" y="346" fill="#e6edf3"> name</text>
+<text x="18" y="366" fill="#8b949e">------</text>
+<text x="18" y="386" fill="#e6edf3">(0 rows)</text>
+<text x="18" y="426" fill="#8b949e">-- Errors carry a position, which psql turns into a caret.</text>
+<text x="18" y="446" fill="#e6edf3">select nome from capivaras;</text>
+<text x="18" y="466" fill="#ff7b72">ERROR:  column &#34;nome&#34; does not exist</text>
+<text x="18" y="486" fill="#ffa198">LINE 1: select nome from capivaras;</text>
+<text x="18" y="506" fill="#ffa198">               ^</text>
+<text x="18" y="526" fill="#e6edf3">selec 1;</text>
+<text x="18" y="546" fill="#ff7b72">ERROR:  syntax error at or near &#34;selec&#34;</text>
+<text x="18" y="566" fill="#ffa198">LINE 1: selec 1;</text>
+<text x="18" y="586" fill="#ffa198">        ^</text>
+<text x="18" y="606" fill="#e6edf3">insert into capivaras values (1, &#39;Repetida&#39;, 1, true);</text>
+<text x="18" y="626" fill="#ff7b72">ERROR:  duplicate key value violates unique constraint &#34;capivaras_pkey&#34;</text>
+<text x="18" y="646" fill="#ffa198">DETAIL:  Key (id)=(1) already exists.</text>
+<text x="18" y="666" fill="#e6edf3">select 1 / 0;</text>
+<text x="18" y="686" fill="#ff7b72">ERROR:  division by zero</text>
+<text x="18" y="706" fill="#8b949e">-- A failed transaction refuses work until it is rolled back.</text>
+<text x="18" y="726" fill="#e6edf3">begin;</text>
+<text x="18" y="746" fill="#e6edf3">BEGIN</text>
+<text x="18" y="766" fill="#e6edf3">select 1 / 0;</text>
+<text x="18" y="786" fill="#ff7b72">ERROR:  division by zero</text>
+<text x="18" y="806" fill="#e6edf3">select 1;</text>
+<text x="18" y="826" fill="#ff7b72">ERROR:  current transaction is aborted, commands ignored until end of transaction block</text>
+<text x="18" y="846" fill="#e6edf3">commit;</text>
+<text x="18" y="866" fill="#e6edf3">ROLLBACK</text>
+<text x="18" y="886" fill="#e6edf3">show transaction isolation level;</text>
+<text x="18" y="906" fill="#e6edf3"> transaction_isolation</text>
+<text x="18" y="926" fill="#8b949e">-----------------------</text>
+<text x="18" y="946" fill="#e6edf3"> read uncommitted</text>
+<text x="18" y="966" fill="#e6edf3">(1 row)</text>
+</g>
+</svg>
