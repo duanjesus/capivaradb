@@ -25,16 +25,28 @@ select * from capivaras;
   4 | Padrão |   45.5 | t
 (3 rows)
 
--- Without a write-ahead log, a checkpoint (or a clean shutdown) is what
--- puts the changes on disk. The server is killed right after this.
-checkpoint;
-CHECKPOINT
+-- A transaction left open: the server is killed while it is in progress.
+begin;
+BEGIN
+insert into capivaras (id, name) values (99, 'Fantasma');
+INSERT 0 1
+update capivaras set weight = 0;
+UPDATE 4
+select id, name, weight from capivaras order by id;
+ id |   name   | weight 
+----+----------+--------
+  1 | Filó     |      0
+  2 | Bolota   |      0
+  4 | Padrão   |      0
+ 99 | Fantasma |      0
+(4 rows)
 
-## server killed; checking the file offline
-ok: 1 tables, 2 indexes, 3 rows; N pages
+-- No COMMIT, no CHECKPOINT, no clean shutdown: the server is killed here.
 
-## a new server opens the same file
--- Second server process, same file: everything is still there.
+## server killed with kill -9; a new one opens the same files
+recovered from the log: N records, N page changes replayed, N unfinished transactions rolled back
+-- Second server process, same file. What was committed is there; the
+-- transaction that was open when the server died is gone without a trace.
 select * from capivaras;
  id |  name  | weight | wild 
 ----+--------+--------+------
@@ -58,7 +70,8 @@ select name, weight, wild from capivaras where id = 5;
  Nova |   45.5 | t
 (1 row)
 
--- The offline check above compared the index with the rows, entry by entry.
+-- The offline check at the end compares the index with the rows, entry by
+-- entry.
 -- (Queries do not use indexes yet: choosing one is the planner's job.)
 select name from capivaras where weight > 46 order by weight;
   name  
@@ -67,3 +80,6 @@ select name from capivaras where weight > 46 order by weight;
  Bolota
 (2 rows)
 
+
+## offline check of the file
+ok: 1 tables, 2 indexes, 4 rows; N pages

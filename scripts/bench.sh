@@ -3,4 +3,4 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 cd "$ROOT"
-go test ./internal/storage -run XXX -bench . -benchtime "${BENCHTIME:-2s}"
+go test ./internal/storage ./internal/engine -run XXX -bench . -benchtime "${BENCHTIME:-2s}"

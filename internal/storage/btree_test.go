@@ -13,7 +13,7 @@ import (
 
 func newPager(t testing.TB, poolPages int) *Pager {
 	t.Helper()
-	p, err := Open(NewMemFile(), poolPages)
+	p, err := Open(NewMemFile(), NewMemFile(), Options{PoolPages: poolPages})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestRandomOperations(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newPager(t, tc.pool)
-			tree, err := CreateTree(p)
+			tree, err := CreateTree(p, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -223,7 +223,7 @@ func TestRandomOperations(t *testing.T) {
 
 func TestSequentialInsertsAndScans(t *testing.T) {
 	p := newPager(t, 64)
-	tree, _ := CreateTree(p)
+	tree, _ := CreateTree(p, 0)
 	m := &model{t: t, tree: tree, want: map[string][]byte{}}
 	key := func(i int) []byte { return binary.BigEndian.AppendUint64(nil, uint64(i)) }
 
@@ -276,8 +276,8 @@ func TestSequentialInsertsAndScans(t *testing.T) {
 }
 
 func TestOverflowValues(t *testing.T) {
-	p := newPager(t, 16)
-	tree, _ := CreateTree(p)
+	p := newPager(t, 512)
+	tree, _ := CreateTree(p, 0)
 	m := &model{t: t, tree: tree, want: map[string][]byte{}}
 	rng := rand.New(rand.NewSource(7))
 	big := func(n int) []byte {
@@ -311,7 +311,7 @@ func TestOverflowValues(t *testing.T) {
 
 func TestKeyLimits(t *testing.T) {
 	p := newPager(t, 16)
-	tree, _ := CreateTree(p)
+	tree, _ := CreateTree(p, 0)
 	if err := tree.Put(make([]byte, MaxKeySize+1), nil); !errors.Is(err, ErrKeyTooLarge) {
 		t.Errorf("expected ErrKeyTooLarge, got %v", err)
 	}
@@ -328,8 +328,8 @@ func TestKeyLimits(t *testing.T) {
 
 func TestDropFreesEverything(t *testing.T) {
 	p := newPager(t, 32)
-	keep, _ := CreateTree(p)
-	doomed, _ := CreateTree(p)
+	keep, _ := CreateTree(p, 0)
+	doomed, _ := CreateTree(p, 0)
 	rng := rand.New(rand.NewSource(9))
 	for i := 0; i < 5000; i++ {
 		key := []byte(fmt.Sprint("key", i))
@@ -350,7 +350,7 @@ func TestDropFreesEverything(t *testing.T) {
 	}
 	// New trees are built out of the recycled pages.
 	before := p.PageCount()
-	again, _ := CreateTree(p)
+	again, _ := CreateTree(p, 0)
 	for i := 0; i < 2000; i++ {
 		again.Put([]byte(fmt.Sprint("key", i)), []byte("recycled"))
 	}
@@ -368,7 +368,13 @@ func TestPersistence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		p, err := Open(f, 16)
+		log, err := OpenFile(path + ".wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Crash safety has tests of its own; this one is about the file
+		// format, and syncing on every eviction would only make it slow.
+		p, err := Open(f, log, Options{PoolPages: 16, NoSync: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -376,7 +382,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	p := open()
-	tree, _ := CreateTree(p)
+	tree, _ := CreateTree(p, 0)
 	m := &model{t: t, tree: tree, want: map[string][]byte{}}
 	rng := rand.New(rand.NewSource(11))
 	for i := 0; i < 5000; i++ {
@@ -402,8 +408,9 @@ func TestPersistence(t *testing.T) {
 
 func TestChecksumDetectsCorruption(t *testing.T) {
 	file := NewMemFile()
-	p, _ := Open(file, 16)
-	tree, _ := CreateTree(p)
+	log := NewMemFile()
+	p, _ := Open(file, log, Options{PoolPages: 16})
+	tree, _ := CreateTree(p, 0)
 	for i := 0; i < 2000; i++ {
 		tree.Put([]byte(fmt.Sprint("key", i)), []byte("value"))
 	}
@@ -415,7 +422,7 @@ func TestChecksumDetectsCorruption(t *testing.T) {
 	// Flip one bit in the middle of a page, as a failing disk would.
 	file.data[3*PageSize+1234] ^= 0x10
 
-	p, err := Open(file, 16)
+	p, err := Open(file, log, Options{PoolPages: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,19 +438,25 @@ func TestChecksumDetectsCorruption(t *testing.T) {
 
 	// The meta page is protected too.
 	file.data[offPageCount] ^= 0x01
-	if _, err := Open(file, 16); !errors.Is(err, ErrCorrupt) {
+	if _, err := Open(file, log, Options{PoolPages: 16}); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("expected ErrCorrupt for a damaged meta page, got %v", err)
 	}
-	if _, err := Open(&MemFile{data: bytes.Repeat([]byte("not a database "), 1000)}, 16); !errors.Is(err, ErrCorrupt) {
+	if _, err := Open(&MemFile{data: bytes.Repeat([]byte("not a database "), 1000)}, NewMemFile(), Options{PoolPages: 16}); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("expected ErrCorrupt for a foreign file, got %v", err)
 	}
 }
 
 func TestPoolExhaustion(t *testing.T) {
 	p := newPager(t, 8)
+	tree, _ := CreateTree(p, 0)
+	for i := 0; i < 3000; i++ { // enough for the file to have dozens of pages
+		if err := tree.Put([]byte(fmt.Sprint("key", i)), bytes.Repeat([]byte("v"), 100)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var held []*Page
-	for {
-		pg, err := p.Alloc(pageLeaf)
+	for id := uint32(1); ; id++ {
+		pg, err := p.Fetch(id)
 		if err != nil {
 			if !errors.Is(err, ErrPoolExhausted) {
 				t.Fatalf("expected ErrPoolExhausted, got %v", err)
@@ -456,14 +469,14 @@ func TestPoolExhaustion(t *testing.T) {
 		}
 	}
 	// Releasing one pin is enough to carry on.
-	held[0].Unpin(true)
-	pg, err := p.Alloc(pageLeaf)
+	held[0].Unpin(false)
+	pg, err := p.Fetch(uint32(len(held) + 1))
 	if err != nil {
 		t.Fatalf("after unpinning: %v", err)
 	}
-	pg.Unpin(true)
+	pg.Unpin(false)
 	for _, h := range held[1:] {
-		h.Unpin(true)
+		h.Unpin(false)
 	}
 	if p.Pinned() != 0 {
 		t.Errorf("%d pages still pinned", p.Pinned())
@@ -479,7 +492,7 @@ func FuzzTree(f *testing.F) {
 	f.Add(bytes.Repeat([]byte{0, 7, 200, 1, 7, 0, 2, 9, 30}, 50))
 	f.Fuzz(func(t *testing.T, script []byte) {
 		p := newPager(t, 8)
-		tree, err := CreateTree(p)
+		tree, err := CreateTree(p, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -510,15 +523,26 @@ func FuzzTree(f *testing.F) {
 // docs/benchmarks.md explains how to read them.
 
 func benchTree(b *testing.B, pool int) *Tree {
-	p, err := Open(NewMemFile(), pool)
+	p, err := Open(NewMemFile(), NewMemFile(), Options{PoolPages: pool})
 	if err != nil {
 		b.Fatal(err)
 	}
-	tree, err := CreateTree(p)
+	tree, err := CreateTree(p, 0)
 	if err != nil {
 		b.Fatal(err)
 	}
 	return tree
+}
+
+// checkpointEvery takes a checkpoint now and then, as the engine does, so
+// that the benchmark includes the cost of logging but not of a log that
+// grows without bound.
+func checkpointEvery(b *testing.B, tree *Tree, i int) {
+	if i%20000 == 19999 {
+		if err := tree.p.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func benchKey(i int) []byte { return binary.BigEndian.AppendUint64(nil, uint64(i)) }
@@ -532,6 +556,7 @@ func BenchmarkPutSequential(b *testing.B) {
 		if err := tree.Put(benchKey(i), benchValue); err != nil {
 			b.Fatal(err)
 		}
+		checkpointEvery(b, tree, i)
 	}
 }
 
@@ -543,6 +568,7 @@ func BenchmarkPutRandom(b *testing.B) {
 		if err := tree.Put(benchKey(rng.Int()), benchValue); err != nil {
 			b.Fatal(err)
 		}
+		checkpointEvery(b, tree, i)
 	}
 }
 
@@ -553,6 +579,7 @@ func filled(b *testing.B, n, pool int) *Tree {
 		if err := tree.Put(benchKey(i), benchValue); err != nil {
 			b.Fatal(err)
 		}
+		checkpointEvery(b, tree, i)
 	}
 	return tree
 }

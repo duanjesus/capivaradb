@@ -23,7 +23,7 @@ func reopen(t *testing.T, db *DB, path string, pool int) *DB {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(path, pool)
+	db, err := Open(path, Options{PoolPages: pool, NoSync: true})
 	if err != nil {
 		t.Fatalf("reopening: %v", err)
 	}
@@ -33,7 +33,7 @@ func reopen(t *testing.T, db *DB, path string, pool int) *DB {
 func openFile(t *testing.T, pool int) (*DB, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "capi.cdb")
-	db, err := Open(path, pool)
+	db, err := Open(path, Options{PoolPages: pool, NoSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestBufferPoolSmallerThanData(t *testing.T) {
 }
 
 func TestLongValuesAndKeys(t *testing.T) {
-	db, path := openFile(t, 64)
+	db, path := openFile(t, 256)
 	h := newHarness(t, db)
 	h.mustRun("create table doc (id int primary key, body text); create table word (w text primary key, n int)")
 
@@ -186,7 +186,7 @@ func TestLongValuesAndKeys(t *testing.T) {
 	h.expect("select count(*) from word", "8")
 	h.sess.Close()
 
-	db = reopen(t, db, path, 64)
+	db = reopen(t, db, path, 256)
 	defer db.Close()
 	h = newHarness(t, db)
 	h.expect("select length(body) from doc where id = 1", fmt.Sprint(len(body)+1))
@@ -217,7 +217,7 @@ func TestOpenRejectsForeignFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("this is not a database\n", 1000)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, 64); !errors.Is(err, storage.ErrCorrupt) {
+	if _, err := Open(path, Options{PoolPages: 64}); !errors.Is(err, storage.ErrCorrupt) {
 		t.Errorf("expected ErrCorrupt, got %v", err)
 	}
 }

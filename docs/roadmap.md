@@ -53,20 +53,31 @@ Acceptance, all automated:
   no regression, with the consistency checker run after each.
 
 Details in [storage.md](storage.md) and
-[decisions/0005](decisions/0005-storage-layout.md). Not crash-safe yet:
-that is the next milestone.
+[decisions/0005](decisions/0005-storage-layout.md).
 
-## 4. Write-ahead log and recovery
+## 4. Write-ahead log and recovery — done
 
-- Physiological log records, page LSNs, group commit
-- Checkpoints; recovery in analysis, redo and undo passes
-- `fsync` discipline, including the directory after file creation
+- A write-ahead log with physical redo (page images and byte-range deltas)
+  and logical undo, one record per B+tree operation
+- Recovery in analysis, redo and undo passes; undo steps and post-commit
+  work marked in the log so that neither is ever repeated
+- Full-page images after each checkpoint, so torn pages are repairable
+- Checkpoints: on demand, at shutdown, and automatic by log size
+- `fsync` at commit, before any page write, at checkpoint, and of the
+  directory when the files are created
 
-Acceptance — the centrepiece of the project: a harness that runs a
-workload, kills the server process at random points (including in the
-middle of page writes, using an injected faulty file layer), restarts it,
-and verifies that every acknowledged commit is present and no uncommitted
-change is.
+Acceptance — the centrepiece of the project:
+
+- a simulated disk that loses any subset of unsynced writes and tears the
+  rest; about 800 crashes per run under a random workload, including
+  crashes during recovery, each checked against a shadow database and by
+  the consistency checker;
+- a real process killed with `SIGKILL` a dozen times while writing;
+- mutation testing of the crash tests: nine ways of breaking the
+  durability rules, all caught.
+
+Details in [recovery.md](recovery.md) and
+[decisions/0006](decisions/0006-logging-scheme.md).
 
 ## 5. MVCC
 

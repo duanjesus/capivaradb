@@ -44,6 +44,9 @@ func must(err error) {
 
 // storageError converts an error from the storage layer for the client.
 func storageError(err error) error {
+	if errors.Is(err, storage.ErrValueTooLarge) {
+		return pgerr.New(pgerr.ProgramLimitExceeded, "value is too large for the buffer pool; start the server with a larger -cache")
+	}
 	if errors.Is(err, storage.ErrKeyTooLarge) {
 		return pgerr.New(pgerr.ProgramLimitExceeded,
 			"index row size exceeds the maximum of %d bytes", storage.MaxKeySize)
@@ -94,26 +97,26 @@ func (ix *index) entryKey(vals []any, rowKey []byte) []byte {
 	return append(encodeKey(ix.cols, vals), rowKey...)
 }
 
-// rawInsert stores a row and its index entries without checking anything.
-func (t *table) rawInsert(key []byte, vals []any) error {
-	if err := t.tree.Put(key, encodeTuple(t.cols, vals)); err != nil {
+// storeRow writes a row and its index entries, without checking anything.
+func (t *table) storeRow(key []byte, vals []any, ch *changes) error {
+	if err := ch.put(t.tree, key, encodeTuple(t.cols, vals)); err != nil {
 		return err
 	}
 	for _, ix := range t.indexes {
-		if err := ix.tree.Put(ix.entryKey(vals, key), nil); err != nil {
+		if err := ch.put(ix.tree, ix.entryKey(vals, key), nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// rawDelete removes a row and its index entries.
-func (t *table) rawDelete(key []byte, vals []any) error {
-	if _, err := t.tree.Delete(key); err != nil {
+// removeRow deletes a row and its index entries.
+func (t *table) removeRow(key []byte, vals []any, ch *changes) error {
+	if err := ch.del(t.tree, key, encodeTuple(t.cols, vals)); err != nil {
 		return err
 	}
 	for _, ix := range t.indexes {
-		if _, err := ix.tree.Delete(ix.entryKey(vals, key)); err != nil {
+		if err := ch.del(ix.tree, ix.entryKey(vals, key), nil); err != nil {
 			return err
 		}
 	}
@@ -196,11 +199,7 @@ func (t *table) insertRow(vals []any, ch *changes) error {
 	if err := t.checkUnique(vals, nil); err != nil {
 		return err
 	}
-	if err := t.rawInsert(key, vals); err != nil {
-		return storageError(err)
-	}
-	ch.undo = append(ch.undo, func() { must(t.rawDelete(key, vals)) })
-	return nil
+	return t.storeRow(key, vals, ch)
 }
 
 // updateRow replaces the row old with vals.
@@ -228,26 +227,15 @@ func (t *table) updateRow(old rowRef, vals []any, ch *changes) error {
 	// key, so the general case is delete-then-insert. When only non-key,
 	// non-indexed columns change this does more work than needed; the
 	// planner milestone can afford to be smarter.
-	if err := t.rawDelete(old.key, old.vals); err != nil {
+	if err := t.removeRow(old.key, old.vals, ch); err != nil {
 		return err
 	}
-	if err := t.rawInsert(key, vals); err != nil {
-		return storageError(err)
-	}
-	ch.undo = append(ch.undo, func() {
-		must(t.rawDelete(key, vals))
-		must(t.rawInsert(old.key, old.vals))
-	})
-	return nil
+	return t.storeRow(key, vals, ch)
 }
 
 // deleteRow removes a row.
 func (t *table) deleteRow(old rowRef, ch *changes) error {
-	if err := t.rawDelete(old.key, old.vals); err != nil {
-		return err
-	}
-	ch.undo = append(ch.undo, func() { must(t.rawInsert(old.key, old.vals)) })
-	return nil
+	return t.removeRow(old.key, old.vals, ch)
 }
 
 // ---- catalog ----
@@ -331,7 +319,7 @@ func (r *recReader) ints() []int {
 }
 
 // saveTable writes the table's definition to the catalog.
-func (db *DB) saveTable(t *table) error {
+func (db *DB) saveTable(t *table, ch *changes) error {
 	var w recWriter
 	w.uint(uint64(t.tree.Root()))
 	w.uint(uint64(len(t.cols)))
@@ -346,21 +334,26 @@ func (db *DB) saveTable(t *table) error {
 	}
 	w.bool(t.pk != nil)
 	w.ints(t.pk)
-	return db.catalog.Put(catalogKey('t', t.name), w.b)
+	return ch.put(db.catalog, catalogKey('t', t.name), w.b)
 }
 
-func (db *DB) saveIndex(ix *index) error {
+func (db *DB) saveIndex(ix *index, ch *changes) error {
 	var w recWriter
 	w.str(ix.table.name)
 	w.uint(uint64(ix.tree.Root()))
 	w.bool(ix.unique)
 	w.ints(ix.cols)
-	return db.catalog.Put(catalogKey('i', ix.name), w.b)
+	return ch.put(db.catalog, catalogKey('i', ix.name), w.b)
 }
 
-func (db *DB) forget(kind byte, name string) error {
-	_, err := db.catalog.Delete(catalogKey(kind, name))
-	return err
+// forget removes an entry from the catalog.
+func (db *DB) forget(kind byte, name string, ch *changes) error {
+	key := catalogKey(kind, name)
+	old, found, err := db.catalog.Get(key)
+	if err != nil || !found {
+		return err
+	}
+	return ch.del(db.catalog, key, old)
 }
 
 // loadCatalog rebuilds the in-memory catalog from the catalog tree.

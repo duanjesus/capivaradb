@@ -52,6 +52,7 @@ const (
 	InvalidRowCountInLimit      = "2201W"
 	InvalidRowCountInOffset     = "2201X"
 	ProgramLimitExceeded        = "54000"
+	ObjectInUse                 = "55006"
 	StatementTooComplex         = "54001"
 	QueryCanceled               = "57014"
 	AdminShutdown               = "57P01"

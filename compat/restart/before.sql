@@ -14,6 +14,10 @@ delete from capivaras where id = 3;
 
 select * from capivaras;
 
--- Without a write-ahead log, a checkpoint (or a clean shutdown) is what
--- puts the changes on disk. The server is killed right after this.
-checkpoint;
+-- A transaction left open: the server is killed while it is in progress.
+begin;
+insert into capivaras (id, name) values (99, 'Fantasma');
+update capivaras set weight = 0;
+select id, name, weight from capivaras order by id;
+
+-- No COMMIT, no CHECKPOINT, no clean shutdown: the server is killed here.

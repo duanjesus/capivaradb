@@ -10,13 +10,14 @@ logging with crash recovery, MVCC transactions, and a query planner and
 executor. **The core has no dependencies outside the Go standard library**;
 CI fails if one is added.
 
-> **Status: milestone 3 of 7.** The wire protocol, the SQL front end and the
-> storage engine are done: data lives in B+trees in a page file, behind a
-> buffer pool, and survives a restart. It is **not crash-safe yet** — that is
-> the write-ahead log, next — and transactions are not isolated from each
-> other. See [Limitations](#limitations) for exactly what that means.
+> **Status: milestone 4 of 7.** The wire protocol, the SQL front end, the
+> storage engine and the write-ahead log are done: data lives in B+trees in
+> a page file, and a committed transaction survives the server being killed
+> or the power failing. Transactions are **not isolated from each other
+> yet** — that is MVCC, next. See [Limitations](#limitations) for exactly
+> what that means.
 
-![psql running joins and aggregates against CapivaraDB](docs/screenshots/m2-psql-joins.svg)
+![a server killed mid-transaction, and what the next one finds](docs/screenshots/m4-recovery.svg)
 
 ## Milestones
 
@@ -25,8 +26,8 @@ CI fails if one is added.
 | 1 | PostgreSQL wire protocol v3: startup, simple and extended query, cancellation | **done** |
 | 2 | Hand-written SQL parser and binder: joins, grouping, subqueries, DDL; fuzzing; sqllogictest | **done** |
 | 3 | Storage engine: slotted pages, buffer pool, B+tree tables and secondary indexes, persistent catalog | **done** |
-| 4 | Write-ahead log, ARIES-style recovery, kill-the-process crash tests | next |
-| 5 | MVCC with snapshot isolation, concurrent transactions, isolation tests | planned |
+| 4 | Write-ahead log, ARIES-style recovery, crash tests on a simulated disk and by killing the process | **done** |
+| 5 | MVCC with snapshot isolation, concurrent transactions, isolation tests | next |
 | 6 | Cost-based planner: index selection, join ordering, `EXPLAIN` | planned |
 | 7 | Volcano executor: hash and merge joins, aggregation, external sort, set operations | planned |
 
@@ -58,8 +59,10 @@ select name, weight * 2 from capivaras where weight > 50;
 Any user name is accepted and no password is asked for, which is why the
 server listens on loopback only unless told otherwise.
 
-Changes reach the file at `CHECKPOINT` and on a clean shutdown (Ctrl+C).
-`capivaradb -data capi.cdb -check` verifies a file offline.
+A commit is durable when it is acknowledged: the write-ahead log, kept in
+`capi.cdb.wal`, is synced first. If the server dies, the next start recovers
+from the log and says so. `capivaradb -data capi.cdb -check` verifies a file
+offline; `-nosync` trades the power-failure guarantee for speed.
 
 ## What works today
 
@@ -114,6 +117,17 @@ B+tree.
 
 ![a second server process reading what the first one wrote](docs/screenshots/m3-restart-after.svg)
 
+### Durability ([details](docs/recovery.md))
+
+- A write-ahead log with physical redo and logical undo; `fsync` at commit
+  and before any page reaches the data file.
+- ARIES-style recovery: analysis, redo, undo. Committed transactions are
+  restored, unfinished ones rolled back, and a recovery interrupted by
+  another crash simply runs again.
+- Torn pages are rebuilt from full-page images in the log.
+- Statements, transactions and DDL are atomic across a crash.
+- Checkpoints on demand, at shutdown and by log size.
+
 ### Protocol ([details](docs/wire-protocol.md))
 
 - Startup, including the `SSLRequest`/`GSSENCRequest` refusal and protocol
@@ -135,7 +149,10 @@ B+tree.
 | The parser | A corpus pinned to its canonical form, a parse → print → parse round trip, and a fuzzer that checks both on arbitrary input | [internal/sql](internal/sql) |
 | The binder and executor | Table-driven tests of every construct, including the error cases | [internal/engine](internal/engine) |
 | The B+tree and buffer pool | Long random operation sequences checked against a map, with a 16-page pool to force eviction; a fuzzer; invariants verified throughout; no page may leak | [internal/storage](internal/storage) |
-| Persistence | Restart tests at the engine level and through psql against a real file; corruption must be detected by checksum | [internal/engine](internal/engine), [compat/restart](compat/restart) |
+| **Crash recovery** | A simulated disk that loses any subset of unsynced writes and tears the rest: ~800 crashes per run under a random workload, some during recovery itself, each compared with a shadow database | [docs/recovery.md](docs/recovery.md) |
+| Crash recovery, for real | A writer process killed with `SIGKILL` a dozen times; every acknowledged commit must be there, whole | [internal/engine](internal/engine), [compat/restart](compat/restart) |
+| The crash tests themselves | Mutation testing: nine ways of breaking the durability rules, each of which the tests must catch | `scripts/mutation-test.sh` |
+| Persistence | Restart tests at the engine level; corruption must be detected by checksum | [internal/engine](internal/engine) |
 | Storage integrity under SQL | The consistency checker runs after every engine test and after each sqllogictest script | `DB.Verify` |
 | The protocol | A raw client written in the test from the specification, asserting exact message sequences | [internal/pgwire](internal/pgwire) |
 | psql 17 | Scripted sessions compared with checked-in transcripts | [compat/psql](compat/psql) |
@@ -156,6 +173,20 @@ found a real bug on its first run (a table made only of constraints printed
 as invalid SQL); the input is now a regression seed.
 
 ![parser fuzzing](docs/screenshots/m2-fuzz.svg)
+
+The crash tests are the part of the project most worth looking at. A
+database is run against a disk that fails at a random moment and keeps an
+arbitrary part of what had not been synced; after recovery it must match a
+shadow database that never crashed:
+
+![crash tests](docs/screenshots/m4-crash-tests.svg)
+
+A crash test that passes proves little unless it would fail if the code
+were wrong, so the tests are tested: each durability rule is broken in turn
+and the suite must notice. It found two blind spots while it was being
+written, both described in [docs/recovery.md](docs/recovery.md).
+
+![mutation testing of the crash tests](docs/screenshots/m4-mutation.svg)
 
 The storage tests report what the tree and the pool did — here, trees of
 thousands of entries kept correct through tens of thousands of evictions:
@@ -206,7 +237,8 @@ go test ./...                          # core: parser, engine, storage, raw prot
 bash scripts/slt.sh                    # sqllogictest; downloads the scripts once
 bash scripts/jdbc-smoke.sh             # pgjdbc; needs a JDK and curl
 bash scripts/psql-smoke.sh             # psql; uses Docker if psql is not installed
-bash scripts/restart-smoke.sh          # write, kill the server, reopen, read
+bash scripts/restart-smoke.sh          # kill the server mid-transaction, recover, read
+bash scripts/mutation-test.sh          # break the durability rules; the crash tests must fail
 bash scripts/bench.sh                  # B+tree benchmarks
 go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m
 go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m
@@ -220,18 +252,22 @@ and pgx suites on Windows. See [docs/development.md](docs/development.md).
 Stated plainly, because a database that overstates what it guarantees is
 worse than useless.
 
-- **Not crash-safe.** Data is on disk, but modified pages are written when
-  they are evicted, at `CHECKPOINT` and at clean shutdown — in no particular
-  order and with no log. `COMMIT` does not make anything durable. If the
-  process is killed between checkpoints, recent changes are lost and the
-  file may be left inconsistent; checksums and `-check` will detect that,
-  not repair it. (Milestone 4.)
 - **No isolation.** Changes are visible to other sessions the moment a
   statement runs, before `COMMIT`. `BEGIN ISOLATION LEVEL ...` is parsed and
   ignored; `SHOW transaction_isolation` answers `read uncommitted`, which is
   the truth. Rollback does undo a transaction's changes, but if two open
   transactions touched the same rows the result is not what a real database
-  would give. (Milestone 5.)
+  would give. `DROP TABLE`, `DROP INDEX` and `CREATE INDEX` are refused
+  while another transaction has uncommitted changes. (Milestone 5.)
+- **Durability has edges.** Crash safety covers the server dying and the
+  power failing. It does not cover the disk itself failing: a damaged page
+  with no image in the current log is detected and reported, not repaired,
+  and there are no backups or replication. One `fsync` per commit, with no
+  group commit, bounds single-row transactions at the disk's sync rate
+  (about 1 600 per second on the machine in
+  [docs/benchmarks.md](docs/benchmarks.md)). The log cannot be discarded
+  while a transaction is open, and a single value must fit in half the
+  buffer pool.
 - **One global lock.** Writers exclude everyone for the duration of a
   statement.
 - **No planner.** Joins are nested loops in the order written, the `WHERE`
@@ -270,7 +306,8 @@ cmd/capivaradb     the server binary
 internal/pgwire    PostgreSQL wire protocol
 internal/sql       lexer, AST, parser, printer
 internal/engine    binder, executor, row and key encoding, catalog
-internal/storage   page file, buffer pool, B+tree, consistency checker
+internal/storage   page file, buffer pool, B+tree, write-ahead log, recovery,
+                   consistency checker, simulated disk for crash tests
 internal/pgerr     errors with SQLSTATE codes
 compat/            tests against real clients and sqllogictest baselines
 tools/slt          sqllogictest runner

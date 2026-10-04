@@ -1,6 +1,7 @@
 # Storage engine
 
-Everything the database stores lives in one file made of 8 kB pages.
+Everything the database stores lives in one file made of 8 kB pages, with a
+write-ahead log beside it ([recovery.md](recovery.md)).
 `internal/storage` manages that file and knows nothing about SQL: it deals
 in pages and in B+trees of byte strings. `internal/engine` decides what the
 bytes mean.
@@ -17,7 +18,7 @@ bytes mean.
 
 | Page | Contents |
 |------|----------|
-| 0 | Meta page: magic `CAPIVARA`, format version, page size, page count, head of the free list, root page of the catalog |
+| 0 | Meta page: magic `CAPIVARA`, format version, page size, page count, head of the free list, root page of the catalog, LSN of the last checkpoint |
 | 1… | B+tree pages (leaf, internal), overflow pages, free pages |
 
 Every page begins with a 16-byte header:
@@ -27,14 +28,17 @@ Every page begins with a 16-byte header:
 | 0 | 4 | CRC-32C of the rest of the page |
 | 4 | 1 | Page type: meta, leaf, internal, overflow, free |
 | 6 | 2 | Number of cells (B+tree pages) |
-| 8 | 8 | LSN — reserved for the write-ahead log (milestone 4) |
+| 8 | 8 | LSN of the last log record that changed the page (see [recovery.md](recovery.md)) |
 
 The checksum is computed when a page is written and verified when it is
 read. A mismatch is reported as corruption instead of being interpreted as
 data; it catches a torn write or a failing disk, it does not repair it.
 
-Freed pages form a linked list starting at the meta page, and allocation
-takes from that list before growing the file. The file never shrinks.
+The free list is a chain of *trunk pages*, each holding the IDs of up to
+2042 free pages. Freeing a page appends its ID to the first trunk and does
+not touch the page itself, so dropping a large table dirties a handful of
+trunk pages rather than every page of the table. Allocation takes from the
+list before growing the file. The file never shrinks.
 
 ## The buffer pool
 
@@ -166,11 +170,6 @@ It runs:
 
 ## What is not there yet
 
-- **Crash safety.** Pages reach the file when they are evicted, at
-  `CHECKPOINT` and at clean shutdown, in no particular order. A crash can
-  leave a tree half-updated. The write-ahead log (milestone 4) is what
-  makes changes atomic and durable; until then only a checkpointed file is
-  trustworthy.
 - **Using indexes to answer queries.** Indexes are maintained and enforce
   uniqueness, but every query still scans its tables. Choosing an index is
   the planner's job (milestone 6).

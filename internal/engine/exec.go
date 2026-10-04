@@ -9,7 +9,6 @@ import (
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
 	"github.com/duanjesus/capivaradb/internal/sql"
-	"github.com/duanjesus/capivaradb/internal/storage"
 )
 
 // prepared implements pgwire.Prepared.
@@ -618,82 +617,89 @@ func (s *Session) buildCreateTable(n *sql.CreateTable, ptypes []sql.Type) (*prep
 
 // createTable allocates the storage of t and of the indexes backing its
 // UNIQUE constraints, and registers them. The caller must hold db.mu.
+//
+// Nothing here needs cleaning up on failure: every step records how to
+// undo itself in ch, and the caller reverts ch if the statement fails.
 func (db *DB) createTable(t *table, uniques []indexDef, ch *changes) (err error) {
-	var trees []*storage.Tree
-	// If anything fails half-way, give back the pages already allocated.
-	defer func() {
-		if err != nil {
-			for _, tree := range trees {
-				tree.Drop()
-			}
-		}
-	}()
-	newTree := func() (*storage.Tree, error) {
-		tree, err := storage.CreateTree(db.pager)
-		if err == nil {
-			trees = append(trees, tree)
-		}
-		return tree, err
-	}
-
-	if t.tree, err = newTree(); err != nil {
+	if t.tree, err = ch.createTree(); err != nil {
 		return err
 	}
 	for _, def := range uniques {
 		if db.nameTaken(def.name) {
 			return pgerr.New(pgerr.DuplicateTable, "relation %q already exists", def.name)
 		}
-		tree, err := newTree()
+		tree, err := ch.createTree()
 		if err != nil {
 			return err
 		}
 		t.indexes = append(t.indexes, &index{name: def.name, table: t, cols: def.cols, unique: true, tree: tree})
 	}
-	if err = db.register(t); err != nil {
+	return db.register(t, ch)
+}
+
+// register adds a table and its indexes to the catalog, on disk and in
+// memory. The caller must hold db.mu.
+func (db *DB) register(t *table, ch *changes) error {
+	if err := db.saveTable(t, ch); err != nil {
 		return err
 	}
-	ch.undo = append(ch.undo, func() {
-		must(db.unregister(t))
-		for _, tree := range trees {
-			must(tree.Drop())
+	for _, ix := range t.indexes {
+		if err := db.saveIndex(ix, ch); err != nil {
+			return err
+		}
+	}
+	db.tables[t.name] = t
+	for _, ix := range t.indexes {
+		db.indexes[ix.name] = ix
+	}
+	indexes := t.indexes
+	ch.onUndo(func() {
+		delete(db.tables, t.name)
+		for _, ix := range indexes {
+			delete(db.indexes, ix.name)
 		}
 	})
 	return nil
 }
 
-// register adds a table and its indexes to the catalog, in memory and on
-// disk. The caller must hold db.mu.
-func (db *DB) register(t *table) error {
-	if err := db.saveTable(t); err != nil {
-		return err
-	}
-	db.tables[t.name] = t
-	for _, ix := range t.indexes {
-		if err := db.saveIndex(ix); err != nil {
-			return err
-		}
-		db.indexes[ix.name] = ix
-	}
-	return nil
-}
-
 // unregister removes a table and its indexes from the catalog, leaving
 // their pages alone.
-func (db *DB) unregister(t *table) error {
+func (db *DB) unregister(t *table, ch *changes) error {
 	for _, ix := range t.indexes {
-		if err := db.forget('i', ix.name); err != nil {
+		if err := db.forget('i', ix.name, ch); err != nil {
 			return err
 		}
+	}
+	if err := db.forget('t', t.name, ch); err != nil {
+		return err
+	}
+	indexes := t.indexes
+	delete(db.tables, t.name)
+	for _, ix := range indexes {
 		delete(db.indexes, ix.name)
 	}
-	delete(db.tables, t.name)
-	return db.forget('t', t.name)
+	ch.onUndo(func() {
+		db.tables[t.name] = t
+		for _, ix := range indexes {
+			db.indexes[ix.name] = ix
+		}
+	})
+	return nil
 }
 
 // nameTaken reports whether a table or index has this name; like PostgreSQL,
 // both live in one namespace. The caller must hold db.mu.
 func (db *DB) nameTaken(name string) bool {
 	return db.tables[name] != nil || db.indexes[name] != nil
+}
+
+// errOthersWriting is returned by DROP while another session has
+// uncommitted changes. Its pages would be freed at commit, and that
+// session's rollback would then write into them. Proper locks arrive with
+// MVCC; until then the drop is refused.
+func errOthersWriting(what, name string) error {
+	return pgerr.New(pgerr.ObjectInUse,
+		"cannot drop %s %q while another transaction has uncommitted changes", what, name)
 }
 
 func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
@@ -707,21 +713,19 @@ func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
 				}
 				return "", pgerr.New(pgerr.UndefinedTable, "table %q does not exist", name)
 			}
+			if s.db.othersWriting(s) {
+				return "", errOthersWriting("table", name)
+			}
 			// The table and its indexes leave the catalog now, but their
-			// pages are only freed once the drop can no longer be rolled
-			// back.
-			if err := s.db.unregister(t); err != nil {
+			// pages are only freed once the transaction has committed:
+			// until then a rollback must be able to bring them back.
+			if err := s.db.unregister(t, ch); err != nil {
 				return "", err
 			}
-			ch.undo = append(ch.undo, func() { must(s.db.register(t)) })
-			ch.onCommit = append(ch.onCommit, func() error {
-				for _, ix := range t.indexes {
-					if err := ix.tree.Drop(); err != nil {
-						return err
-					}
-				}
-				return t.tree.Drop()
-			})
+			for _, ix := range t.indexes {
+				ch.drops = append(ch.drops, ix.tree.Root())
+			}
+			ch.drops = append(ch.drops, t.tree.Root())
 			return "DROP TABLE", nil
 		})
 	}}, nil
@@ -734,6 +738,12 @@ func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 			t, err := s.db.lookup(n.Table)
 			if err != nil {
 				return "", err
+			}
+			// Rows another transaction has not committed would get index
+			// entries that its rollback knows nothing about.
+			if s.db.othersWriting(s) {
+				return "", pgerr.New(pgerr.ObjectInUse,
+					"cannot create index %q while another transaction has uncommitted changes", name)
 			}
 			if s.db.nameTaken(name) {
 				if n.IfNotExists {
@@ -748,19 +758,13 @@ func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 				}
 			}
 			ix := &index{name: name, table: t, cols: cols, unique: n.Unique}
-			if err := s.db.buildIndex(ix); err != nil {
+			if err := s.db.buildIndex(ix, ch); err != nil {
 				return "", err
 			}
-			if err := s.db.saveIndex(ix); err != nil {
-				ix.tree.Drop()
+			if err := s.db.saveIndex(ix, ch); err != nil {
 				return "", err
 			}
-			s.db.indexes[name] = ix
-			t.indexes = append(t.indexes[:len(t.indexes):len(t.indexes)], ix)
-			ch.undo = append(ch.undo, func() {
-				must(s.db.detachIndex(ix))
-				must(ix.tree.Drop())
-			})
+			s.db.attachIndex(ix, ch)
 			return "CREATE INDEX", nil
 		})
 	}}, nil
@@ -768,17 +772,13 @@ func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 
 // buildIndex creates the index's tree and fills it from the table's rows.
 // For a unique index the existing rows must already satisfy it.
-func (db *DB) buildIndex(ix *index) error {
+func (db *DB) buildIndex(ix *index, ch *changes) error {
 	t := ix.table
 	rows, err := db.scan(t)
 	if err != nil {
 		return err
 	}
-	if ix.tree, err = storage.CreateTree(db.pager); err != nil {
-		return err
-	}
-	fail := func(err error) error {
-		ix.tree.Drop()
+	if ix.tree, err = ch.createTree(); err != nil {
 		return err
 	}
 	seen := make(map[string]bool)
@@ -786,21 +786,30 @@ func (db *DB) buildIndex(ix *index) error {
 		if ix.unique && !hasNull(ix.cols, r.vals) {
 			prefix := string(encodeKey(ix.cols, r.vals))
 			if seen[prefix] {
-				return fail(pgerr.New(pgerr.UniqueViolation, "could not create unique index %q", ix.name).
-					WithDetail("Key (%s) is duplicated.", t.colNames(ix.cols, ", ")))
+				return pgerr.New(pgerr.UniqueViolation, "could not create unique index %q", ix.name).
+					WithDetail("Key (%s) is duplicated.", t.colNames(ix.cols, ", "))
 			}
 			seen[prefix] = true
 		}
+		// The entries need no undo of their own: undoing the creation of
+		// the tree frees them all at once.
 		if err := ix.tree.Put(ix.entryKey(r.vals, r.key), nil); err != nil {
-			return fail(storageError(err))
+			return storageError(err)
 		}
 	}
 	return nil
 }
 
-// detachIndex removes an index from the catalog and from its table, leaving
-// its pages alone. The caller must hold db.mu.
-func (db *DB) detachIndex(ix *index) error {
+// attachIndex adds an index to the in-memory catalog and to its table.
+func (db *DB) attachIndex(ix *index, ch *changes) {
+	t := ix.table
+	db.indexes[ix.name] = ix
+	t.indexes = append(t.indexes[:len(t.indexes):len(t.indexes)], ix)
+	ch.onUndo(func() { db.removeIndex(ix) })
+}
+
+// removeIndex takes an index out of the in-memory catalog and of its table.
+func (db *DB) removeIndex(ix *index) {
 	t := ix.table
 	kept := make([]*index, 0, len(t.indexes))
 	for _, other := range t.indexes {
@@ -810,7 +819,6 @@ func (db *DB) detachIndex(ix *index) error {
 	}
 	t.indexes = kept
 	delete(db.indexes, ix.name)
-	return db.forget('i', ix.name)
 }
 
 func (s *Session) buildDropIndex(n *sql.DropIndex) (*prepared, error) {
@@ -824,15 +832,18 @@ func (s *Session) buildDropIndex(n *sql.DropIndex) (*prepared, error) {
 				}
 				return "", pgerr.New(pgerr.UndefinedObject, "index %q does not exist", name)
 			}
-			if err := s.db.detachIndex(ix); err != nil {
+			if s.db.othersWriting(s) {
+				return "", errOthersWriting("index", name)
+			}
+			if err := s.db.forget('i', name, ch); err != nil {
 				return "", err
 			}
-			ch.undo = append(ch.undo, func() {
-				must(s.db.saveIndex(ix))
+			s.db.removeIndex(ix)
+			ch.onUndo(func() {
 				s.db.indexes[name] = ix
 				ix.table.indexes = append(ix.table.indexes[:len(ix.table.indexes):len(ix.table.indexes)], ix)
 			})
-			ch.onCommit = append(ch.onCommit, ix.tree.Drop)
+			ch.drops = append(ch.drops, ix.tree.Root())
 			return "DROP INDEX", nil
 		})
 	}}, nil

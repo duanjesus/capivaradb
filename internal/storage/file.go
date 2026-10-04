@@ -21,6 +21,7 @@ type File interface {
 	io.WriterAt
 	Sync() error
 	Size() (int64, error)
+	Truncate(size int64) error
 	Close() error
 }
 
@@ -94,3 +95,17 @@ func (m *MemFile) Size() (int64, error) {
 }
 
 func (m *MemFile) Close() error { return nil }
+
+func (m *MemFile) Truncate(size int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if size < 0 {
+		return fmt.Errorf("storage: negative size %d", size)
+	}
+	if size <= int64(len(m.data)) {
+		m.data = m.data[:size]
+		return nil
+	}
+	m.data = append(m.data, make([]byte, size-int64(len(m.data)))...)
+	return nil
+}

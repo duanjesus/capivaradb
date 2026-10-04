@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the code as it stands at milestone 3 and marks what
+This document describes the code as it stands at milestone 4 and marks what
 each later milestone changes. It is updated with every milestone.
 
 ## Layers
@@ -10,7 +10,7 @@ each later milestone changes. It is updated with every milestone.
 | `cmd/capivaradb` | Flags, listener, signal handling | everything |
 | `internal/pgwire` | Wire protocol: bytes ⇄ interface calls | `pgerr` |
 | `internal/engine` | Scopes, type checking, grouping rules, execution, transactions, row and key encoding, catalog | `pgwire` interfaces, `sql`, `storage`, `pgerr` |
-| `internal/storage` | Page file, buffer pool, B+trees, consistency checks | nothing |
+| `internal/storage` | Page file, buffer pool, B+trees, write-ahead log, recovery, consistency checks | nothing |
 | `internal/sql` | Lexer, AST, parser, canonical printer | `pgerr` |
 | `internal/pgerr` | Error type carrying a SQLSTATE | nothing |
 
@@ -164,10 +164,14 @@ are unique indexes, checked by seeking the indexed values. As in
 PostgreSQL, NULLs never conflict with each other, and constraints get the
 names PostgreSQL would generate (`t_pkey`, `t_a_b_key`).
 
-**Transactions.** Each change appends a function to an undo log. A failing
-statement runs its own undo entries immediately, which makes statements
-atomic; `ROLLBACK` runs the transaction's entries in reverse. DDL is
-transactional too. There is no isolation: see the README.
+**Transactions.** Every statement that changes something belongs to a
+transaction: the open `BEGIN` block, or one of its own. Before each change
+to a tree the transaction logs how to reverse it; `ROLLBACK`, a failed
+statement and crash recovery all reverse changes through that same log, so
+statements are atomic and so are transactions, across a crash. `COMMIT`
+makes the log durable. DDL is transactional too: a dropped table's pages are
+only freed after the commit. See [recovery.md](recovery.md). There is still
+no isolation between transactions: see the README.
 
 ## Values and types
 
@@ -188,7 +192,6 @@ otherwise, as in PostgreSQL.
 
 | Today | Replaced by |
 |-------|-------------|
-| Pages written at eviction and checkpoint, undo as closures in memory | WAL records with redo and undo (M4) |
 | Indexes maintained but never read by queries | Index scans chosen by the planner (M6) |
 | One global lock, no isolation | MVCC snapshots, row versions, vacuum (M5) |
 | Joins in the order written, filters applied last | Cost-based planner (M6) |

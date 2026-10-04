@@ -7,36 +7,64 @@ so every table here says what was run, on what, and how to run it again.
 bash scripts/bench.sh
 ```
 
-## B+tree (milestone 3)
+All measurements: Intel Core i7-11370H (4 cores, 8 threads, 3.3 GHz), NVMe
+SSD, Windows 11, Go 1.27, single-threaded, 2 seconds per benchmark. One run
+on a laptop: repeat runs differ by up to a quarter, so read these as orders
+of magnitude.
 
-`internal/storage`, through the buffer pool, on an in-memory file — so this
-times the data structure and the cache, not the disk. Keys are 8 bytes,
-values 100 bytes.
+## What a commit costs (milestone 4)
 
-Measured on an Intel Core i7-11370H (4 cores, 8 threads, 3.3 GHz), Windows
-11, Go 1.27, single-threaded, 2 seconds per benchmark. One run, on a laptop:
-repeat runs differ by up to a quarter, so read these as orders of magnitude.
+`internal/engine`: a prepared `INSERT` of one small row into a table with a
+primary key, through the binder, the B+tree and the write-ahead log.
 
-| Benchmark | Result | What it does |
-|-----------|-------:|--------------|
-| `PutSequential` | 1.01 µs/op | Insert keys in ascending order: every insert lands in the rightmost leaf |
-| `PutRandom` | 2.77 µs/op | Insert random keys: a binary search per level, splits all over the tree |
-| `Get`, in pool | 1.82 µs/op | Random lookups among 1 000 000 keys, all pages cached |
-| `Get`, 2 MB pool | 3.03 µs/op | The same with a pool 100 times smaller than the data: most lookups evict a page and read another from the (in-memory) file |
-| `Scan` | 176 ns/row | Full scan of 1 000 000 rows, copying each key and value |
+| | One row per transaction | 100 rows per transaction |
+|---|---:|---:|
+| In memory | 4.7 µs/row | 4.4 µs/row (229 000 rows/s) |
+| File, `-nosync` | 9.8 µs/row | 4.6 µs/row (217 000 rows/s) |
+| File, fsync at commit | **614 µs/row** | 11.9 µs/row (84 000 rows/s) |
 
 How to read them:
 
-- The gap between sequential and random inserts is locality: ascending keys
-  keep landing on the same few pages, random ones touch a different leaf
-  each time.
-- The small-pool lookup is less than twice as slow because the "disk" is
-  memory. On a real disk each miss is a read, and that number is dominated
-  by the device. It shows the pool's own overhead: evict, read, verify the
-  checksum.
-- These are single-threaded. The pager has one mutex; contention is a
-  subject for milestone 5.
+- **The fsync is the commit.** A single-row transaction costs about 0.6 ms,
+  of which the database's own work is under 10 µs. The other 98% is waiting
+  for the disk to say the log is safe. That is roughly 1 600 commits per
+  second on this disk, and it is the price of the durability guarantee, not
+  an inefficiency to tune away. `-nosync` shows what is left without it.
+- **Batching amortises it.** With 100 rows per transaction the same fsync
+  is shared by 100 rows, and throughput rises fifty-fold.
+- There is no group commit: with one writer at a time there is nobody to
+  share a sync with. That changes with concurrent writers (milestone 5).
 
-What they do not show: SQL-level throughput (the executor materialises
-whole tables and would dominate), durability costs (there is no `fsync` on
-the write path until the WAL), or concurrency.
+## B+tree
+
+`internal/storage`, through the buffer pool and the log, on in-memory files
+— so this times the data structure, the cache and the logging, not the
+disk. Keys are 8 bytes, values 100 bytes. A checkpoint is taken every
+20 000 operations, as the engine would.
+
+| Benchmark | Milestone 3 | Milestone 4 | What it does |
+|-----------|------------:|------------:|--------------|
+| `PutSequential` | 1.0 µs | 4.0 µs | Insert keys in ascending order |
+| `PutRandom` | 2.8 µs | 5.4 µs | Insert random keys |
+| `Get`, in pool | 1.8 µs | 1.3 µs | Random lookups among 1 000 000 keys, all pages cached |
+| `Get`, 2 MB pool | 3.0 µs | 2.5 µs | The same with a pool 100 times smaller than the data |
+| `Scan` | 176 ns/row | 77 ns/row | Full scan of 1 000 000 rows |
+
+How to read them:
+
+- **Logging made writes two to four times slower.** Each operation now
+  copies the pages it is about to modify, compares them afterwards to find
+  what changed, and builds a log record; the first change to a page after a
+  checkpoint logs all 8 kB of it. This is the straightforward
+  implementation and has obvious room: the before-image copy could be
+  avoided by having the B+tree report what it changed instead of having the
+  pager discover it.
+- **Reads did not change in this milestone**; the differences in the read
+  rows are run-to-run variation (and a fair illustration of how much to
+  trust a single run on a laptop).
+- The small-pool lookup is less than twice as slow as the cached one
+  because the "disk" is memory. On a real disk each miss is a read, and the
+  device dominates.
+
+What none of this shows: SQL queries (the executor materialises whole
+tables and would dominate), or concurrency.

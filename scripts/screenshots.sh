@@ -9,7 +9,7 @@
 # looked like at the time.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-MILESTONE="${1:?usage: screenshots.sh m1|m2|m3}"
+MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4}"
 OUT="$ROOT/docs/screenshots"
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -88,6 +88,30 @@ m3)
 
   { echo '$ scripts/bench.sh'; bash scripts/bench.sh 2>&1 | grep -vE '^(PASS|ok)'; } |
     shot bench "B+tree benchmarks"
+  ;;
+
+m4)
+  # A server killed in the middle of a transaction, through psql.
+  bash scripts/restart-smoke.sh >/dev/null
+  sed -n '/^-- A transaction left open/,/^-- So are the rules/p' "$CACHE/restart.out" | sed '$d' |
+    shot recovery "kill -9 mid-transaction, then recovery"
+
+  # The crash tests, with what they report.
+  {
+    echo '$ go test ./internal/engine -v -run "TestCrashRecovery|TestKillProcess"'
+    go test -count=1 ./internal/engine -v -run 'TestCrashRecovery|TestKillProcess' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +[a-z_]+_test.go:[0-9]+: /    /' | fold -s -w 110
+    echo
+    echo '$ go test ./internal/storage -v -run "Committed|Uncommitted|Torn|LogIs|Broken"'
+    go test -count=1 ./internal/storage -v -run 'Committed|Uncommitted|Torn|LogIs|Broken' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//'
+  } | shot crash-tests "crash tests"
+
+  { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
+    shot mutation "mutation testing: break a rule, the crash tests must fail"
+
+  { echo '$ scripts/bench.sh'; bash scripts/bench.sh 2>&1 | grep -E '^(cpu|Benchmark)' | awk '!seen[$0]++' | sed -E 's/-8 +/  /; s/\t+/  /g'; } |
+    shot bench "benchmarks: what a commit costs"
   ;;
 
 *)

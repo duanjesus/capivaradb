@@ -1,7 +1,9 @@
 // Package engine binds and executes SQL on top of the storage layer.
 //
-// Rows live in B+trees (see store.go); the catalog is persistent. What is
-// still deliberately naive is everything about concurrency and planning: one
+// Rows live in B+trees (see store.go), the catalog is persistent, and every
+// change goes through the write-ahead log, so a committed transaction
+// survives a crash and an unfinished one leaves no trace. What is still
+// deliberately naive is everything about concurrency and planning: one
 // database-wide lock, no isolation between concurrent transactions, full
 // scans and nested-loop joins only. Those are the subjects of the later
 // milestones. Everything the protocol layer needs goes through
@@ -10,6 +12,8 @@ package engine
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -24,22 +28,56 @@ import (
 // 8 kB, or 32 MB.
 const DefaultPoolPages = 4096
 
+// DefaultCheckpointBytes is how much log accumulates before a checkpoint is
+// taken on its own. A larger value means fewer checkpoints and a longer
+// recovery.
+const DefaultCheckpointBytes = 16 << 20
+
+// Options configures a database.
+type Options struct {
+	// PoolPages is the size of the buffer pool, in pages.
+	PoolPages int
+	// NoSync turns off every fsync. Commits then survive a crash of the
+	// server but not of the machine. For tests and benchmarks.
+	NoSync bool
+	// CheckpointBytes is the amount of log that triggers a checkpoint.
+	CheckpointBytes int64
+}
+
+func (o Options) withDefaults() Options {
+	if o.PoolPages == 0 {
+		o.PoolPages = DefaultPoolPages
+	}
+	if o.CheckpointBytes == 0 {
+		o.CheckpointBytes = DefaultCheckpointBytes
+	}
+	return o
+}
+
 // DB is a database. It implements pgwire.Handler.
 type DB struct {
 	// mu guards the catalog maps and, for now, every page: writers hold it
 	// for a whole statement, readers while they scan.
 	mu      sync.RWMutex
 	pager   *storage.Pager
+	opts    Options
 	closed  bool
 	catalog *storage.Tree
 	tables  map[string]*table
 	indexes map[string]*index
+
+	// nextTx numbers transactions. IDs need not survive a restart: after
+	// recovery no transaction of an earlier run is left in the log.
+	nextTx uint64
+	// writers holds the sessions with an open transaction that has changed
+	// something.
+	writers map[*Session]bool
 }
 
 // New returns an empty database held in memory. It uses the same storage
-// engine as a database on disk, on top of an in-memory file.
+// engine and the same log as a database on disk, on top of in-memory files.
 func New() *DB {
-	db, err := open(storage.NewMemFile(), DefaultPoolPages)
+	db, err := OpenFiles(storage.NewMemFile(), storage.NewMemFile(), Options{})
 	if err != nil {
 		panic(fmt.Sprintf("engine: opening an in-memory database: %v", err))
 	}
@@ -47,45 +85,89 @@ func New() *DB {
 }
 
 // Open opens the database stored in the file at path, creating it if it
-// does not exist. poolPages is the size of the buffer pool in pages.
-func Open(path string, poolPages int) (*DB, error) {
+// does not exist, and recovers it if it was not shut down cleanly. The
+// write-ahead log is kept next to it, in path + ".wal".
+func Open(path string, opts Options) (*DB, error) {
 	file, err := storage.OpenFile(path)
 	if err != nil {
 		return nil, err
 	}
-	db, err := open(file, poolPages)
+	logFile, err := storage.OpenFile(path + ".wal")
 	if err != nil {
 		file.Close()
+		return nil, err
+	}
+	// A new file's directory entry is not durable until the directory is
+	// synced. Without this a crash could leave a database whose log
+	// exists and whose data file does not, or the other way round.
+	if !opts.NoSync {
+		syncDir(filepath.Dir(path))
+	}
+	db, err := OpenFiles(file, logFile, opts)
+	if err != nil {
+		file.Close()
+		logFile.Close()
 		return nil, err
 	}
 	return db, nil
 }
 
-func open(file storage.File, poolPages int) (*DB, error) {
-	pager, err := storage.Open(file, poolPages)
+// syncDir flushes a directory's entries to disk. It is best-effort: Windows
+// has no such operation and returns an error that is safe to ignore.
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+}
+
+// OpenFiles opens a database on the given data and log files. It is what
+// Open and New are built on, and what tests use to interpose their own
+// files.
+func OpenFiles(file, logFile storage.File, opts Options) (*DB, error) {
+	opts = opts.withDefaults()
+	pager, err := storage.Open(file, logFile, storage.Options{PoolPages: opts.PoolPages, NoSync: opts.NoSync})
 	if err != nil {
 		return nil, err
 	}
-	db := &DB{pager: pager, tables: make(map[string]*table), indexes: make(map[string]*index)}
+	db := &DB{
+		pager:   pager,
+		opts:    opts,
+		tables:  make(map[string]*table),
+		indexes: make(map[string]*index),
+		writers: make(map[*Session]bool),
+	}
 	if root := pager.CatalogRoot(); root != 0 {
 		db.catalog = storage.OpenTree(pager, root)
 		return db, db.loadCatalog()
 	}
-	if db.catalog, err = storage.CreateTree(pager); err != nil {
+	if db.catalog, err = storage.CreateTree(pager, 0); err != nil {
 		return nil, err
 	}
-	pager.SetCatalogRoot(db.catalog.Root())
-	return db, pager.Flush()
+	if err := pager.SetCatalogRoot(db.catalog.Root()); err != nil {
+		return nil, err
+	}
+	return db, pager.Checkpoint()
 }
 
-// Checkpoint writes every modified page to the file and syncs it.
+// Checkpoint brings the data file up to date with the log, after which the
+// log can be discarded if no transaction is in progress.
 func (db *DB) Checkpoint() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.pager.Flush()
+	return db.pager.Checkpoint()
 }
 
-// Close checkpoints and closes the database file.
+// maybeCheckpoint takes a checkpoint if enough log has accumulated. The
+// caller must hold db.mu.
+func (db *DB) maybeCheckpoint() error {
+	if db.pager.LogSize() < db.opts.CheckpointBytes || db.pager.ActiveTransactions() > 0 {
+		return nil
+	}
+	return db.pager.Checkpoint()
+}
+
+// Close checkpoints and closes the database files.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -93,10 +175,13 @@ func (db *DB) Close() error {
 	return db.pager.Close()
 }
 
-// Stats reports the buffer pool counters and the size of the file in pages.
+// Stats reports the storage counters and the size of the file in pages.
 func (db *DB) Stats() (stats storage.Stats, pages, poolPages int) {
 	return db.pager.Stats(), db.pager.PageCount(), db.pager.PoolPages()
 }
+
+// Recovery reports what recovery did when the database was opened.
+func (db *DB) Recovery() storage.RecoveryInfo { return db.pager.Recovery() }
 
 type table struct {
 	name string
@@ -150,16 +235,82 @@ func (t *table) colNames(cols []int, sep string) string {
 	return strings.Join(names, sep)
 }
 
-// changes collects what a statement did, so that it can be undone or, at
-// commit, finished.
+// changes collects what a statement or a transaction did, so that it can be
+// undone or, at commit, finished.
 type changes struct {
-	// undo holds one function per change; rolling back runs them newest
+	db *DB
+	// tx is the transaction's ID in the log; zero until it first changes
+	// something.
+	tx uint64
+	// undo lists how to reverse each change; rolling back runs it newest
 	// first.
-	undo []func()
-	// onCommit holds work that must wait until the change is final, such
-	// as freeing the pages of a dropped table: until then a rollback has
-	// to be able to bring the table back.
-	onCommit []func() error
+	undo []undoEntry
+	// drops lists the trees to free once the transaction has committed.
+	// Until then a rollback has to be able to bring them back.
+	drops []uint32
+}
+
+// undoEntry reverses one change. A change to a tree is reversed through the
+// log (rec, logged at lsn), so that a crash in the middle of a rollback
+// neither repeats nor skips it. A change to the in-memory catalog is
+// reversed by mem; after a crash the catalog is simply read again.
+type undoEntry struct {
+	lsn uint64
+	rec storage.UndoRec
+	mem func()
+}
+
+// begin gives the transaction an ID the first time it needs one.
+func (ch *changes) begin() uint64 {
+	if ch.tx == 0 {
+		ch.db.nextTx++
+		ch.tx = ch.db.nextTx
+	}
+	return ch.tx
+}
+
+// put stores key in tree, where it must not exist yet, logging how to take
+// it out again.
+func (ch *changes) put(tree *storage.Tree, key, val []byte) error {
+	rec := storage.UndoRec{Tx: ch.begin(), Root: tree.Root(), Kind: storage.UndoDelete, Key: key}
+	ch.undo = append(ch.undo, undoEntry{lsn: ch.db.pager.LogUndo(rec), rec: rec})
+	return storageError(tree.Put(key, val))
+}
+
+// del removes key from tree, logging how to put it back with its old value.
+func (ch *changes) del(tree *storage.Tree, key, old []byte) error {
+	rec := storage.UndoRec{Tx: ch.begin(), Root: tree.Root(), Kind: storage.UndoPut, Key: key, Val: old}
+	ch.undo = append(ch.undo, undoEntry{lsn: ch.db.pager.LogUndo(rec), rec: rec})
+	_, err := tree.Delete(key)
+	return err
+}
+
+// createTree allocates a tree that is freed again if the changes are undone.
+func (ch *changes) createTree() (*storage.Tree, error) {
+	tree, lsn, err := storage.CreateTreeLogged(ch.db.pager, ch.begin())
+	if err != nil {
+		return nil, err
+	}
+	rec := storage.UndoRec{Tx: ch.tx, Root: tree.Root(), Kind: storage.UndoDropTree}
+	ch.undo = append(ch.undo, undoEntry{lsn: lsn, rec: rec})
+	return tree, nil
+}
+
+// onUndo registers a change to in-memory state to reverse on rollback.
+func (ch *changes) onUndo(fn func()) {
+	ch.undo = append(ch.undo, undoEntry{mem: fn})
+}
+
+// revert undoes the changes, newest first. The caller must hold db.mu.
+func (ch *changes) revert() {
+	for i := len(ch.undo) - 1; i >= 0; i-- {
+		if e := ch.undo[i]; e.mem != nil {
+			e.mem()
+		} else {
+			must(ch.db.pager.ApplyUndo(e.rec, e.lsn))
+		}
+	}
+	ch.undo = nil
 }
 
 // Session is the state of one client connection. It implements
@@ -198,6 +349,7 @@ func (db *DB) NewSession(params map[string]string) (pgwire.Session, error) {
 			"transaction_isolation": "read uncommitted",
 		},
 	}
+	s.tx.db = db
 	return s, nil
 }
 
@@ -244,59 +396,90 @@ func (s *Session) begin() {
 	s.inTx = true
 }
 
-// finish runs the work that was waiting for the changes to become final.
-// The caller must hold db.mu.
-func (ch *changes) finish() error {
-	for _, fn := range ch.onCommit {
-		if err := fn(); err != nil {
-			return err
-		}
-	}
-	return nil
+// endTx forgets the transaction block. The caller must hold db.mu.
+func (s *Session) endTx() {
+	delete(s.db.writers, s)
+	s.inTx, s.failed, s.tx = false, false, changes{db: s.db}
 }
 
-// revert undoes the changes, newest first. The caller must hold db.mu.
-func (ch *changes) revert() {
-	for i := len(ch.undo) - 1; i >= 0; i-- {
-		ch.undo[i]()
-	}
-}
-
+// commit makes the transaction block durable. When it returns without
+// error, the transaction survives a crash.
 func (s *Session) commit() error {
 	s.db.mu.Lock()
-	err := s.tx.finish()
-	s.db.mu.Unlock()
-	s.inTx, s.failed, s.tx = false, false, changes{}
-	return err
+	defer s.db.mu.Unlock()
+	defer s.endTx()
+	if s.tx.tx == 0 {
+		return nil // it changed nothing
+	}
+	if err := s.db.pager.Commit(s.tx.tx, s.tx.drops); err != nil {
+		return err
+	}
+	return s.db.maybeCheckpoint()
 }
 
 func (s *Session) rollback() {
 	s.db.mu.Lock()
+	defer s.db.mu.Unlock()
+	defer s.endTx()
 	s.tx.revert()
-	s.db.mu.Unlock()
-	s.inTx, s.failed, s.tx = false, false, changes{}
+	if s.tx.tx != 0 {
+		s.db.pager.End(s.tx.tx)
+	}
 }
 
 // write runs a data-modifying statement under the write lock. fn records
 // every change it makes. If fn fails, its changes are undone on the spot,
-// so a statement either happens entirely or not at all; if it succeeds
-// inside a transaction block, the record is kept for COMMIT or ROLLBACK.
+// so a statement either happens entirely or not at all. Outside a
+// transaction block the statement is a transaction of its own and is
+// committed before write returns; inside one, the record is kept for COMMIT
+// or ROLLBACK.
 func (s *Session) write(fn func(ch *changes) (string, error)) (*result, error) {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
-	var ch changes
+	ch := changes{db: s.db}
+	if s.inTx {
+		ch.tx = s.tx.tx
+	}
 	tag, err := fn(&ch)
 	if err != nil {
 		ch.revert()
+		if !s.inTx && ch.tx != 0 {
+			s.db.pager.End(ch.tx)
+		}
+		if s.inTx {
+			s.tx.tx = ch.tx
+		}
 		return nil, err
 	}
 	if s.inTx {
+		s.tx.tx = ch.tx
 		s.tx.undo = append(s.tx.undo, ch.undo...)
-		s.tx.onCommit = append(s.tx.onCommit, ch.onCommit...)
-	} else if err := ch.finish(); err != nil {
-		return nil, err
+		s.tx.drops = append(s.tx.drops, ch.drops...)
+		if ch.tx != 0 {
+			s.db.writers[s] = true
+		}
+		return &result{tag: tag}, nil
+	}
+	if ch.tx != 0 {
+		if err := s.db.pager.Commit(ch.tx, ch.drops); err != nil {
+			return nil, err
+		}
+		if err := s.db.maybeCheckpoint(); err != nil {
+			return nil, err
+		}
 	}
 	return &result{tag: tag}, nil
+}
+
+// othersWriting reports whether a session other than s has uncommitted
+// changes. The caller must hold db.mu.
+func (db *DB) othersWriting(s *Session) bool {
+	for other := range db.writers {
+		if other != s {
+			return true
+		}
+	}
+	return false
 }
 
 // lookup returns the named table. The caller must hold db.mu.

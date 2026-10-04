@@ -20,11 +20,13 @@
 | Accept new sqllogictest counts | `bash scripts/slt.sh --update` (also rewrites `docs/sqllogictest.md`) |
 | Fuzz the parser | `go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m` |
 | Accept new psql output | `bash scripts/psql-smoke.sh --update` |
-| Restart test | `bash scripts/restart-smoke.sh` |
+| Kill-and-recover test through psql | `bash scripts/restart-smoke.sh` |
+| Crash tests (simulated disk, real kill) | `go test ./internal/engine -run "TestCrashRecovery|TestKillProcess" -v` |
+| Mutation-test the crash tests | `bash scripts/mutation-test.sh` |
 | Fuzz the B+tree | `go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m` |
 | Benchmarks | `bash scripts/bench.sh` |
 | Check a database file | `go run ./cmd/capivaradb -data file.cdb -check` |
-| Regenerate screenshots | `bash scripts/screenshots.sh m3` |
+| Regenerate screenshots | `bash scripts/screenshots.sh m4` |
 | Format check | `gofmt -l .` (must print nothing) |
 
 The scripts are bash and run unchanged on Linux and under Git Bash on
@@ -84,3 +86,18 @@ A new construct usually touches four places, in this order:
 A crasher found by the fuzzer is saved under
 `internal/sql/testdata/fuzz/FuzzParse/`; commit it with the fix so that it
 runs as a regression test from then on.
+
+## Changing the storage or logging code
+
+Three things to do before trusting a change under `internal/storage`:
+
+1. `go test ./internal/storage ./internal/engine` — the crash tests are
+   part of the normal run.
+2. `bash scripts/mutation-test.sh` — it also fails if a mutant no longer
+   applies because the line it targets has moved, which is the cue to
+   update the script.
+3. If the change adds a rule the design now depends on, add a mutant that
+   breaks it, and make sure something fails.
+
+A failing crash test prints its seed and round. The workload and the
+simulated disk are both seeded, so the failure replays exactly.

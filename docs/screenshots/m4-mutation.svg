@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="727" height="530" viewBox="0 0 727 530" role="img" aria-label="mutation testing: break a rule, the crash tests must fail">
+<rect width="727" height="530" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h707 a10 10 0 0 1 10 10v24 h-727 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="363" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">mutation testing: break a rule, the crash tests must fail</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ scripts/mutation-test.sh</text>
+<text x="18" y="86" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="106" fill="#e6edf3">  passes</text>
+<text x="18" y="126" fill="#e6edf3">mutant: COMMIT returns without syncing the log</text>
+<text x="18" y="146" fill="#e6edf3">  killed</text>
+<text x="18" y="166" fill="#e6edf3">mutant: a page is written to the data file before its log record is durable</text>
+<text x="18" y="186" fill="#e6edf3">  killed</text>
+<text x="18" y="206" fill="#e6edf3">mutant: recovery skips the undo pass</text>
+<text x="18" y="226" fill="#e6edf3">  killed</text>
+<text x="18" y="246" fill="#e6edf3">mutant: recovery skips the redo pass</text>
+<text x="18" y="266" fill="#e6edf3">  killed</text>
+<text x="18" y="286" fill="#e6edf3">mutant: a page changed for the first time since a checkpoint is not logged in full</text>
+<text x="18" y="306" fill="#e6edf3">  killed</text>
+<text x="18" y="326" fill="#e6edf3">mutant: a checkpoint does not sync the data file</text>
+<text x="18" y="346" fill="#e6edf3">  killed</text>
+<text x="18" y="366" fill="#e6edf3">mutant: a checkpoint discards the log while a transaction is still open</text>
+<text x="18" y="386" fill="#e6edf3">  killed</text>
+<text x="18" y="406" fill="#e6edf3">mutant: undo steps are not marked as done in the log</text>
+<text x="18" y="426" fill="#e6edf3">  SURVIVED: the tests did not notice</text>
+<text x="18" y="446" fill="#e6edf3">mutant: trees dropped by a committed transaction are not freed after a crash</text>
+<text x="18" y="466" fill="#e6edf3">  killed</text>
+<text x="18" y="506" fill="#e6edf3">1 mutant(s) survived</text>
+</g>
+</svg>

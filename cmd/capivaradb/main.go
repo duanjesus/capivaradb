@@ -21,6 +21,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:5432", "address to listen on")
 	data := flag.String("data", "", "database file; without it the database lives in memory")
 	cacheMB := flag.Int("cache", engine.DefaultPoolPages*storage.PageSize>>20, "buffer pool size in megabytes")
+	noSync := flag.Bool("nosync", false, "never fsync: fast, and unsafe if the machine (not just the server) crashes")
 	check := flag.Bool("check", false, "verify the database file and exit")
 	verbose := flag.Bool("v", false, "log every connection")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -39,10 +40,17 @@ func main() {
 	where := "in memory only: data is lost on exit"
 	if *data != "" {
 		var err error
-		if db, err = engine.Open(*data, max(*cacheMB<<20/storage.PageSize, 8)); err != nil {
+		db, err = engine.Open(*data, engine.Options{PoolPages: max(*cacheMB<<20/storage.PageSize, 8), NoSync: *noSync})
+		if err != nil {
 			fail(err)
 		}
 		where = "data file " + *data
+		// Say so if the last run did not shut down cleanly: the log was
+		// replayed and unfinished transactions were rolled back.
+		if r := db.Recovery(); r.Records > 0 {
+			fmt.Fprintf(os.Stderr, "recovered from the log: %d records, %d page changes replayed, %d unfinished transactions rolled back\n",
+				r.Records, r.PagesRedone, r.RolledBack)
+		}
 	}
 
 	if *check {
@@ -79,9 +87,9 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "%s\nlistening on %s (%s)\n", version.Full, ln.Addr(), where)
 	serveErr := srv.Serve(ln)
-	// Closing writes every modified page and syncs the file. Until the
-	// write-ahead log exists this clean shutdown (or CHECKPOINT) is what
-	// makes changes durable.
+	// A commit is already durable when it is acknowledged, through the log.
+	// Closing takes a final checkpoint, so that the next start has nothing
+	// to recover.
 	if err := db.Close(); err != nil {
 		fail(err)
 	}

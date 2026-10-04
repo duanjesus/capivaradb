@@ -9,6 +9,10 @@ import (
 // ErrKeyTooLarge is returned by Put for a key longer than MaxKeySize.
 var ErrKeyTooLarge = errors.New("storage: key exceeds the maximum size")
 
+// ErrValueTooLarge is returned by Put for a value whose overflow pages would
+// not fit in half the buffer pool.
+var ErrValueTooLarge = errors.New("storage: value too large for the buffer pool")
+
 // maxDepth is far more than any tree can reach (a tree of depth 8 already
 // addresses more pages than a file can have); exceeding it means the page
 // links form a cycle.
@@ -32,14 +36,25 @@ type Tree struct {
 	root uint32
 }
 
-// CreateTree allocates an empty tree.
-func CreateTree(p *Pager) (*Tree, error) {
+// CreateTree allocates an empty tree. If tx is not zero the creation belongs
+// to that transaction: the log notes it, and recovery frees the tree again
+// should the transaction not commit.
+func CreateTree(p *Pager, tx uint64) (t *Tree, err error) {
+	if err = p.beginWrite(); err != nil {
+		return nil, err
+	}
+	defer p.endWrite(&err)
 	pg, err := p.Alloc(pageLeaf)
 	if err != nil {
 		return nil, err
 	}
 	initNode(pg.Data, pageLeaf)
 	pg.Unpin(true)
+	if tx != 0 {
+		p.mu.Lock()
+		p.batch.note = note{kind: noteCreated, tx: tx, arg: uint64(pg.ID)}
+		p.mu.Unlock()
+	}
 	return &Tree{p: p, root: pg.ID}, nil
 }
 
@@ -73,11 +88,20 @@ func (t *Tree) descend(key []byte) ([]step, *Page, error) {
 	var path []step
 	id := t.root
 	for {
-		pg, n, err := t.fetchNode(id)
+		// Internal pages are only read on the way down, so they are
+		// fetched without the bookkeeping a modification would need;
+		// the leaf, which the caller may change, gets it.
+		pg, err := t.p.FetchUntracked(id)
 		if err != nil {
 			return nil, nil, err
 		}
+		n := node(pg.Data)
+		if typ := pg.Data[offType]; typ != pageLeaf && typ != pageInternal {
+			pg.Unpin(false)
+			return nil, nil, fmt.Errorf("%w: page %d has type %d where a B+tree page was expected", ErrCorrupt, id, typ)
+		}
 		if n.isLeaf() {
+			pg.Track()
 			return path, pg, nil
 		}
 		if len(path) >= maxTreeDepth {
@@ -227,13 +251,23 @@ func (t *Tree) leafCell(key, val []byte) ([]byte, error) {
 }
 
 // Put stores val under key, replacing any existing value.
-func (t *Tree) Put(key, val []byte) error {
+func (t *Tree) Put(key, val []byte) (err error) {
 	if len(key) > MaxKeySize {
 		return ErrKeyTooLarge
 	}
 	if len(val) >= overflowFlag {
 		return fmt.Errorf("storage: value of %d bytes is too large", len(val))
 	}
+	// A large value's overflow pages are all modified by this one
+	// operation, and pages modified by an operation in progress cannot
+	// leave the buffer pool.
+	if pages := len(val)/(PageSize-slotBase) + 1; pages > t.p.PoolPages()/2 {
+		return ErrValueTooLarge
+	}
+	if err = t.p.beginWrite(); err != nil {
+		return err
+	}
+	defer t.p.endWrite(&err)
 	path, leaf, err := t.descend(key)
 	if err != nil {
 		return err
@@ -403,7 +437,11 @@ func (t *Tree) insertIntoParent(path []step, left uint32, sep []byte, right uint
 }
 
 // Delete removes key and reports whether it was present.
-func (t *Tree) Delete(key []byte) (bool, error) {
+func (t *Tree) Delete(key []byte) (found bool, err error) {
+	if err = t.p.beginWrite(); err != nil {
+		return false, err
+	}
+	defer t.p.endWrite(&err)
 	path, leaf, err := t.descend(key)
 	if err != nil {
 		return false, err
@@ -597,7 +635,11 @@ func (c *Cursor) Next() (key, val []byte, ok bool) {
 func (c *Cursor) Err() error { return c.err }
 
 // Drop frees every page of the tree. The Tree must not be used afterwards.
-func (t *Tree) Drop() error {
+func (t *Tree) Drop() (err error) {
+	if err = t.p.beginWrite(); err != nil {
+		return err
+	}
+	defer t.p.endWrite(&err)
 	return t.dropPage(t.root, 0)
 }
 
@@ -633,4 +675,17 @@ func (t *Tree) dropPage(id uint32, depth int) error {
 		}
 	}
 	return t.p.Free(id)
+}
+
+// CreateTreeLogged is CreateTree for a transaction, also returning the LSN
+// of the log record that notes the creation. Undoing it is an UndoDropTree
+// applied at that LSN.
+func CreateTreeLogged(p *Pager, tx uint64) (*Tree, uint64, error) {
+	t, err := CreateTree(p, tx)
+	if err != nil {
+		return nil, 0, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return t, p.lastLSN, nil
 }
