@@ -35,6 +35,10 @@ func newHarness(t *testing.T, db *DB) *harness {
 		if _, err := db.Verify(); err != nil {
 			t.Errorf("database is inconsistent after the test: %v", err)
 		}
+		// Every temporary file a query created must be gone by now.
+		if n := db.openSpills.Load(); n != 0 {
+			t.Errorf("%d temporary files were left behind", n)
+		}
 	})
 	t.Cleanup(sess.Close)
 	return &harness{t: t, sess: sess}
@@ -405,7 +409,13 @@ func TestStalePreparedStatement(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.mustRun("drop table t; create table t (name text)")
-	if _, err := p.Execute(context.Background(), nil); pgerr.From(err).Code != pgerr.UndefinedTable {
+	// A query does nothing until its first row is asked for.
+	rows, err := p.Execute(context.Background(), nil)
+	if err == nil {
+		_, err = rows.Next(context.Background())
+		rows.Close()
+	}
+	if pgerr.From(err).Code != pgerr.UndefinedTable {
 		t.Errorf("expected the stale statement to be rejected, got %v", err)
 	}
 }

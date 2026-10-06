@@ -27,12 +27,14 @@ import (
 // Choices are made by estimated cost. The estimates come from table
 // statistics (stats.go) and are crude; they only need to rank plans.
 //
-// What the planner leaves alone: it does not reorder across LEFT JOIN, it
-// builds only left-deep join trees, and the only join algorithm is the
-// nested loop, with or without an index on the inner side. Hash and merge
-// joins belong to the executor milestone.
+//   - How each join is carried out: by looking the inner rows up through an
+//     index, by hashing, by merging two sorted inputs, or by comparing
+//     every pair (join.go has what each costs).
+//
+// What the planner leaves alone: it does not reorder across an outer join,
+// and it builds only left-deep join trees.
 
-// planNode is a step of a plan. It serves both execution, through run, and
+// planNode is a step of a plan. It serves both execution, through open, and
 // EXPLAIN, through everything else.
 type planNode struct {
 	op    string   // "Seq Scan on emp e", "Nested Loop", ...
@@ -40,25 +42,23 @@ type planNode struct {
 	kids  []*planNode
 	// rows and cost are the planner's estimates.
 	rows, cost float64
-	run        func(cx *env) ([][]any, error)
+	// open starts the step and returns the iterator over its rows.
+	open func(cx *env) (iter, error)
+	// orderedBy is 1 + the FROM column the rows come out sorted by, or 0
+	// if they come in no useful order. A table is stored in primary key
+	// order, so a scan of it is sorted for free; a merge join can use that.
+	orderedBy int
 
 	// What actually happened, for EXPLAIN ANALYZE.
 	loops, actual int
 	elapsed       time.Duration
-}
-
-// exec runs the node and records what it did.
-func (n *planNode) exec(cx *env) ([][]any, error) {
-	start := time.Now()
-	rows, err := n.run(cx)
-	n.elapsed += time.Since(start)
-	n.loops++
-	n.actual += len(rows)
-	return rows, err
+	// info holds what the step has to say about its own execution ("Sort
+	// Method: ...").
+	info []string
 }
 
 func (n *planNode) reset() {
-	n.loops, n.actual, n.elapsed = 0, 0, 0
+	n.loops, n.actual, n.elapsed, n.info = 0, 0, 0, nil
 	for _, k := range n.kids {
 		k.reset()
 	}
@@ -101,6 +101,11 @@ func (n *planNode) write(out *[]string, indent string, root bool, opt explainOpt
 	for _, l := range n.lines {
 		*out = append(*out, body+l)
 	}
+	if opt.analyze {
+		for _, l := range n.info {
+			*out = append(*out, body+l)
+		}
+	}
 	for _, k := range n.kids {
 		k.write(out, body, false, opt)
 	}
@@ -113,7 +118,27 @@ const (
 	costIndexRow = 4.0  // a row read through a secondary index: a lookup in the table per row
 	costDescent  = 3.0  // finding the starting point in a B+tree
 	costPair     = 0.25 // comparing one pair of rows in a nested loop
+	costHashRow  = 1.5  // putting a row in a hash table
+	costProbe    = 0.5  // looking a row up in a hash table
+	costMergeRow = 0.3  // advancing one row in a merge
+	costSortCmp  = 0.2  // one comparison of a sort
 )
+
+// disabledCost is added to the cost of a join method that has been switched
+// off but may still be the only one possible, so that it is chosen last
+// rather than never. (PostgreSQL does the same.)
+const disabledCost = 1e10
+
+// loopPenalty is what a plain nested loop costs extra in this session.
+func (p *planner) loopPenalty() float64 {
+	if p.s.vars["enable_nestloop"] == "off" {
+		return disabledCost
+	}
+	return 0
+}
+
+// sortCost estimates sorting rows rows.
+func sortCost(rows float64) float64 { return rows * math.Log2(rows+2) * costSortCmp }
 
 // bits is a set of relations of a join group.
 type bits [2]uint64
@@ -163,6 +188,8 @@ func (it *relItem) label() string {
 type joinGroup struct {
 	items []*relItem
 	conds []sql.Expr
+	// star lists the group's columns in the order "*" shows them.
+	star []int
 }
 
 func (g *joinGroup) span() (off, end int) {
@@ -173,10 +200,15 @@ func (g *joinGroup) span() (off, end int) {
 	return off, end
 }
 
-// joinUnit is a LEFT JOIN. Its two sides are planned on their own and it
+// joinUnit is an outer join. Its two sides are planned on their own and it
 // takes part in the enclosing group as a single relation: rows cannot be
 // moved across an outer join without changing the result.
+//
+// left is the side whose rows are all kept; for a RIGHT JOIN that is the
+// side written on the right. Which side is which does not affect where
+// their columns are in the row, which follows the order written.
 type joinUnit struct {
+	kind        joinKind // joinLeft or joinFull
 	left, right *joinGroup
 	on          []sql.Expr
 }
@@ -199,6 +231,7 @@ type planner struct {
 	cols   []scopeCol
 	owners []*relItem // for each column, the base table it belongs to, if any
 	conjs  map[sql.Expr]*conj
+	equis  map[*conj]*equiCond
 }
 
 // conj is one AND-ed piece of a condition, analysed.
@@ -235,6 +268,8 @@ func (p *planner) refs(e sql.Expr) (cols []int, opaque bool) {
 			if i, err := p.b.scope.find(x); err == nil && i >= 0 {
 				cols = append(cols, i)
 			}
+		case *colIdx:
+			cols = append(cols, x.idx)
 		case *sql.SubqueryExpr, *sql.Exists:
 			opaque = true
 		case *sql.In:
@@ -271,10 +306,67 @@ type fromBuilder struct {
 func (fb *fromBuilder) add(it *relItem, cols []scopeCol) *joinGroup {
 	it.off, it.width = len(fb.cols), len(cols)
 	fb.cols = append(fb.cols, cols...)
-	for range cols {
+	g := &joinGroup{items: []*relItem{it}}
+	for i := range cols {
 		fb.owners = append(fb.owners, it)
+		g.star = append(g.star, it.off+i)
 	}
-	return &joinGroup{items: []*relItem{it}}
+	return g
+}
+
+// using turns JOIN ... USING (a, b) into the conditions it stands for and
+// works out what "*" shows: each named column once, first, then the rest of
+// the left side, then the rest of the right. The copy that is not shown
+// stays reachable by its table's name.
+func (fb *fromBuilder) using(te *sql.Join, left, right *joinGroup) (conds []sql.Expr, star []int, err error) {
+	find := func(g *joinGroup, id sql.Ident, side string) (int, error) {
+		found := -1
+		for _, i := range g.star {
+			if fb.cols[i].name != id.Name {
+				continue
+			}
+			if found >= 0 {
+				return 0, pgerr.New(pgerr.AmbiguousColumn,
+					"common column name %q appears more than once in %s table", id.Name, side).At(id.Pos)
+			}
+			found = i
+		}
+		if found < 0 {
+			return 0, pgerr.New(pgerr.UndefinedColumn,
+				"column %q specified in USING clause does not exist in %s table", id.Name, side).At(id.Pos)
+		}
+		return found, nil
+	}
+	merged := map[int]bool{}
+	for _, id := range te.Using {
+		l, err := find(left, id, "left")
+		if err != nil {
+			return nil, nil, err
+		}
+		r, err := find(right, id, "right")
+		if err != nil {
+			return nil, nil, err
+		}
+		lc, rc := fb.cols[l], fb.cols[r]
+		conds = append(conds, &sql.Binary{Op: "=", Pos: id.Pos,
+			L: &sql.ColumnRef{Table: lc.table, Name: lc.name, Pos: id.Pos},
+			R: &sql.ColumnRef{Table: rc.table, Name: rc.name, Pos: id.Pos}})
+		// The column shown is the one from the side whose rows are all
+		// there: in a RIGHT JOIN the left one may be NULL.
+		shown, hidden := l, r
+		if te.Kind == sql.RightJoin {
+			shown, hidden = r, l
+		}
+		fb.cols[hidden].hidden = true
+		merged[l], merged[r] = true, true
+		star = append(star, shown)
+	}
+	for _, i := range append(append([]int(nil), left.star...), right.star...) {
+		if !merged[i] {
+			star = append(star, i)
+		}
+	}
+	return conds, star, nil
 }
 
 func (fb *fromBuilder) build(te sql.TableExpr) (*joinGroup, error) {
@@ -314,16 +406,35 @@ func (fb *fromBuilder) build(te sql.TableExpr) (*joinGroup, error) {
 		if err != nil {
 			return nil, err
 		}
-		if te.Kind == sql.LeftJoin {
+		on := conjuncts(te.On)
+		star := append(append([]int(nil), left.star...), right.star...)
+		if te.Using != nil {
+			if te.Kind == sql.FullJoin {
+				// Its column would have to be whichever of the two is
+				// not NULL, which is neither side's column.
+				return nil, pgerr.New(pgerr.FeatureNotSupported, "FULL JOIN ... USING is not supported").At(te.Pos)
+			}
+			if on, star, err = fb.using(te, left, right); err != nil {
+				return nil, err
+			}
+		}
+		if te.Kind == sql.LeftJoin || te.Kind == sql.RightJoin || te.Kind == sql.FullJoin {
 			off, _ := left.span()
 			_, end := right.span()
-			unit := &relItem{off: off, width: end - off, alias: "left join",
-				unit: &joinUnit{left: left, right: right, on: conjuncts(te.On)}}
-			return &joinGroup{items: []*relItem{unit}}, nil
+			u := &joinUnit{kind: joinLeft, left: left, right: right, on: on}
+			switch te.Kind {
+			case sql.RightJoin:
+				u.left, u.right = right, left
+			case sql.FullJoin:
+				u.kind = joinFull
+			}
+			unit := &relItem{off: off, width: end - off, alias: "outer join", unit: u}
+			return &joinGroup{items: []*relItem{unit}, star: star}, nil
 		}
 		// An inner join's ON is just more conditions on the merged group.
 		left.items = append(left.items, right.items...)
-		left.conds = append(append(left.conds, right.conds...), conjuncts(te.On)...)
+		left.conds = append(append(left.conds, right.conds...), on...)
+		left.star = star
 		return left, nil
 	}
 	return nil, pgerr.New(pgerr.InternalError, "unhandled FROM item %T", te)
@@ -559,14 +670,23 @@ func (a *access) name() string {
 
 // fetch reads the rows the access selects, given the values en supplies.
 func (a *access) fetch(s *Session, en *env) ([]rowRef, error) {
-	var kb keyBounds
+	kb, ok, err := a.bounds(en)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return s.db.rangeScan(a.item.table, a.index, en.q.snap, kb, en.locked)
+}
+
+// bounds computes the key range the access reads, given the values en
+// supplies. It reports false if the range is empty for certain.
+func (a *access) bounds(en *env) (kb keyBounds, ok bool, err error) {
 	for _, k := range a.eq {
 		part, err := k.encode(en)
 		if err != nil {
-			return nil, err
+			return kb, false, err
 		}
 		if part == nil {
-			return nil, nil // col = NULL is never true
+			return kb, false, nil // col = NULL is never true
 		}
 		kb.prefix = append(kb.prefix, part...)
 	}
@@ -580,15 +700,15 @@ func (a *access) fetch(s *Session, en *env) ([]rowRef, error) {
 		}
 		part, err := bound.k.encode(en)
 		if err != nil {
-			return nil, err
+			return kb, false, err
 		}
 		if part == nil {
-			return nil, nil
+			return kb, false, nil
 		}
 		*bound.dst = part
 	}
 	kb.loIncl, kb.hiIncl = a.loIncl, a.hiIncl
-	return s.db.rangeScan(a.item.table, a.index, s.snap, kb, en.locked)
+	return kb, true, nil
 }
 
 // bestAccess finds the cheapest index access to a table for the given
@@ -732,6 +852,73 @@ type scanPlan struct {
 	sargs   []sarg
 }
 
+// scanIter reads a table, or the part of it a key range selects, a batch at
+// a time. It returns the table's own rows.
+type scanIter struct {
+	db     *DB
+	t      *table
+	ix     *index
+	kb     keyBounds
+	cx     *env
+	batch  []rowRef
+	pos    int
+	resume []byte
+	done   bool
+	// size is how many rows the next batch asks for. It starts small and
+	// doubles: a query that wants ten rows should not decode hundreds, and
+	// one that wants them all should not take the lock for each handful.
+	size int
+}
+
+func (sc *scanIter) next() ([]any, error) {
+	for sc.pos >= len(sc.batch) {
+		if sc.done {
+			return nil, nil
+		}
+		if err := sc.cx.ctx.Err(); err != nil {
+			return nil, err
+		}
+		sc.size = min(max(2*sc.size, scanBatchFirst), scanBatchRows)
+		batch, resume, err := sc.db.scanBatch(sc.t, sc.ix, sc.cx.q.snap, sc.kb, sc.resume, sc.size, sc.cx.locked)
+		if err != nil {
+			return nil, err
+		}
+		sc.batch, sc.pos, sc.resume, sc.done = batch, 0, resume, resume == nil
+	}
+	sc.pos++
+	return sc.batch[sc.pos-1].vals, nil
+}
+
+func (sc *scanIter) close() { sc.batch, sc.done = nil, true }
+
+// widenIter places a relation's own rows in its segment of the full row and
+// applies the relation's conditions.
+type widenIter struct {
+	src        iter
+	en         *env
+	filters    []evalFn
+	off, width int
+}
+
+func (w *widenIter) next() ([]any, error) {
+	for {
+		r, err := w.src.next()
+		if err != nil || r == nil {
+			return nil, err
+		}
+		full := make([]any, w.width)
+		copy(full[w.off:], r)
+		w.en.row = full
+		if ok, err := allMatch(w.filters, w.en); err != nil {
+			return nil, err
+		} else if ok {
+			return full, nil
+		}
+	}
+}
+
+func (w *widenIter) close() { w.src.close() }
+
 // planScan plans reading one relation, applying the conditions that
 // mention it alone.
 func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
@@ -741,22 +928,8 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 	for _, c := range local {
 		sel *= p.selectivity(c.expr)
 	}
-	// widen places a relation's own row in its segment of the full row and
-	// applies the relation's conditions.
-	widen := func(cx *env, rows [][]any) ([][]any, error) {
-		en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
-		out := make([][]any, 0, len(rows))
-		for _, r := range rows {
-			full := make([]any, width)
-			copy(full[it.off:], r)
-			en.row = full
-			if ok, err := allMatch(filters, en); err != nil {
-				return nil, err
-			} else if ok {
-				out = append(out, full)
-			}
-		}
-		return out, nil
+	widen := func(cx *env, src iter) iter {
+		return &widenIter{src: src, en: cx.child(), filters: filters, off: it.off, width: width}
 	}
 	sp := &scanPlan{local: local}
 	node := &planNode{}
@@ -777,12 +950,12 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 		filterLine(nil)
 		node.kids = []*planNode{sub.root}
 		node.rows, node.cost = math.Max(sp.rawRows*sel, 1), sub.root.cost+sp.rawRows*costSeqRow*0.1
-		node.run = func(cx *env) ([][]any, error) {
-			rows, err := sub.run(cx)
+		node.open = func(cx *env) (iter, error) {
+			src, err := sub.open(cx)
 			if err != nil {
 				return nil, err
 			}
-			return widen(cx, rows)
+			return widen(cx, src), nil
 		}
 
 	default:
@@ -793,6 +966,10 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 		}
 		node.rows = math.Max(sp.rawRows*sel, 1)
 		seqCost := sp.rawRows * costSeqRow
+		// A table is stored in the order of its primary key.
+		if t.pk != nil {
+			node.orderedBy = 1 + it.off + t.pk[0]
+		}
 		// Only conditions on constants can drive a scan that stands alone.
 		acc := p.bestAccess(it, sp.sargs, func(sa sarg) bool { return len(sa.needs) == 0 })
 		if acc != nil && acc.cost < seqCost {
@@ -801,27 +978,25 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 			filterLine(acc.used)
 			node.cost = acc.cost
 			node.rows = math.Min(node.rows, acc.rows)
-			node.run = func(cx *env) ([][]any, error) {
-				refs, err := acc.fetch(p.s, &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked})
+			if acc.index != nil {
+				node.orderedBy = 0
+			}
+			node.open = func(cx *env) (iter, error) {
+				kb, ok, err := acc.bounds(cx.child())
 				if err != nil {
 					return nil, err
 				}
-				rows := make([][]any, len(refs))
-				for i, r := range refs {
-					rows[i] = r.vals
+				if !ok {
+					return &sliceIter{}, nil
 				}
-				return widen(cx, rows)
+				return widen(cx, &scanIter{db: p.s.db, t: t, ix: acc.index, kb: kb, cx: cx}), nil
 			}
 		} else {
 			node.op = "Seq Scan on " + it.label()
 			filterLine(nil)
 			node.cost = seqCost
-			node.run = func(cx *env) ([][]any, error) {
-				rows, err := p.s.db.rows(t, p.s.snap, cx.locked)
-				if err != nil {
-					return nil, err
-				}
-				return widen(cx, rows)
+			node.open = func(cx *env) (iter, error) {
+				return widen(cx, &scanIter{db: p.s.db, t: t, cx: cx}), nil
 			}
 		}
 	}
@@ -829,11 +1004,173 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 	return sp, nil
 }
 
-// planUnit plans a LEFT JOIN. Conditions from outside that mention only
-// its left side are pushed into that side; conditions in its ON clause that
-// mention only the right side are pushed into the right side. (Not the
-// other way round: an ON condition on the left side does not remove left
-// rows, it only stops them matching.)
+// ---- equalities a join can hash or merge on ----
+
+// equiCond is a join condition of the form "a = b" in which the two sides
+// can be computed separately and compared by value.
+type equiCond struct {
+	c            *conj
+	l, r         bound
+	lcols, rcols []int
+	// float is set if the sides are compared as double precision.
+	float bool
+}
+
+// equi analyses c as an equality between two separately computable sides,
+// or returns nil if it is not one.
+func (p *planner) equi(c *conj) *equiCond {
+	if eq, done := p.equis[c]; done {
+		return eq
+	}
+	p.equis[c] = nil
+	e, ok := c.expr.(*sql.Binary)
+	if !ok || e.Op != "=" || c.opaque {
+		return nil
+	}
+	l, err := p.b.bind(e.L, sql.Unknown)
+	if err != nil {
+		return nil
+	}
+	r, err := p.b.bind(e.R, sql.Unknown)
+	if err != nil {
+		return nil
+	}
+	eq := &equiCond{c: c, l: l, r: r}
+	switch {
+	case l.typ.IsInt() && r.typ.IsInt():
+	case l.typ.IsNumeric() && r.typ.IsNumeric():
+		eq.float = true
+	case l.typ == sql.Text && r.typ == sql.Text, l.typ == sql.Bool && r.typ == sql.Bool:
+	default:
+		return nil
+	}
+	eq.lcols, _ = p.refs(e.L)
+	eq.rcols, _ = p.refs(e.R)
+	if len(eq.lcols) == 0 || len(eq.rcols) == 0 {
+		return nil
+	}
+	p.equis[c] = eq
+	return eq
+}
+
+// keySide is one side of an equiCond, assigned to a side of a join.
+type keySide struct {
+	b    bound
+	expr sql.Expr
+}
+
+func (k keySide) hashKey(eq *equiCond) hashKey { return hashKey{eval: k.b.eval, float: eq.float} }
+
+// split assigns the sides of eq to the outer and the inner side of a join,
+// given which columns each side has. It reports false if the equality does
+// not separate that way.
+func (eq *equiCond) split(isOuter, isInner func(cols []int) bool) (outer, inner keySide, ok bool) {
+	e := eq.c.expr.(*sql.Binary)
+	l, r := keySide{eq.l, e.L}, keySide{eq.r, e.R}
+	switch {
+	case isOuter(eq.lcols) && isInner(eq.rcols):
+		return l, r, true
+	case isOuter(eq.rcols) && isInner(eq.lcols):
+		return r, l, true
+	}
+	return keySide{}, keySide{}, false
+}
+
+// keyColumn returns 1 + the FROM column a key is, if it is a plain column.
+func (p *planner) keyColumn(k keySide) int {
+	if col, ok := p.columnOf(k.expr); ok {
+		return 1 + col
+	}
+	return 0
+}
+
+// hashParts builds the pieces of a hash join from the conditions of a join:
+// the keys of each side, the conditions the keys stand for, and the
+// conditions left to check on each pair.
+func (p *planner) hashParts(conds []*conj, isOuter, isInner func(cols []int) bool) (probe, build []hashKey, used []sql.Expr, rest []*conj) {
+	for _, c := range conds {
+		if eq := p.equi(c); eq != nil {
+			if o, i, ok := eq.split(isOuter, isInner); ok {
+				probe, build = append(probe, o.hashKey(eq)), append(build, i.hashKey(eq))
+				used = append(used, c.expr)
+				continue
+			}
+		}
+		rest = append(rest, c)
+	}
+	return probe, build, used, rest
+}
+
+// hashJoinNode builds the plan node of a hash join.
+func (p *planner) hashJoinNode(spec *joinSpec, probe, build []hashKey, used []sql.Expr, rest []*conj) *planNode {
+	restEvals, restExprs := condEvals(rest)
+	spec.conds = restEvals
+	hash := &planNode{op: "Hash", kids: []*planNode{spec.inner}, rows: spec.inner.rows,
+		cost: spec.inner.cost + spec.inner.rows*costHashRow}
+	node := &planNode{op: "Hash" + spec.kind.label() + " Join", kids: []*planNode{spec.outer, hash},
+		lines: []string{"Hash Cond: " + exprList(used)}}
+	if len(restExprs) > 0 {
+		node.lines = append(node.lines, "Join Filter: "+exprList(restExprs))
+	}
+	node.open = func(cx *env) (iter, error) {
+		return &hashJoinIter{j: spec, probeKeys: probe, buildKeys: build, hashNode: hash, cx: cx, en: cx.child()}, nil
+	}
+	return node
+}
+
+// nlJoinNode builds the plan node of a plain nested loop.
+func nlJoinNode(spec *joinSpec, conds []*conj) *planNode {
+	evals, exprs := condEvals(conds)
+	spec.conds = evals
+	node := &planNode{op: "Nested Loop" + spec.kind.label() + joinWord(spec.kind), kids: []*planNode{spec.outer, spec.inner},
+		orderedBy: spec.outer.orderedBy}
+	if len(exprs) > 0 {
+		node.lines = []string{"Join Filter: " + exprList(exprs)}
+	}
+	node.open = func(cx *env) (iter, error) {
+		outer, err := spec.outer.start(cx)
+		if err != nil {
+			return nil, err
+		}
+		return &nlJoinIter{j: spec, cx: cx, en: cx.child(), outer: outer}, nil
+	}
+	return node
+}
+
+// joinWord completes the name of an outer nested loop the way PostgreSQL
+// writes it: "Nested Loop", but "Nested Loop Left Join".
+func joinWord(k joinKind) string {
+	if k == joinInner {
+		return ""
+	}
+	return " Join"
+}
+
+// filtered puts conditions on top of a node's rows.
+func filtered(node *planNode, conds []evalFn) {
+	if len(conds) == 0 {
+		return
+	}
+	inner := node.open
+	node.open = func(cx *env) (iter, error) {
+		src, err := inner(cx)
+		if err != nil {
+			return nil, err
+		}
+		return &filterIter{src: src, en: cx.child(), conds: conds}, nil
+	}
+}
+
+// planUnit plans an outer join. Conditions from outside that mention only
+// its preserved side are pushed into that side; conditions in its ON clause
+// that mention only the other side are pushed into the other side. (Not the
+// other way round: an ON condition on the preserved side does not remove
+// its rows, it only stops them matching.) A full join preserves both sides,
+// and nothing can be pushed into either.
+//
+// In a unit, "left" is the preserved side and "right" the side whose
+// columns are NULL in a row that matched nothing. A RIGHT JOIN arrives here
+// with its sides already exchanged.
 func (p *planner) planUnit(it *relItem, outside []*conj) (*scanPlan, error) {
 	u := it.unit
 	loff, lend := u.left.span()
@@ -846,11 +1183,13 @@ func (p *planner) planUnit(it *relItem, outside []*conj) (*scanPlan, error) {
 		}
 		return true
 	}
+	inLeft := func(cols []int) bool { return len(cols) > 0 && inside(cols, loff, lend) }
+	inRight := func(cols []int) bool { return len(cols) > 0 && inside(cols, roff, rend) }
 
 	var toLeft, above []sql.Expr
 	var aboveConds []*conj
 	for _, c := range outside {
-		if !c.opaque && inside(c.cols, loff, lend) {
+		if u.kind != joinFull && !c.opaque && inside(c.cols, loff, lend) {
 			toLeft = append(toLeft, c.expr)
 		} else {
 			above = append(above, c.expr)
@@ -864,7 +1203,7 @@ func (p *planner) planUnit(it *relItem, outside []*conj) (*scanPlan, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !c.opaque && len(c.cols) > 0 && inside(c.cols, roff, rend) {
+		if u.kind != joinFull && !c.opaque && inRight(c.cols) {
 			toRight = append(toRight, e)
 		} else {
 			on = append(on, c)
@@ -875,35 +1214,38 @@ func (p *planner) planUnit(it *relItem, outside []*conj) (*scanPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	onEvals, onExprs := condEvals(on)
+	right, err := p.planGroup(u.right, toRight)
+	if err != nil {
+		return nil, err
+	}
+	_, onExprs := condEvals(on)
 	aboveEvals, _ := condEvals(aboveConds)
-	node := &planNode{op: "Nested Loop Left Join"}
-	if len(onExprs) > 0 {
-		node.lines = append(node.lines, "Join Filter: "+exprList(onExprs))
-	}
-	if len(above) > 0 {
-		node.lines = append(node.lines, "Filter: "+exprList(above))
-	}
 	sel := 1.0
 	for _, c := range on {
 		sel *= p.selectivity(c.expr)
 	}
 	width := len(p.cols)
-	finish := func(en *env, out *[][]any, row []any) error {
-		en.row = row
-		ok, err := allMatch(aboveEvals, en)
-		if err == nil && ok {
-			if len(*out) >= maxJoinRows {
-				return errJoinTooLarge()
-			}
-			*out = append(*out, row)
+	spec := &joinSpec{kind: u.kind, outer: left, inner: right, off: roff, end: rend, width: width}
+	rows := math.Max(left.rows, left.rows*right.rows*sel)
+	if u.kind == joinFull {
+		rows = math.Max(rows, right.rows)
+	}
+
+	// Three ways to do it; the cheapest wins.
+	nlCost := left.cost + right.cost + left.rows*right.rows*costPair + p.loopPenalty()
+	node := nlJoinNode(spec, on)
+	node.cost = nlCost
+
+	if probe, build, used, rest := p.hashParts(on, inLeft, inRight); len(used) > 0 && p.s.vars["enable_hashjoin"] != "off" {
+		if cost := left.cost + right.cost + right.rows*costHashRow + left.rows*costProbe; cost < nlCost {
+			node = p.hashJoinNode(spec, probe, build, used, rest)
+			node.cost = cost
 		}
-		return err
 	}
 
 	// If the right side is a single table that an index can look up from
-	// the left row, do that instead of comparing every pair.
-	if len(u.right.items) == 1 && u.right.items[0].table != nil {
+	// the left row, that may beat both: it never reads the table at all.
+	if len(u.right.items) == 1 && u.right.items[0].table != nil && u.kind == joinLeft {
 		inner := u.right.items[0]
 		var sargs []sarg
 		for _, c := range on {
@@ -927,148 +1269,69 @@ func (p *planner) planUnit(it *relItem, outside []*conj) (*scanPlan, error) {
 				}
 			}
 		}
-		if acc != nil && usesLeft && costDescent+acc.rows*costIndexRow < inner.ps.rows*costPair {
+		if cost := left.cost; acc != nil && usesLeft && cost+left.rows*acc.cost < node.cost {
 			localEvals, localExprs := condEvals(rightLocal)
+			onEvals, _ := condEvals(on)
 			probe := &planNode{op: fmt.Sprintf("Index Scan using %s on %s", acc.name(), inner.label()),
 				lines: []string{"Index Cond: " + exprList(acc.used)}, rows: acc.rows, cost: acc.cost}
 			if len(localExprs) > 0 {
 				probe.lines = append(probe.lines, "Filter: "+exprList(localExprs))
 			}
-			node.kids = []*planNode{left, probe}
-			node.rows = math.Max(left.rows, left.rows*acc.rows*sel)
-			node.cost = left.cost + left.rows*acc.cost
-			node.run = func(cx *env) ([][]any, error) {
-				lrows, err := left.exec(cx)
+			ispec := &joinSpec{kind: joinLeft, outer: left, off: inner.off, width: width, conds: onEvals}
+			node = &planNode{op: "Nested Loop Left Join", kids: []*planNode{left, probe}, orderedBy: left.orderedBy,
+				cost: cost + left.rows*acc.cost}
+			if len(onExprs) > 0 {
+				node.lines = []string{"Join Filter: " + exprList(onExprs)}
+			}
+			rows = math.Max(left.rows, left.rows*acc.rows*sel)
+			node.open = func(cx *env) (iter, error) {
+				outer, err := left.start(cx)
 				if err != nil {
 					return nil, err
 				}
-				en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
-				var out [][]any
-				for _, l := range lrows {
-					if err := cx.ctx.Err(); err != nil {
-						return nil, err
-					}
-					en.row = l
-					refs, err := acc.fetch(p.s, en)
-					if err != nil {
-						return nil, err
-					}
-					probe.loops++
-					matched := false
-					for _, r := range refs {
-						row := make([]any, width)
-						copy(row, l)
-						copy(row[inner.off:], r.vals)
-						en.row = row
-						ok, err := allMatch(localEvals, en)
-						if err == nil && ok {
-							ok, err = allMatch(onEvals, en)
-						}
-						if err != nil {
-							return nil, err
-						}
-						if !ok {
-							continue
-						}
-						probe.actual++
-						matched = true
-						if err := finish(en, &out, row); err != nil {
-							return nil, err
-						}
-					}
-					if !matched {
-						if err := finish(en, &out, l); err != nil {
-							return nil, err
-						}
-					}
-				}
-				return out, nil
+				return &indexJoinIter{j: ispec, s: p.s, acc: acc, probe: probe, local: localEvals,
+					cx: cx, en: cx.child(), outer: outer}, nil
 			}
-			return &scanPlan{node: node, rawRows: node.rows}, nil
 		}
 	}
 
-	right, err := p.planGroup(u.right, toRight)
-	if err != nil {
-		return nil, err
-	}
-	node.kids = []*planNode{left, right}
-	node.rows = math.Max(left.rows, left.rows*right.rows*sel)
-	node.cost = left.cost + right.cost + left.rows*right.rows*costPair
-	node.run = func(cx *env) ([][]any, error) {
-		lrows, err := left.exec(cx)
-		if err != nil {
-			return nil, err
-		}
-		rrows, err := right.exec(cx)
-		if err != nil {
-			return nil, err
-		}
-		en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
-		var out [][]any
-		buf := make([]any, width)
-		steps := 0
-		for _, l := range lrows {
-			matched := false
-			for _, r := range rrows {
-				if steps++; steps&0xfff == 0 {
-					if err := cx.ctx.Err(); err != nil {
-						return nil, err
-					}
-				}
-				copy(buf, l)
-				copy(buf[roff:rend], r[roff:rend])
-				en.row = buf
-				ok, err := allMatch(onEvals, en)
-				if err != nil {
-					return nil, err
-				}
-				if !ok {
-					continue
-				}
-				matched = true
-				row := buf
-				buf = make([]any, width)
-				if err := finish(en, &out, row); err != nil {
-					return nil, err
-				}
-			}
-			// A left join keeps unmatched left rows; the right side's
-			// columns stay NULL.
-			if !matched {
-				if err := finish(en, &out, l); err != nil {
-					return nil, err
-				}
-			}
-		}
-		return out, nil
+	node.rows = rows
+	if len(above) > 0 {
+		node.lines = append(node.lines, "Filter: "+exprList(above))
+		filtered(node, aboveEvals)
 	}
 	return &scanPlan{node: node, rawRows: node.rows}, nil
 }
 
-func errJoinTooLarge() error {
-	return pgerr.New(pgerr.ProgramLimitExceeded, "join produced more than %d intermediate rows", maxJoinRows)
-}
-
-// maxJoinRows caps what a join may materialise. Every step of a plan still
-// holds its whole result in memory; until the executor streams rows
-// (milestone 7), failing is better than exhausting the machine.
-const maxJoinRows = 2_000_000
-
 // ---- join ordering ----
 
+type joinMethod uint8
+
+const (
+	nestedLoop joinMethod = iota
+	indexLoop
+	hashJoin
+	mergeJoin
+)
+
 // joinStep is one decision of a join order: add relation item to what has
-// been joined so far, either by comparing all pairs or by looking it up
-// through acc.
+// been joined so far, and how.
 type joinStep struct {
-	item       int
-	acc        *access
-	conds      []*conj // conditions that become checkable at this step
-	rows, cost float64
+	item   int
+	method joinMethod
+	acc    *access // for indexLoop
+	// For mergeJoin: the equality merged on, and which inputs arrive
+	// already in its order.
+	merge                    *equiCond
+	outerSorted, innerSorted bool
+	conds                    []*conj // conditions that become checkable at this step
+	rows, cost               float64
+	// orderedBy describes the order of the step's output; see planNode.
+	orderedBy int
 }
 
-// planGroup plans an inner-join group: how to read each relation, and in
-// what order to join them.
+// planGroup plans an inner-join group: how to read each relation, in what
+// order to join them, and by which method.
 func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 	n := len(g.items)
 	if n > maxGroupItems {
@@ -1104,8 +1367,6 @@ func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 			// outer column): filter the first scan with it, so that a
 			// false one empties the whole join at once.
 			local[0] = append(local[0], c)
-		case single >= 0 && !c.opaque:
-			local[single] = append(local[single], c)
 		case single >= 0:
 			local[single] = append(local[single], c)
 		default:
@@ -1125,12 +1386,15 @@ func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 	if n == 1 {
 		return scans[0].node, nil
 	}
+	hashOK := p.s.vars["enable_hashjoin"] != "off"
+	mergeOK := p.s.vars["enable_mergejoin"] != "off"
 
 	// extend computes the step that adds relation i to the set joined.
-	extend := func(joined bits, rows, cost float64, i int) joinStep {
+	extend := func(joined bits, prev joinStep, i int) joinStep {
 		it := g.items[i]
 		now := joined.or(bit(i))
-		step := joinStep{item: i}
+		rows, cost := prev.rows, prev.cost
+		step := joinStep{item: i, orderedBy: prev.orderedBy}
 		sel := 1.0
 		var sargs []sarg
 		for _, c := range conds {
@@ -1151,7 +1415,7 @@ func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 		// as one that follows the join conditions.
 		emit := step.rows * costSeqRow
 		// Compare all pairs: the inner relation is read once.
-		step.cost = cost + sp.node.cost + rows*sp.node.rows*costPair + emit
+		step.cost = cost + sp.node.cost + rows*sp.node.rows*costPair + emit + p.loopPenalty()
 		// Or look each outer row up through an index of the inner table,
 		// if a join condition gives the key.
 		if it.table != nil && len(sargs) > 0 {
@@ -1164,156 +1428,219 @@ func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 					}
 				}
 				if lookup := cost + rows*acc.cost + emit; usesOuter && lookup < step.cost {
-					step.cost, step.acc = lookup, acc
+					step.cost, step.method, step.acc = lookup, indexLoop, acc
 				}
+			}
+		}
+		// Or, if the join has an equality, hash the inner relation or merge
+		// the two in key order.
+		isOuter := func(cols []int) bool { return maskOf(g, cols).within(joined) }
+		isInner := func(cols []int) bool { return maskOf(g, cols).within(bit(i)) }
+		for _, c := range step.conds {
+			eq := p.equi(c)
+			if eq == nil {
+				continue
+			}
+			o, in, ok := eq.split(isOuter, isInner)
+			if !ok {
+				continue
+			}
+			if hash := cost + sp.node.cost + sp.node.rows*costHashRow + rows*costProbe + emit; hashOK && hash < step.cost {
+				step.cost, step.method, step.acc, step.orderedBy = hash, hashJoin, nil, 0
+			}
+			if !mergeOK {
+				continue
+			}
+			oCol, iCol := p.keyColumn(o), p.keyColumn(in)
+			oSorted := oCol != 0 && prev.orderedBy == oCol
+			iSorted := iCol != 0 && sp.node.orderedBy == iCol
+			merge := cost + sp.node.cost + (rows+sp.node.rows)*costMergeRow + emit
+			if !oSorted {
+				merge += sortCost(rows)
+			}
+			if !iSorted {
+				merge += sortCost(sp.node.rows)
+			}
+			if merge < step.cost {
+				step.cost, step.method, step.acc = merge, mergeJoin, nil
+				step.merge, step.outerSorted, step.innerSorted, step.orderedBy = eq, oSorted, iSorted, oCol
 			}
 		}
 		return step
 	}
 
+	first := func(i int) joinStep {
+		return joinStep{item: i, rows: scans[i].node.rows, cost: scans[i].node.cost, orderedBy: scans[i].node.orderedBy}
+	}
 	var order []joinStep
 	reorder := p.s.vars["join_collapse_limit"] != "1"
 	switch {
 	case !reorder:
 		// As written.
-		order = []joinStep{{item: 0, rows: scans[0].node.rows, cost: scans[0].node.cost}}
+		order = []joinStep{first(0)}
 		joined := bit(0)
 		for i := 1; i < n; i++ {
-			last := order[len(order)-1]
-			order = append(order, extend(joined, last.rows, last.cost, i))
+			order = append(order, extend(joined, order[len(order)-1], i))
 			joined = joined.or(bit(i))
 		}
 	case n <= 10:
-		order = p.orderExhaustive(n, scans, extend)
+		order = p.orderExhaustive(n, first, extend)
 	default:
-		order = p.orderGreedy(n, scans, extend)
+		order = p.orderGreedy(n, first, extend)
 	}
 
 	// Build the left-deep tree the order describes.
 	width := len(p.cols)
 	node := scans[order[0].item].node
+	joined := bit(order[0].item)
 	for _, step := range order[1:] {
 		it, sp, outer := g.items[step.item], scans[step.item], node
-		evals, exprs := condEvals(step.conds)
-		join := &planNode{op: "Nested Loop", rows: step.rows, cost: step.cost}
+		spec := &joinSpec{kind: joinInner, outer: outer, inner: sp.node, off: it.off, end: it.off + it.width, width: width}
+		was := joined
+		isOuter := func(cols []int) bool { return maskOf(g, cols).within(was) }
+		isInner := func(cols []int) bool { return maskOf(g, cols).within(bit(step.item)) }
+		var join *planNode
 
-		if acc := step.acc; acc != nil {
+		switch step.method {
+		case indexLoop:
+			acc := step.acc
+			evals, exprs := condEvals(step.conds)
+			spec.conds = evals
 			localEvals, localExprs := condEvals(sp.local)
 			probe := &planNode{op: fmt.Sprintf("Index Scan using %s on %s", acc.name(), it.label()),
 				lines: []string{"Index Cond: " + exprList(acc.used)}, rows: acc.rows, cost: acc.cost}
 			// Whatever the index condition does not already guarantee.
-			var rest []sql.Expr
-			for _, e := range append(append([]sql.Expr(nil), exprs...), localExprs...) {
-				covered := false
-				for _, u := range acc.used {
-					covered = covered || u == e
-				}
-				if !covered {
-					rest = append(rest, e)
-				}
-			}
-			if len(rest) > 0 {
+			if rest := without(append(append([]sql.Expr(nil), exprs...), localExprs...), acc.used); len(rest) > 0 {
 				probe.lines = append(probe.lines, "Filter: "+exprList(rest))
 			}
-			join.kids = []*planNode{outer, probe}
-			join.run = func(cx *env) ([][]any, error) {
-				orows, err := outer.exec(cx)
+			join = &planNode{op: "Nested Loop", kids: []*planNode{outer, probe}}
+			join.open = func(cx *env) (iter, error) {
+				src, err := outer.start(cx)
 				if err != nil {
 					return nil, err
 				}
-				en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
-				var out [][]any
-				for _, o := range orows {
-					if err := cx.ctx.Err(); err != nil {
-						return nil, err
-					}
-					en.row = o
-					refs, err := acc.fetch(p.s, en)
-					if err != nil {
-						return nil, err
-					}
-					probe.loops++
-					for _, r := range refs {
-						row := make([]any, width)
-						copy(row, o)
-						copy(row[it.off:], r.vals)
-						en.row = row
-						ok, err := allMatch(localEvals, en)
-						if err == nil && ok {
-							ok, err = allMatch(evals, en)
-						}
-						if err != nil {
-							return nil, err
-						}
-						if ok {
-							if len(out) >= maxJoinRows {
-								return nil, errJoinTooLarge()
-							}
-							probe.actual++
-							out = append(out, row)
-						}
-					}
+				return &indexJoinIter{j: spec, s: p.s, acc: acc, probe: probe, local: localEvals,
+					cx: cx, en: cx.child(), outer: src}, nil
+			}
+
+		case hashJoin:
+			probe, build, used, rest := p.hashParts(step.conds, isOuter, isInner)
+			join = p.hashJoinNode(spec, probe, build, used, rest)
+
+		case mergeJoin:
+			eq := step.merge
+			o, in, _ := eq.split(isOuter, isInner)
+			var rest []*conj
+			for _, c := range step.conds {
+				if c != eq.c {
+					rest = append(rest, c)
 				}
-				return out, nil
 			}
-		} else {
-			inner := sp.node
-			if len(exprs) > 0 {
-				join.lines = []string{"Join Filter: " + exprList(exprs)}
+			restEvals, restExprs := condEvals(rest)
+			spec.conds = restEvals
+			left, openLeft := p.mergeInput(outer, o, step.outerSorted)
+			right, openRight := p.mergeInput(sp.node, in, step.innerSorted)
+			join = &planNode{op: "Merge Join", kids: []*planNode{left, right},
+				lines: []string{"Merge Cond: " + sql.FormatExpr(eq.c.expr)}}
+			if len(restExprs) > 0 {
+				join.lines = append(join.lines, "Join Filter: "+exprList(restExprs))
 			}
-			join.kids = []*planNode{outer, inner}
-			join.run = func(cx *env) ([][]any, error) {
-				orows, err := outer.exec(cx)
+			cmp, same := comparator(o.b.typ, in.b.typ), comparator(o.b.typ, o.b.typ)
+			join.open = func(cx *env) (iter, error) {
+				l, err := openLeft(cx)
 				if err != nil {
 					return nil, err
 				}
-				if len(orows) == 0 {
-					return nil, nil // nothing to join with: skip the inner side
-				}
-				irows, err := inner.exec(cx)
+				r, err := openRight(cx)
 				if err != nil {
+					l.close()
 					return nil, err
 				}
-				en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
-				var out [][]any
-				buf := make([]any, width)
-				steps := 0
-				for _, o := range orows {
-					for _, in := range irows {
-						if steps++; steps&0xfff == 0 {
-							if err := cx.ctx.Err(); err != nil {
-								return nil, err
-							}
-						}
-						copy(buf, o)
-						copy(buf[it.off:it.off+it.width], in[it.off:it.off+it.width])
-						en.row = buf
-						ok, err := allMatch(evals, en)
-						if err != nil {
-							return nil, err
-						}
-						if ok {
-							if len(out) >= maxJoinRows {
-								return nil, errJoinTooLarge()
-							}
-							out = append(out, buf)
-							buf = make([]any, width)
-						}
-					}
-				}
-				return out, nil
+				return &mergeJoinIter{j: spec, cmp: cmp, same: same, left: l, right: r, en: cx.child()}, nil
 			}
+
+		default:
+			join = nlJoinNode(spec, step.conds)
 		}
+		join.rows, join.cost, join.orderedBy = step.rows, step.cost, step.orderedBy
 		node = join
+		joined = joined.or(bit(step.item))
 	}
 	return node, nil
+}
+
+// mergeInput prepares one input of a merge join: each row gets its key
+// appended, and unless the rows already arrive in key order they are
+// sorted by it — by an external sort, so that the input may be larger than
+// memory. It returns the node to show in the plan and how to open it.
+func (p *planner) mergeInput(child *planNode, key keySide, sorted bool) (*planNode, func(cx *env) (iter, error)) {
+	width := len(p.cols)
+	keyed := func(cx *env) (iter, error) {
+		src, err := child.start(cx)
+		if err != nil {
+			return nil, err
+		}
+		return &keyedIter{src: src, en: cx.child(), eval: key.b.eval}, nil
+	}
+	if sorted {
+		return child, keyed
+	}
+	cmp := comparator(key.b.typ, key.b.typ)
+	node := &planNode{op: "Sort", lines: []string{"Sort Key: " + sql.FormatExpr(key.expr)},
+		kids: []*planNode{child}, rows: child.rows, cost: child.cost + sortCost(child.rows)}
+	node.open = func(cx *env) (iter, error) {
+		src, err := keyed(cx)
+		if err != nil {
+			return nil, err
+		}
+		so := &sorter{q: cx.q, cmp: func(a, b []any) int {
+			x, y := a[width], b[width]
+			switch {
+			case x == nil && y == nil:
+				return 0
+			case x == nil:
+				return 1
+			case y == nil:
+				return -1
+			}
+			return cmp(x, y)
+		}}
+		return sortAll(src, so, node)
+	}
+	return node, node.start
+}
+
+// sortAll feeds every row of src to the sorter and returns them in order.
+func sortAll(src iter, so *sorter, node *planNode) (iter, error) {
+	defer src.close()
+	for {
+		row, err := src.next()
+		if err != nil {
+			so.release()
+			return nil, err
+		}
+		if row == nil {
+			break
+		}
+		if err := so.add(row); err != nil {
+			so.release()
+			return nil, err
+		}
+	}
+	out, err := so.finish()
+	if err != nil {
+		so.release()
+		return nil, err
+	}
+	node.info = []string{so.info()}
+	return out, nil
 }
 
 // orderExhaustive finds the cheapest left-deep join order by dynamic
 // programming over sets of relations: the best way to join a set is the
 // best way to join all but one of its members, extended by that member.
 // It considers every order while computing only 2^n subplans.
-func (p *planner) orderExhaustive(n int, scans []*scanPlan, extend func(bits, float64, float64, int) joinStep) []joinStep {
+func (p *planner) orderExhaustive(n int, first func(int) joinStep, extend func(bits, joinStep, int) joinStep) []joinStep {
 	type entry struct {
 		ok   bool
 		step joinStep
@@ -1321,7 +1648,7 @@ func (p *planner) orderExhaustive(n int, scans []*scanPlan, extend func(bits, fl
 	}
 	best := make([]entry, 1<<n)
 	for i := 0; i < n; i++ {
-		best[1<<i] = entry{ok: true, step: joinStep{item: i, rows: scans[i].node.rows, cost: scans[i].node.cost}}
+		best[1<<i] = entry{ok: true, step: first(i)}
 	}
 	for set := 1; set < 1<<n; set++ {
 		if !best[set].ok {
@@ -1333,7 +1660,7 @@ func (p *planner) orderExhaustive(n int, scans []*scanPlan, extend func(bits, fl
 			if set&(1<<i) != 0 {
 				continue
 			}
-			step := extend(joined, best[set].step.rows, best[set].step.cost, i)
+			step := extend(joined, best[set].step, i)
 			next := set | 1<<i
 			if !best[next].ok || step.cost < best[next].step.cost {
 				best[next] = entry{ok: true, step: step, prev: set}
@@ -1350,15 +1677,15 @@ func (p *planner) orderExhaustive(n int, scans []*scanPlan, extend func(bits, fl
 
 // orderGreedy handles joins too large for the exhaustive search: start
 // from the smallest relation and keep adding whichever is cheapest to add.
-func (p *planner) orderGreedy(n int, scans []*scanPlan, extend func(bits, float64, float64, int) joinStep) []joinStep {
-	first := 0
+func (p *planner) orderGreedy(n int, first func(int) joinStep, extend func(bits, joinStep, int) joinStep) []joinStep {
+	start := first(0)
 	for i := 1; i < n; i++ {
-		if scans[i].node.rows < scans[first].node.rows {
-			first = i
+		if s := first(i); s.rows < start.rows {
+			start = s
 		}
 	}
-	order := []joinStep{{item: first, rows: scans[first].node.rows, cost: scans[first].node.cost}}
-	joined := bit(first)
+	order := []joinStep{start}
+	joined := bit(start.item)
 	for len(order) < n {
 		last := order[len(order)-1]
 		var pick *joinStep
@@ -1366,7 +1693,7 @@ func (p *planner) orderGreedy(n int, scans []*scanPlan, extend func(bits, float6
 			if joined.has(i) {
 				continue
 			}
-			step := extend(joined, last.rows, last.cost, i)
+			step := extend(joined, last, i)
 			if pick == nil || step.cost < pick.cost {
 				pick = &step
 			}
@@ -1377,14 +1704,24 @@ func (p *planner) orderGreedy(n int, scans []*scanPlan, extend func(bits, float6
 	return order
 }
 
+// fromPlan is a planned FROM clause.
+type fromPlan struct {
+	// cols are the columns the clause produces, in written order.
+	cols []scopeCol
+	// star lists the columns "*" stands for, in the order it shows them:
+	// all of them, except that a JOIN ... USING shows each of its columns
+	// once, and first.
+	star []int
+	node *planNode
+}
+
 // planFromWhere plans a FROM clause together with the WHERE clause that
-// filters it. It returns the columns the FROM clause produces, in written
-// order, and the plan that produces the rows satisfying WHERE.
-func (s *Session) planFromWhere(from sql.TableExpr, where sql.Expr, parent *scope, ptypes []sql.Type) ([]scopeCol, *planNode, error) {
+// filters it: the plan produces the rows that satisfy WHERE.
+func (s *Session) planFromWhere(from sql.TableExpr, where sql.Expr, parent *scope, ptypes []sql.Type) (*fromPlan, error) {
 	fb := &fromBuilder{s: s, parent: parent, ptypes: ptypes}
 	g, err := fb.build(from)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	p := &planner{
 		s:      s,
@@ -1392,19 +1729,23 @@ func (s *Session) planFromWhere(from sql.TableExpr, where sql.Expr, parent *scop
 		cols:   fb.cols,
 		owners: fb.owners,
 		conjs:  make(map[sql.Expr]*conj),
+		equis:  make(map[*conj]*equiCond),
 	}
 	// Bind the whole condition once first, so that a type error is
 	// reported about the clause as written rather than about a fragment.
 	if _, err := p.b.bindWhere(where, "WHERE"); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	node, err := p.planGroup(g, conjuncts(where))
-	return fb.cols, node, err
+	return &fromPlan{cols: fb.cols, star: g.star, node: node}, err
 }
 
 // targetScan is how an UPDATE or DELETE finds the rows it applies to. It is
 // the same choice a SELECT from one table faces — scan, or go through an
 // index — so that changing one row by its key does not read the table.
+//
+// Unlike a query it collects all its rows before any is changed: a row
+// that an UPDATE moves must not be met again further along the scan.
 type targetScan struct {
 	node  *planNode
 	fetch func(en *env) ([]rowRef, error)
@@ -1427,6 +1768,7 @@ func (s *Session) planTarget(op string, t *table, ref sql.TableRef, where sql.Ex
 		cols:   cols,
 		owners: owners,
 		conjs:  make(map[sql.Expr]*conj),
+		equis:  make(map[*conj]*equiCond),
 	}
 	var conds []*conj
 	var sargs []sarg
@@ -1465,7 +1807,7 @@ func (s *Session) planTarget(op string, t *table, ref sql.TableRef, where sql.Ex
 		if acc != nil {
 			refs, err = acc.fetch(s, en)
 		} else {
-			refs, err = s.db.scan(t, s.snap)
+			refs, err = s.db.scan(t, en.q.snap)
 		}
 		if err != nil {
 			return nil, err

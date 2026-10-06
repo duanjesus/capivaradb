@@ -210,6 +210,9 @@ func (p *parser) optAlias() (string, error) {
 
 func (p *parser) statement() (Node, error) {
 	t := p.peek()
+	if t.Kind == TOp && t.Text == "(" {
+		return p.selectStmt()
+	}
 	if t.Kind != TIdent {
 		return nil, p.syntaxError()
 	}
@@ -323,12 +326,137 @@ func (p *parser) isolationLevel() (string, error) {
 
 // ---- SELECT ----
 
+// selectStmt parses a query: one SELECT, or several combined with UNION,
+// INTERSECT and EXCEPT, followed by the ORDER BY, LIMIT and OFFSET that
+// apply to the whole.
+//
+//	query     := setExpr [ORDER BY ...] [LIMIT ...] [OFFSET ...]
+//	setExpr   := intersect { (UNION | EXCEPT) [ALL | DISTINCT] intersect }
+//	intersect := primary { INTERSECT [ALL | DISTINCT] primary }
+//	primary   := SELECT ... | "(" query ")"
+//
+// INTERSECT binds tighter than UNION and EXCEPT, which associate to the
+// left, as the standard says.
 func (p *parser) selectStmt() (*Select, error) {
 	if err := p.enter(); err != nil {
 		return nil, err
 	}
 	defer p.leave()
 
+	s, parenthesised, err := p.setExpr()
+	if err != nil {
+		return nil, err
+	}
+	// A parenthesised query that already has an ORDER BY or LIMIT of its
+	// own cannot take another: "(select ... limit 1) limit 2" would need a
+	// node of its own, and nobody writes it.
+	hasTail := len(s.OrderBy) > 0 || s.Limit != nil || s.Offset != nil
+	if parenthesised && hasTail {
+		if p.isKw("order") || p.isKw("limit") || p.isKw("offset") {
+			return nil, p.unsupported("ORDER BY or LIMIT after a parenthesised query that has its own", p.peek().Pos)
+		}
+		return s, nil
+	}
+	if p.acceptKw("order") {
+		if err := p.expectKw("by"); err != nil {
+			return nil, err
+		}
+		for {
+			item, err := p.orderItem()
+			if err != nil {
+				return nil, err
+			}
+			s.OrderBy = append(s.OrderBy, item)
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+	}
+	// PostgreSQL accepts LIMIT and OFFSET in either order.
+	for {
+		switch {
+		case s.Limit == nil && p.acceptKw("limit"):
+			if p.acceptKw("all") {
+				continue
+			}
+			if s.Limit, err = p.expr(0); err != nil {
+				return nil, err
+			}
+		case s.Offset == nil && p.acceptKw("offset"):
+			if s.Offset, err = p.expr(0); err != nil {
+				return nil, err
+			}
+			if !p.acceptKw("rows") {
+				p.acceptKw("row")
+			}
+		default:
+			return s, nil
+		}
+	}
+}
+
+// setExpr parses operands joined by UNION and EXCEPT. It also reports
+// whether what it parsed was a single parenthesised query.
+func (p *parser) setExpr() (*Select, bool, error) {
+	left, parenthesised, err := p.intersectExpr()
+	if err != nil {
+		return nil, false, err
+	}
+	for p.isKw("union") || p.isKw("except") {
+		op := p.next().Text
+		all := p.setQuantifier()
+		right, _, err := p.intersectExpr()
+		if err != nil {
+			return nil, false, err
+		}
+		left, parenthesised = &Select{Op: op, All: all, Left: left, Right: right}, false
+	}
+	return left, parenthesised, nil
+}
+
+func (p *parser) intersectExpr() (*Select, bool, error) {
+	left, parenthesised, err := p.selectPrimary()
+	if err != nil {
+		return nil, false, err
+	}
+	for p.isKw("intersect") {
+		p.i++
+		all := p.setQuantifier()
+		right, _, err := p.selectPrimary()
+		if err != nil {
+			return nil, false, err
+		}
+		left, parenthesised = &Select{Op: "intersect", All: all, Left: left, Right: right}, false
+	}
+	return left, parenthesised, nil
+}
+
+// setQuantifier parses the optional ALL or DISTINCT after a set operator.
+func (p *parser) setQuantifier() (all bool) {
+	if p.acceptKw("all") {
+		return true
+	}
+	p.acceptKw("distinct")
+	return false
+}
+
+func (p *parser) selectPrimary() (*Select, bool, error) {
+	if p.acceptOp("(") {
+		s, err := p.selectStmt()
+		if err != nil {
+			return nil, false, err
+		}
+		return s, true, p.expectOp(")")
+	}
+	if !p.isKw("select") {
+		return nil, false, p.syntaxError()
+	}
+	s, err := p.simpleSelect()
+	return s, false, err
+}
+
+// simpleSelect parses one SELECT up to and including HAVING.
+func (p *parser) simpleSelect() (*Select, error) {
 	p.i++ // select
 	s := &Select{}
 	if p.acceptKw("distinct") {
@@ -370,45 +498,7 @@ func (p *parser) selectStmt() (*Select, error) {
 			return nil, err
 		}
 	}
-	if p.acceptKw("order") {
-		if err := p.expectKw("by"); err != nil {
-			return nil, err
-		}
-		for {
-			item, err := p.orderItem()
-			if err != nil {
-				return nil, err
-			}
-			s.OrderBy = append(s.OrderBy, item)
-			if !p.acceptOp(",") {
-				break
-			}
-		}
-	}
-	// PostgreSQL accepts LIMIT and OFFSET in either order.
-	for {
-		switch {
-		case s.Limit == nil && p.acceptKw("limit"):
-			if p.acceptKw("all") {
-				continue
-			}
-			if s.Limit, err = p.expr(0); err != nil {
-				return nil, err
-			}
-		case s.Offset == nil && p.acceptKw("offset"):
-			if s.Offset, err = p.expr(0); err != nil {
-				return nil, err
-			}
-			if !p.acceptKw("rows") {
-				p.acceptKw("row")
-			}
-		default:
-			if t := p.peek(); t.Kind == TIdent && (t.Text == "union" || t.Text == "intersect" || t.Text == "except") {
-				return nil, p.unsupported(strings.ToUpper(t.Text), t.Pos)
-			}
-			return s, nil
-		}
-	}
+	return s, nil
 }
 
 func (p *parser) selectItem() (SelectItem, error) {
@@ -501,8 +591,17 @@ func (p *parser) joinedTable() (TableExpr, error) {
 				return nil, err
 			}
 			kind = CrossJoin
-		case p.isKw("right"), p.isKw("full"), p.isKw("natural"):
-			return nil, p.unsupported(strings.ToUpper(t.Text)+" JOIN", t.Pos)
+		case p.acceptKw("right"), p.acceptKw("full"):
+			p.acceptKw("outer")
+			if err := p.expectKw("join"); err != nil {
+				return nil, err
+			}
+			kind = RightJoin
+			if t.Text == "full" {
+				kind = FullJoin
+			}
+		case p.isKw("natural"):
+			return nil, p.unsupported("NATURAL JOIN", t.Pos)
 		default:
 			return left, nil
 		}
@@ -512,14 +611,17 @@ func (p *parser) joinedTable() (TableExpr, error) {
 		}
 		join := &Join{Kind: kind, Left: left, Right: right, Pos: t.Pos}
 		if kind != CrossJoin {
-			if p.isKw("using") {
-				return nil, p.unsupported("JOIN ... USING", p.peek().Pos)
-			}
-			if err := p.expectKw("on"); err != nil {
-				return nil, err
-			}
-			if join.On, err = p.expr(0); err != nil {
-				return nil, err
+			if p.acceptKw("using") {
+				if join.Using, err = p.identList(); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := p.expectKw("on"); err != nil {
+					return nil, err
+				}
+				if join.On, err = p.expr(0); err != nil {
+					return nil, err
+				}
 			}
 		}
 		left = join

@@ -52,6 +52,7 @@ const (
 	InvalidRowCountInLimit      = "2201W"
 	InvalidRowCountInOffset     = "2201X"
 	ProgramLimitExceeded        = "54000"
+	DiskFull                    = "53100"
 	ObjectInUse                 = "55006"
 	SerializationFailure        = "40001"
 	DeadlockDetected            = "40P01"

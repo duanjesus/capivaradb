@@ -1,6 +1,6 @@
 # 4. Execute the new SQL now, naively, and pin its answers
 
-Status: accepted
+Status: accepted. The executor it describes was replaced in milestone 7 (decision 9); its role as the reference is now played by the new executor with every optimisation switched off.
 
 ## Context
 

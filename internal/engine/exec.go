@@ -28,14 +28,42 @@ func (p *prepared) Execute(ctx context.Context, params []any) (pgwire.Rows, erro
 	return p.run(ctx, params)
 }
 
-// result implements pgwire.Rows over fully materialised rows.
+// result implements pgwire.Rows. A query's result is a cursor over its
+// plan: rows are computed as the client asks for them, and a client that
+// stops asking leaves the rest uncomputed. Everything else returns rows it
+// already has, if any.
 type result struct {
 	rows [][]any
 	next int
 	tag  string
+
+	// For a query: the plan being executed, the context its iterators
+	// look at, how many rows it has returned, and what to release when it
+	// is closed.
+	it      iter
+	live    *liveCtx
+	count   int
+	release func()
 }
 
 func (r *result) Next(ctx context.Context) ([]any, error) {
+	if r.it != nil {
+		// Each call may arrive with a context of its own: a client can
+		// fetch a cursor in several requests.
+		r.live.Context = ctx
+		row, err := r.it.next()
+		if err != nil {
+			r.Close()
+			return nil, err
+		}
+		if row == nil {
+			r.tag = fmt.Sprintf("SELECT %d", r.count)
+			r.Close()
+			return nil, io.EOF
+		}
+		r.count++
+		return row, nil
+	}
 	if r.next >= len(r.rows) {
 		return nil, io.EOF
 	}
@@ -44,7 +72,38 @@ func (r *result) Next(ctx context.Context) ([]any, error) {
 }
 
 func (r *result) Tag() string { return r.tag }
-func (r *result) Close()      {}
+
+func (r *result) Close() {
+	if r.it != nil {
+		r.it.close()
+		r.it = nil
+		r.release()
+	}
+}
+
+// liveCtx is a context that can be pointed at another one. The iterators
+// of a query hold it for as long as the query's cursor is open.
+type liveCtx struct{ context.Context }
+
+// query starts a SELECT and returns the cursor over its rows. The snapshot
+// it reads through is held, against vacuum, until the cursor is closed.
+func (s *Session) query(ctx context.Context, params []any, plan *selectPlan) (*result, error) {
+	s.db.mu.RLock()
+	release := s.takeSnapshot()
+	s.db.mu.RUnlock()
+	live := &liveCtx{ctx}
+	cx := s.newEnv(live, params, false)
+	done := func() {
+		cx.q.cleanup()
+		release()
+	}
+	it, err := plan.open(cx)
+	if err != nil {
+		done()
+		return nil, err
+	}
+	return &result{it: it, live: live, release: done}, nil
+}
 
 func typeOfOID(oid uint32) (sql.Type, bool) {
 	switch oid {
@@ -142,13 +201,7 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 			return nil, err
 		}
 		return &prepared{cols: plan.cols, plan: plan.root, run: func(ctx context.Context, params []any) (*result, error) {
-			rows, err := s.read(func() ([][]any, error) {
-				return plan.run(&env{ctx: ctx, params: params})
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &result{rows: rows, tag: fmt.Sprintf("SELECT %d", len(rows))}, nil
+			return s.query(ctx, params, plan)
 		}}, nil
 	case *sql.Insert:
 		return s.buildInsert(n, ptypes)
@@ -204,6 +257,13 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 				default:
 					s.level = parseLevel(n.Value)
 				}
+			case "work_mem":
+				if _, ok := parseMemory(n.Value); !ok {
+					return nil, pgerr.New(pgerr.InvalidParameterValue,
+						"invalid value for parameter \"work_mem\": %q", n.Value).
+						WithDetail("A size in kB, or with a unit (kB, MB, GB), of at least 64kB.")
+				}
+				s.vars[n.Name] = n.Value
 			default:
 				s.vars[n.Name] = n.Value
 			}
@@ -410,7 +470,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 				if err := s.db.stillCurrent(t); err != nil {
 					return "", err
 				}
-				en := &env{ctx: ctx, params: params, locked: true}
+				en := s.newEnv(ctx, params, true)
 				// The query is evaluated in full before anything is
 				// inserted, so "insert into t select * from t" terminates.
 				rows, err := plan.run(en)
@@ -457,7 +517,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
-			en := &env{ctx: ctx, params: params, locked: true}
+			en := s.newEnv(ctx, params, true)
 			for _, assigns := range rows {
 				vals, err := newRow(len(assigns), en)
 				if err != nil {
@@ -514,11 +574,11 @@ func (s *Session) buildUpdate(n *sql.Update, ptypes []sql.Type) (*prepared, erro
 			}
 			// The rows are read in full before any is changed: an updated
 			// row may move in the tree, and must not be met a second time.
-			rows, err := target.fetch(&env{ctx: ctx, params: params, locked: true})
+			rows, err := target.fetch(s.newEnv(ctx, params, true))
 			if err != nil {
 				return "", err
 			}
-			en := &env{ctx: ctx, params: params, locked: true}
+			en := s.newEnv(ctx, params, true)
 			count := 0
 			for _, r := range rows {
 				en.row = r.vals
@@ -566,11 +626,11 @@ func (s *Session) buildDelete(n *sql.Delete, ptypes []sql.Type) (*prepared, erro
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
-			rows, err := target.fetch(&env{ctx: ctx, params: params, locked: true})
+			rows, err := target.fetch(s.newEnv(ctx, params, true))
 			if err != nil {
 				return "", err
 			}
-			en := &env{ctx: ctx, params: params, locked: true}
+			en := s.newEnv(ctx, params, true)
 			count := 0
 			for _, r := range rows {
 				en.row = r.vals
@@ -968,7 +1028,18 @@ func (s *Session) buildExplain(n *sql.Explain, ptypes []sql.Type) (*prepared, er
 			var elapsed time.Duration
 			if n.Analyze {
 				start := time.Now()
-				if _, err := inner.run(ctx, params); err != nil {
+				s.timing = opt.timing
+				res, err := inner.run(ctx, params)
+				s.timing = false
+				if err != nil {
+					return nil, err
+				}
+				// A query only does its work as its rows are read.
+				for err == nil {
+					_, err = res.Next(ctx)
+				}
+				res.Close()
+				if err != io.EOF {
 					return nil, err
 				}
 				elapsed = time.Since(start)

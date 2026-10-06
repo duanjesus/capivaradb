@@ -227,6 +227,59 @@ func (f *formatter) where(e Expr) {
 }
 
 func (f *formatter) selectStmt(s *Select) {
+	f.selectBody(s)
+	for i, o := range s.OrderBy {
+		if i == 0 {
+			f.w(" order by ")
+		} else {
+			f.w(", ")
+		}
+		f.expr(o.Expr)
+		if o.Desc {
+			f.w(" desc")
+		}
+		if o.NullsFirst != nil {
+			if *o.NullsFirst {
+				f.w(" nulls first")
+			} else {
+				f.w(" nulls last")
+			}
+		}
+	}
+	if s.Limit != nil {
+		f.w(" limit ")
+		f.expr(s.Limit)
+	}
+	if s.Offset != nil {
+		f.w(" offset ")
+		f.expr(s.Offset)
+	}
+}
+
+// setOperand prints one side of a set operation. Anything but a plain
+// SELECT goes in parentheses, which makes the printed form independent of
+// precedence and keeps an operand's own ORDER BY and LIMIT with it.
+func (f *formatter) setOperand(s *Select) {
+	if s.Op == "" && len(s.OrderBy) == 0 && s.Limit == nil && s.Offset == nil {
+		f.selectStmt(s)
+		return
+	}
+	f.w("(")
+	f.selectStmt(s)
+	f.w(")")
+}
+
+// selectBody prints a query without its ORDER BY, LIMIT and OFFSET.
+func (f *formatter) selectBody(s *Select) {
+	if s.Op != "" {
+		f.setOperand(s.Left)
+		f.w(" ", s.Op, " ")
+		if s.All {
+			f.w("all ")
+		}
+		f.setOperand(s.Right)
+		return
+	}
 	f.w("select ")
 	if s.Distinct {
 		f.w("distinct ")
@@ -260,32 +313,6 @@ func (f *formatter) selectStmt(s *Select) {
 		f.w(" having ")
 		f.expr(s.Having)
 	}
-	for i, o := range s.OrderBy {
-		if i == 0 {
-			f.w(" order by ")
-		} else {
-			f.w(", ")
-		}
-		f.expr(o.Expr)
-		if o.Desc {
-			f.w(" desc")
-		}
-		if o.NullsFirst != nil {
-			if *o.NullsFirst {
-				f.w(" nulls first")
-			} else {
-				f.w(" nulls last")
-			}
-		}
-	}
-	if s.Limit != nil {
-		f.w(" limit ")
-		f.expr(s.Limit)
-	}
-	if s.Offset != nil {
-		f.w(" offset ")
-		f.expr(s.Offset)
-	}
 }
 
 func (f *formatter) tableExpr(t TableExpr) {
@@ -304,6 +331,10 @@ func (f *formatter) tableExpr(t TableExpr) {
 		if t.On != nil {
 			f.w(" on ")
 			f.expr(t.On)
+		}
+		if t.Using != nil {
+			f.w(" using ")
+			f.idents(t.Using)
 		}
 		f.w(")")
 	}

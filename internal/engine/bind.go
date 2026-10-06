@@ -34,6 +34,8 @@ type env struct {
 	// locked is set when the goroutine already holds the database lock,
 	// so that scans inside a writing statement do not try to take it again.
 	locked bool
+	// q is the execution the env belongs to.
+	q *query
 }
 
 type evalFn func(*env) (any, error)
@@ -51,6 +53,9 @@ type scopeCol struct {
 	table string // the alias it can be qualified with
 	name  string
 	typ   sql.Type
+	// hidden is set on the copy of a JOIN ... USING column that the join
+	// does not show: it is found by its qualified name only.
+	hidden bool
 }
 
 // scope is the set of columns of one query level. parent is the enclosing
@@ -65,7 +70,7 @@ type scope struct {
 func (sc *scope) find(ref *sql.ColumnRef) (int, error) {
 	found := -1
 	for i, c := range sc.cols {
-		if c.name != ref.Name || (ref.Table != "" && c.table != ref.Table) {
+		if c.name != ref.Name || (ref.Table != "" && c.table != ref.Table) || (ref.Table == "" && c.hidden) {
 			continue
 		}
 		if found >= 0 {
@@ -254,15 +259,24 @@ func (b *binder) bind(e sql.Expr, hint sql.Type) (bound, error) {
 			return bound{}, err
 		}
 		return bound{plan.types[0], func(en *env) (any, error) {
-			rows, err := plan.run(en)
-			if err != nil || len(rows) == 0 {
+			it, err := plan.open(en)
+			if err != nil {
 				return nil, err
 			}
-			if len(rows) > 1 {
+			defer it.close()
+			row, err := it.next()
+			if err != nil || row == nil {
+				return nil, err
+			}
+			// One row is the answer; a second one is an error, and there
+			// is no need to look further than that.
+			if more, err := it.next(); err != nil {
+				return nil, err
+			} else if more != nil {
 				return nil, pgerr.New(pgerr.CardinalityViolation,
 					"more than one row returned by a subquery used as an expression")
 			}
-			return rows[0][0], nil
+			return row[0], nil
 		}}, nil
 
 	case *sql.Exists:
@@ -271,8 +285,15 @@ func (b *binder) bind(e sql.Expr, hint sql.Type) (bound, error) {
 			return bound{}, err
 		}
 		return bound{sql.Bool, func(en *env) (any, error) {
-			rows, err := plan.run(en)
-			return len(rows) > 0, err
+			// EXISTS is settled by the first row; the subquery is not run
+			// any further.
+			it, err := plan.open(en)
+			if err != nil {
+				return nil, err
+			}
+			defer it.close()
+			row, err := it.next()
+			return row != nil, err
 		}}, nil
 
 	case *sql.DefaultValue:

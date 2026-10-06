@@ -146,6 +146,21 @@ serializable snapshot isolation), which is out of scope.
 `TestWriteSkewIsPossible` asserts the anomaly, so that the limitation is
 on record rather than assumed away.
 
+## Cursors
+
+Since milestone 7 a query's result is a cursor: rows are computed as the
+client fetches them, and the client may take its time. The query keeps the
+snapshot it started with until the cursor is closed — also under read
+committed, where the *next statement* gets a new one. A session can
+therefore have a cursor reading one state of the database while its other
+statements see a newer one.
+
+Holding the snapshot keeps vacuum from removing the versions the cursor
+has yet to read, and that is all a scan needs: between batches it holds no
+lock, only the key it stopped at ([executor.md](executor.md)). The price is
+the usual one for long readers: dead versions pile up behind a cursor that
+is left open.
+
 ## Vacuum
 
 Dead versions accumulate: every update leaves one behind. A version can be

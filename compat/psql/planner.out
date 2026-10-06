@@ -99,8 +99,9 @@ group by c.city
 order by 2 desc;
                                                   QUERY PLAN                                                  
 --------------------------------------------------------------------------------------------------------------
- Sort  (cost=901.26 rows=4) (actual rows=1 loops=1)
-   Sort Key: 2
+ Sort  (cost=902.95 rows=4) (actual rows=1 loops=1)
+   Sort Key: 2 DESC
+   Sort Method: quicksort  Memory: 1kB
    ->  HashAggregate  (cost=900.27 rows=4) (actual rows=1 loops=1)
          Group Key: c.city
          ->  Nested Loop Left Join  (cost=896.00 rows=43) (actual rows=10 loops=1)
@@ -109,7 +110,7 @@ order by 2 desc;
                      Filter: (c.city = 'Recife')
                ->  Index Scan using orders_customer on orders o  (cost=18.00 rows=4) (actual rows=10 loops=2)
                      Index Cond: (o.customer_id = c.id)
-(10 rows)
+(11 rows)
 
 -- Updates and deletes find their rows the same way.
 explain (costs off) update orders set total = total + 1 where id = 10;

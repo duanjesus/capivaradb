@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="744" height="390" viewBox="0 0 744 390" role="img" aria-label="benchmarks: join methods, sorts, early termination">
+<rect width="744" height="390" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h724 a10 10 0 0 1 10 10v24 h-744 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="372" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">benchmarks: join methods, sorts, early termination</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ go test ./internal/engine -run XXX -bench &#34;JoinMethod|Sort|FirstRows|SetOperation&#34;</text>
+<text x="18" y="86" fill="#e6edf3">cpu: 11th Gen Intel(R) Core(TM) i7-11370H @ 3.30GHz</text>
+<text x="18" y="106" fill="#e6edf3">BenchmarkJoinMethod/hash_join         254     8966594 ns/op</text>
+<text x="18" y="126" fill="#e6edf3">BenchmarkJoinMethod/merge_join         177    13070548 ns/op</text>
+<text x="18" y="146" fill="#e6edf3">BenchmarkJoinMethod/nested_loop           4   540705400 ns/op</text>
+<text x="18" y="166" fill="#e6edf3">BenchmarkJoinMethod/hash_join_on_disk          72    38813518 ns/op</text>
+<text x="18" y="186" fill="#e6edf3">BenchmarkSort/in_memory         219    10235161 ns/op</text>
+<text x="18" y="206" fill="#e6edf3">BenchmarkSort/external,_work_mem_64kB         100    26521935 ns/op</text>
+<text x="18" y="226" fill="#e6edf3">BenchmarkSort/top_10         451     5379645 ns/op</text>
+<text x="18" y="246" fill="#e6edf3">BenchmarkFirstRows/all_20000_rows         453     5440708 ns/op</text>
+<text x="18" y="266" fill="#e6edf3">BenchmarkFirstRows/limit_10      229101       11203 ns/op</text>
+<text x="18" y="286" fill="#e6edf3">BenchmarkFirstRows/exists      260652       10366 ns/op</text>
+<text x="18" y="306" fill="#e6edf3">BenchmarkSetOperation/union_all         368     6577058 ns/op</text>
+<text x="18" y="326" fill="#e6edf3">BenchmarkSetOperation/union         290     7395702 ns/op</text>
+<text x="18" y="346" fill="#e6edf3">BenchmarkSetOperation/intersect         303     7674656 ns/op</text>
+<text x="18" y="366" fill="#e6edf3">BenchmarkSetOperation/except         312     7758773 ns/op</text>
+</g>
+</svg>

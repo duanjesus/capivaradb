@@ -99,7 +99,7 @@ jobs:
         run: bash scripts/slt.sh
 
   mutation:
-    name: mutation-test the crash, isolation and planner tests
+    name: mutation-test the tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -107,5 +107,5 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: compat/pgx/go.sum
-      - name: Break each durability, isolation and planner rule; the tests must fail
+      - name: Break each durability, isolation, planner and executor rule; the tests must fail
         run: bash scripts/mutation-test.sh

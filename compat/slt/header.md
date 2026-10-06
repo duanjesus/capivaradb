@@ -25,23 +25,23 @@ if any pass count drops below `compat/slt/baseline.txt`.
   small tables, integers, floats and text. They say nothing about
   durability, concurrency or performance.
 
-## What the planner changed
+## What the planner and the executor changed
 
 Two scripts join many tables at once and could not be run to completion
 before milestone 6: joins ran as nested loops in the order written and
 the `WHERE` clause was applied only at the end, so a query like
 `FROM t1, t2, ... t15 WHERE ...` built a cross product of fifteen tables
 before discarding almost all of it. They were measured with a 300 ms limit
-per query; the planner made the limit irrelevant.
+per query; the planner made the limit irrelevant. What `select4.test` still
+failed after that used `UNION`, `EXCEPT` or `INTERSECT`, which arrived with
+the executor in milestone 7.
 
-| Script | Records | Before the planner | With the planner |
-|---|---:|---|---|
-| `select4.test` | 3857 | 1506 passed (39.0%) in 441 s; 1351 timed out | 2857 passed (74.1%) in 2 s; none time out |
-| `select5.test` | 1436 | 739 passed (51.5%) in 217 s; 697 timed out | **1436 passed (100%)** in 1 s |
+| Script | Records | Milestone 5 | Milestone 6: planner | Milestone 7: executor |
+|---|---:|---|---|---|
+| `select4.test` | 3857 | 39.0% in 441 s; 1351 timed out | 74.1% in 2 s | **100%** in 5 s |
+| `select5.test` | 1436 | 51.5% in 217 s; 697 timed out | **100%** in 1 s | **100%** in 2 s |
 
-Every record `select4.test` still fails uses `UNION`, `EXCEPT` or
-`INTERSECT`, which are not implemented. Both scripts are now part of the
-regular run below.
+Both scripts are part of the regular run below.
 
 ## Regular run
 

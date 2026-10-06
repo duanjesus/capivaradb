@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="626" height="710" viewBox="0 0 626 710" role="img" aria-label="sqllogictest">
+<rect width="626" height="710" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h606 a10 10 0 0 1 10 10v24 h-626 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="313" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">sqllogictest</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ scripts/slt.sh</text>
+<text x="18" y="86" fill="#e6edf3">script                                        records   passed    rate</text>
+<text x="18" y="106" fill="#e6edf3">select1.test                                     1031     1031 100.00%</text>
+<text x="18" y="126" fill="#e6edf3">select2.test                                     1031     1031 100.00%</text>
+<text x="18" y="146" fill="#e6edf3">select3.test                                     3351     3351 100.00%</text>
+<text x="18" y="166" fill="#e6edf3">select4.test                                     3857     3857 100.00%</text>
+<text x="18" y="186" fill="#e6edf3">select5.test                                     1436     1436 100.00%</text>
+<text x="18" y="206" fill="#e6edf3">evidence/in1.test                                 132      128  96.97%</text>
+<text x="18" y="226" fill="#e6edf3">evidence/in2.test                                  53       45  84.91%</text>
+<text x="18" y="246" fill="#e6edf3">evidence/slt_lang_aggfunc.test                      5        5 100.00%</text>
+<text x="18" y="266" fill="#e6edf3">evidence/slt_lang_update.test                      27       24  88.89%</text>
+<text x="18" y="286" fill="#e6edf3">evidence/slt_lang_droptable.test                   12       12 100.00%</text>
+<text x="18" y="306" fill="#e6edf3">evidence/slt_lang_dropindex.test                    8        8 100.00%</text>
+<text x="18" y="326" fill="#e6edf3">index/between/1/slt_good_0.test                 10022    10022 100.00%</text>
+<text x="18" y="346" fill="#e6edf3">index/commute/10/slt_good_0.test                10034    10034 100.00%</text>
+<text x="18" y="366" fill="#e6edf3">index/in/10/slt_good_0.test                     10035    10035 100.00%</text>
+<text x="18" y="386" fill="#e6edf3">index/orderby/10/slt_good_0.test                10053    10053 100.00%</text>
+<text x="18" y="406" fill="#e6edf3">index/orderby_nosort/10/slt_good_0.test         10053    10053 100.00%</text>
+<text x="18" y="426" fill="#e6edf3">index/delete/1/slt_good_0.test                  10907    10907 100.00%</text>
+<text x="18" y="446" fill="#e6edf3">random/select/slt_good_0.test                    9175     9175 100.00%</text>
+<text x="18" y="466" fill="#e6edf3">random/expr/slt_good_0.test                     10012    10012 100.00%</text>
+<text x="18" y="486" fill="#e6edf3">random/aggregates/slt_good_0.test                9130     9130 100.00%</text>
+<text x="18" y="506" fill="#e6edf3">random/groupby/slt_good_0.test                   9050     9050 100.00%</text>
+<text x="18" y="526" fill="#e6edf3">TOTAL                                          109414   109399  99.99%</text>
+<text x="18" y="566" fill="#e6edf3">why records fail:</text>
+<text x="18" y="586" fill="#e6edf3">      10  42601 syntax error at or near &#34;…&#34;</text>
+<text x="18" y="606" fill="#e6edf3">       2  22P02 invalid input syntax for type integer: &#34;…&#34;</text>
+<text x="18" y="626" fill="#e6edf3">       2  wrong result</text>
+<text x="18" y="646" fill="#e6edf3">       1  42601 multiple assignments to same column &#34;…&#34;</text>
+<text x="18" y="686" fill="#e6edf3">no regressions against compat/slt/baseline.txt</text>
+</g>
+</svg>

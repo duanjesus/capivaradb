@@ -9,7 +9,7 @@
 # looked like at the time.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4|m5|m6}"
+MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4|m5|m6|m7}"
 OUT="$ROOT/docs/screenshots"
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -167,6 +167,44 @@ m6)
     go test ./internal/engine -run XXX -bench 'PointLookup|SecondaryIndex|UpdateByKey|ThreeTableJoin' -benchtime "${BENCHTIME:-2s}" 2>&1 |
       grep -E '^(cpu|Benchmark)' | sed -E 's/-8 +/  /; s/\t+/  /g'
   } | shot bench "benchmarks: the chosen plan against the rejected one"
+
+  { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
+    shot mutation "mutation testing: break a rule, the tests must fail"
+  ;;
+
+m7)
+  # EXPLAIN ANALYZE through psql: the same query with memory to spare and
+  # with almost none.
+  bash scripts/psql-smoke.sh >/dev/null
+  sed -n '/^-- What each step did/,/^set work_mem = .4MB.;/p' "$CACHE/psql-executor.out" | sed '$d' |
+    shot work-mem "psql: one query, with memory to spare and with 64 kB"
+  sed -n '/^-- Set operations/,/^-- Enough rows/p' "$CACHE/psql-executor.out" | sed '$d' |
+    shot sql "psql: set operations, RIGHT and FULL JOIN, USING"
+  sed -n '/^-- No index on orders.customer_id/,/^-- What each step did/p' "$CACHE/psql-executor.out" | sed '$d' |
+    shot joins "psql: a hash join, and a merge join that needs no sort"
+  sed -n '/^-- A query that wants three rows/,/^drop table orders/p' "$CACHE/psql-executor.out" | sed '$d' |
+    shot early "psql: a query that wants three rows reads three rows"
+
+  # The executor tests, with what they measure.
+  {
+    echo '$ go test ./internal/engine -v -run "TestSetOperations|TestOuterJoins|TestJoinKeys|TestLimitStops|Cursor|TestSpilling|TestHashJoinWithOne|TestTopN|TestExternalSort|TestMemory|TestPlansAgree"'
+    go test -count=1 ./internal/engine -v -run 'TestSetOperations|TestOuterJoins|TestJoinKeys|TestLimitStops|Cursor|TestSpilling|TestHashJoinWithOne|TestTopN|TestExternalSort|TestMemory|TestPlansAgree' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ ([0-9.]+s)$//; s/	[0-9.]+s$//; s/^ +[a-z_]+_test.go:[0-9]+: /    /' | fold -s -w 110
+  } | shot executor-tests "executor tests"
+
+  # The official JDBC driver, cursor included.
+  { echo '$ scripts/jdbc-smoke.sh'; bash scripts/jdbc-smoke.sh 2>&1 | grep -v '^downloading'; } |
+    shot jdbc "pgjdbc: a cursor read while the table is deleted under it"
+
+  # sqllogictest: the report of the regular run, without the timing column.
+  { echo '$ scripts/slt.sh'; bash scripts/slt.sh 2>/dev/null | sed -E 's/ +[0-9.]+s$//; s/ +time$//'; } |
+    shot slt "sqllogictest"
+
+  {
+    echo '$ go test ./internal/engine -run XXX -bench "JoinMethod|Sort|FirstRows|SetOperation"'
+    go test ./internal/engine -run XXX -bench 'JoinMethod|Sort|FirstRows|SetOperation' -benchtime "${BENCHTIME:-2s}" 2>&1 |
+      grep -E '^(cpu|Benchmark)' | sed -E 's/-8 +/  /; s/	+/  /g'
+  } | shot bench "benchmarks: join methods, sorts, early termination"
 
   { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
     shot mutation "mutation testing: break a rule, the tests must fail"

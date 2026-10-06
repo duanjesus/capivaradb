@@ -210,6 +210,33 @@ var corpus = []struct{ src, canonical string }{
 	{"select a + 1 as b from t group by a + 1 order by b",
 		"select (a + 1) as b from t group by (a + 1) order by b"},
 
+	// Set operations: INTERSECT binds tighter; UNION and EXCEPT associate
+	// to the left; ORDER BY and LIMIT apply to the whole.
+	{"select a from t union select b from u",
+		"select a from t union select b from u"},
+	{"select a from t union all select b from u union distinct select c from v",
+		"(select a from t union all select b from u) union select c from v"},
+	{"select 1 union select 2 intersect select 3",
+		"select 1 union (select 2 intersect select 3)"},
+	{"select 1 except select 2 except all select 3",
+		"(select 1 except select 2) except all select 3"},
+	{"(select 1 union select 2) intersect select 3",
+		"(select 1 union select 2) intersect select 3"},
+	{"select a from t union select b from u order by 1 desc limit 3",
+		"select a from t union select b from u order by 1 desc limit 3"},
+	{"(select a from t order by a limit 1) union all (select b from u)",
+		"(select a from t order by a limit 1) union all select b from u"},
+	{"(select 1)",
+		"select 1"},
+	{"select * from (select 1 union select 2) as s where x in (select 1 except select 2)",
+		"select * from (select 1 union select 2) as s where (x in (select 1 except select 2))"},
+
+	// The other joins
+	{"select * from a right join b on a.x = b.x full outer join c on true",
+		"select * from ((a right join b on (a.x = b.x)) full join c on true)"},
+	{"select * from a join b using (x, y) left join c using (z)",
+		"select * from ((a inner join b using (x, y)) left join c using (z))"},
+
 	// Subqueries in expressions
 	{"select (select max(x) from u where u.k = t.k) from t where exists (select 1 from u) and a not in (select b from u)",
 		"select (select max(x) from u where (u.k = t.k)) from t where (exists (select 1 from u) and (a not in (select b from u)))"},
@@ -382,9 +409,11 @@ func TestSyntaxErrors(t *testing.T) {
 		{"select case end", `syntax error at or near "end"`, 13, pgerr.SyntaxError},
 		{"select * from (select 1)", "subquery in FROM must have an alias", 15, pgerr.SyntaxError},
 		{"select a from t limit 1 limit 2", `syntax error at or near "limit"`, 25, pgerr.SyntaxError},
-		{"select 1 union select 2", "UNION is not supported", 10, pgerr.FeatureNotSupported},
-		{"select * from a right join b on true", "RIGHT JOIN is not supported", 17, pgerr.FeatureNotSupported},
-		{"select * from a join b using (x)", "JOIN ... USING is not supported", 24, pgerr.FeatureNotSupported},
+		{"select 1 union", "syntax error at end of input", 15, pgerr.SyntaxError},
+		{"select 1 intersect all 2", `syntax error at or near "2"`, 24, pgerr.SyntaxError},
+		{"select * from a natural join b", "NATURAL JOIN is not supported", 17, pgerr.FeatureNotSupported},
+		{"select * from a join b using x", `syntax error at or near "x"`, 30, pgerr.SyntaxError},
+		{"(select 1 limit 1) limit 2", "ORDER BY or LIMIT after a parenthesised query that has its own is not supported", 20, pgerr.FeatureNotSupported},
 		{"begin isolation level chaos", `syntax error at or near "chaos"`, 23, pgerr.SyntaxError},
 	}
 	for _, tc := range cases {

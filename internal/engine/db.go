@@ -78,6 +78,12 @@ type DB struct {
 	// writers holds the sessions with an open transaction that has changed
 	// something.
 	writers map[*Session]bool
+
+	// spills counts the temporary files queries have created. Tests use
+	// it to tell that a query really did go to disk.
+	spills atomic.Int64
+	// openSpills counts the ones not yet removed; it must return to zero.
+	openSpills atomic.Int64
 }
 
 // New returns an empty database held in memory. It uses the same storage
@@ -379,6 +385,9 @@ type Session struct {
 	// started is set once a statement has run in the transaction block,
 	// after which its isolation level can no longer be changed.
 	started bool
+	// timing is set while EXPLAIN ANALYZE runs its statement with timing
+	// on: plan steps then measure how long they take.
+	timing bool
 	// blocked is set while a statement waits for another transaction to
 	// end. Nothing depends on it but tests, which need to tell "still
 	// running" from "waiting".
@@ -405,7 +414,13 @@ func (db *DB) NewSession(params map[string]string) (pgwire.Session, error) {
 			// compare plans: turning them off gives the plan the planner
 			// would otherwise have rejected.
 			"enable_indexscan":    "on",
+			"enable_hashjoin":     "on",
+			"enable_mergejoin":    "on",
+			"enable_nestloop":     "on",
 			"join_collapse_limit": "8",
+			// The memory one sort or hash table may use before it moves to
+			// temporary files.
+			"work_mem": defaultWorkMem,
 		},
 	}
 	s.tx = changes{db: db, sess: s}
@@ -489,15 +504,6 @@ func (s *Session) takeSnapshot() (release func()) {
 	}
 	s.snap = s.db.newSnapshot(s.tx.tx)
 	return s.db.hold(s.snap)
-}
-
-// read runs a query under a snapshot of its own (or the transaction's).
-func (s *Session) read(fn func() ([][]any, error)) ([][]any, error) {
-	s.db.mu.RLock()
-	release := s.takeSnapshot()
-	s.db.mu.RUnlock()
-	defer release()
-	return fn()
 }
 
 // endTx forgets the transaction block. The caller must hold db.mu.

@@ -175,9 +175,6 @@ It runs:
 
 ## What is not there yet
 
-- **Streaming scans.** The executor materialises each table it reads, so a
-  query needs memory proportional to the tables it touches regardless of
-  the buffer pool. The iterator executor (milestone 7) removes that.
 - **Parallel writes.** One database-wide lock still serialises
   statements that write; MVCC (milestone 5) added isolation, not this.
 - An `UPDATE` rewrites the row and all its index entries even when only an

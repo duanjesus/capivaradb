@@ -157,9 +157,15 @@ func benchQuery(b *testing.B, h *harness, settings, query string, param func(i i
 }
 
 const (
-	planned   = "set enable_indexscan = on; set join_collapse_limit = 8"
-	noIndexes = "set enable_indexscan = off; set join_collapse_limit = 8"
-	asWritten = "set enable_indexscan = off; set join_collapse_limit = 1"
+	everything = "set enable_indexscan = on; set join_collapse_limit = 8; set enable_hashjoin = on; set enable_mergejoin = on; set work_mem = '64MB'; "
+	planned    = everything
+	noIndexes  = everything + "set enable_indexscan = off"
+	// naive is the executor with nothing to choose from: no indexes, joins
+	// in the order written, by nested loops.
+	naive     = noIndexes + "; set join_collapse_limit = 1; set enable_hashjoin = off; set enable_mergejoin = off"
+	hashOnly  = noIndexes + "; set enable_mergejoin = off"
+	mergeOnly = noIndexes + "; set enable_hashjoin = off"
+	loopOnly  = noIndexes + "; set enable_hashjoin = off; set enable_mergejoin = off"
 )
 
 func BenchmarkPointLookup(b *testing.B) {
@@ -200,11 +206,69 @@ func BenchmarkThreeTableJoin(b *testing.B) {
 	          where o.customer_id = c.id and o.product_id = p.id and c.name = $1`
 	for _, mode := range []struct{ name, settings string }{
 		{"planned", planned},
-		{"reordered, no indexes", noIndexes},
-		{"as written, no indexes", asWritten},
+		{"no indexes", noIndexes},
+		{"no indexes, nested loops as written", naive},
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			benchQuery(b, h, mode.settings, query, func(i int) any { return fmt.Sprintf("c%d", i%1000) })
+		})
+	}
+}
+
+// Every order with its customer: 20 000 rows against 1 000, with no index
+// to help. What the join method alone is worth.
+func BenchmarkJoinMethod(b *testing.B) {
+	_, h := benchShop(b)
+	query := "select o.id, c.name from orders o join customer c on c.id = o.customer_id where o.qty > $1"
+	for _, mode := range []struct{ name, settings string }{
+		{"hash join", hashOnly},
+		{"merge join", mergeOnly},
+		{"nested loop", loopOnly},
+		{"hash join on disk", hashOnly + "; set work_mem = '64kB'"},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, query, func(i int) any { return int64(0) })
+		})
+	}
+}
+
+// Sorting 20 000 rows: in memory, on disk, and when only the first ten are
+// wanted.
+func BenchmarkSort(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, settings, query string }{
+		{"in memory", everything, "select id from orders where qty > $1 order by product_id, id desc"},
+		{"external, work_mem 64kB", everything + "set work_mem = '64kB'", "select id from orders where qty > $1 order by product_id, id desc"},
+		{"top 10", everything, "select id from orders where qty > $1 order by product_id, id desc limit 10"},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, mode.query, func(i int) any { return int64(0) })
+		})
+	}
+}
+
+// What not computing the rows nobody asked for is worth.
+func BenchmarkFirstRows(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, query string }{
+		{"all 20000 rows", "select * from orders where qty > $1"},
+		{"limit 10", "select * from orders where qty > $1 limit 10"},
+		{"exists", "select exists (select 1 from orders where qty > $1)"},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, planned, mode.query, func(i int) any { return int64(0) })
+		})
+	}
+}
+
+// A set operation over the two halves of a table.
+func BenchmarkSetOperation(b *testing.B) {
+	_, h := benchShop(b)
+	for _, op := range []string{"union all", "union", "intersect", "except"} {
+		b.Run(op, func(b *testing.B) {
+			benchQuery(b, h, planned,
+				"select customer_id from orders where id < 10000 and qty > $1 "+op+" select customer_id from orders where id >= 5000",
+				func(i int) any { return int64(0) })
 		})
 	}
 }

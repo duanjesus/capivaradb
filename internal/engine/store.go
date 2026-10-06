@@ -735,12 +735,34 @@ type keyBounds struct {
 // rangeScan returns the versions of t the snapshot sees whose key in ix (or
 // in the table itself, if ix is nil) falls within the bounds, in key order.
 func (db *DB) rangeScan(t *table, ix *index, sn *snapshot, kb keyBounds, locked bool) ([]rowRef, error) {
+	rows, _, err := db.scanBatch(t, ix, sn, kb, nil, 0, locked)
+	return rows, err
+}
+
+// A scan reads scanBatchFirst rows the first time it takes the lock, and
+// twice as many each time after that, up to scanBatchRows.
+const (
+	scanBatchFirst = 16
+	scanBatchRows  = 256
+)
+
+// scanBatch is rangeScan in instalments. It returns at most limit rows (all
+// of them if limit is 0), starting after the tree key resume, and the key
+// to resume from next time; that key is nil once the range is exhausted.
+//
+// This is what lets a scan run for as long as its consumer likes without
+// holding the database lock or a position inside a tree that others are
+// changing: between batches it holds nothing but a key. Finding its place
+// again is sound because of MVCC — the versions its snapshot sees are not
+// removed while the snapshot is held, and versions added meanwhile are not
+// visible to it — so every batch reads from the same frozen state.
+func (db *DB) scanBatch(t *table, ix *index, sn *snapshot, kb keyBounds, resume []byte, limit int, locked bool) (_ []rowRef, next []byte, _ error) {
 	if !locked {
 		db.mu.RLock()
 		defer db.mu.RUnlock()
 	}
 	if err := db.stillCurrent(t); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tree := t.tree
 	if ix != nil {
@@ -753,12 +775,20 @@ func (db *DB) rangeScan(t *table, ix *index, sn *snapshot, kb keyBounds, locked 
 		// a range with only an upper bound starts after the NULLs.
 		start = append(start, 1)
 	}
+	if resume != nil {
+		// The smallest key greater than the last one read.
+		start = append(append([]byte(nil), resume...), 0)
+	}
 	c := tree.Seek(start)
 	for {
 		key, val, ok := c.Next()
 		if !ok || !bytes.HasPrefix(key, kb.prefix) {
 			break
 		}
+		if limit > 0 && len(rows) >= limit {
+			return rows, next, c.Err()
+		}
+		next = append(next[:0], key...)
 		rest := key[len(kb.prefix):]
 		if kb.lo != nil && !kb.loIncl && bytes.HasPrefix(rest, kb.lo) {
 			continue
@@ -781,18 +811,18 @@ func (db *DB) rangeScan(t *table, ix *index, sn *snapshot, kb keyBounds, locked 
 			// of the version it points at, which holds the rest.
 			n, err := keyPartsLen(key, ix.cols, t)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			rowKey = key[n:]
 			var found bool
 			if val, found, err = t.tree.Get(rowKey); err != nil {
-				return nil, err
+				return nil, nil, err
 			} else if !found {
-				return nil, fmt.Errorf("index %s has an entry for a row version that does not exist", ix.name)
+				return nil, nil, fmt.Errorf("index %s has an entry for a row version that does not exist", ix.name)
 			}
 		}
 		if len(rowKey) < versionTagSize || len(val) < 8 {
-			return nil, fmt.Errorf("corrupt row version in table %s", t.name)
+			return nil, nil, fmt.Errorf("corrupt row version in table %s", t.name)
 		}
 		_, xmin := splitVersionKey(rowKey)
 		if sn != nil && !sn.visible(xmin, binary.BigEndian.Uint64(val)) {
@@ -800,11 +830,11 @@ func (db *DB) rangeScan(t *table, ix *index, sn *snapshot, kb keyBounds, locked 
 		}
 		ref, err := t.decodeVersion(rowKey, val)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		rows = append(rows, ref)
 	}
-	return rows, c.Err()
+	return rows, nil, c.Err()
 }
 
 // keyPartsLen returns how many bytes of key the encodings of the given

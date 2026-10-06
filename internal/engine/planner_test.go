@@ -175,6 +175,21 @@ func TestJoinOrder(t *testing.T) {
 	h := shop(t, New())
 	// Written largest table first. The planner starts from the one row of
 	// customer the query asks for and reaches the orders through an index.
+	// The products are twenty rows, already in key order: reading them all
+	// and merging is estimated cheaper than ten separate lookups.
+	h.expectPlan("select * from orders o, customer c, product p where o.customer_id = c.id and o.product_id = p.id and c.name = 'c7'", `
+		Merge Join
+		  Merge Cond: (o.product_id = p.id)
+		  ->  Sort
+		        Sort Key: o.product_id
+		        ->  Nested Loop
+		              ->  Index Scan using customer_name on customer c
+		                    Index Cond: (c.name = 'c7')
+		              ->  Index Scan using orders_customer on orders o
+		                    Index Cond: (o.customer_id = c.id)
+		  ->  Seq Scan on product p`)
+	// With only nested loops to choose from, it is lookups all the way.
+	h.mustRun("set enable_mergejoin = off; set enable_hashjoin = off")
 	h.expectPlan("select * from orders o, customer c, product p where o.customer_id = c.id and o.product_id = p.id and c.name = 'c7'", `
 		Nested Loop
 		  ->  Nested Loop
@@ -185,7 +200,7 @@ func TestJoinOrder(t *testing.T) {
 		  ->  Index Scan using product_pkey on product p
 		        Index Cond: (o.product_id = p.id)`)
 	// With reordering off the joins run as written.
-	h.mustRun("set join_collapse_limit = 1; set enable_indexscan = off")
+	h.mustRun("set join_collapse_limit = 1; set enable_indexscan = off; set enable_hashjoin = off; set enable_mergejoin = off")
 	h.expectPlan("select * from orders o, customer c, product p where o.customer_id = c.id and o.product_id = p.id and c.name = 'c7'", `
 		Nested Loop
 		  Join Filter: (o.product_id = p.id)
@@ -209,7 +224,7 @@ func TestLeftJoinPlans(t *testing.T) {
 		        Index Cond: (o.customer_id = c.id)`)
 	// A WHERE condition on the right side must stay above the join: below
 	// it, it would turn "no match" rows into matches that were filtered.
-	h.mustRun("set enable_indexscan = off")
+	h.mustRun("set enable_indexscan = off; set enable_hashjoin = off")
 	h.expectPlan("select * from customer c left join orders o on o.customer_id = c.id where o.id is null", `
 		Nested Loop Left Join
 		  Join Filter: (o.customer_id = c.id)
@@ -230,7 +245,7 @@ func TestExplainUpperNodes(t *testing.T) {
 	h.expectPlan("select customer_id, count(*) from orders where qty > 1 group by customer_id having count(*) > 5 order by 2 desc limit 3", `
 		Limit
 		  ->  Sort
-		        Sort Key: 2
+		        Sort Key: 2 DESC
 		        ->  HashAggregate
 		              Group Key: customer_id
 		              Filter: (count(*) > 5)
@@ -400,12 +415,27 @@ func TestPlansAgree(t *testing.T) {
 		"orders o left join tag t on t.order_id = o.id join customer c on c.id = o.customer_id join product p on p.id = o.product_id where true",
 		"customer c join orders o on o.customer_id = c.id and o.qty > 2 left join product p on p.id = o.product_id and p.price > 50 where true",
 		"(select * from orders where qty < 4) o join customer c on c.id = o.customer_id join product p on p.id = o.product_id where true",
+		"orders o right join customer c on o.customer_id = c.id left join product p on p.id = o.product_id where true",
+		"customer c full join orders o on o.customer_id = c.id and o.qty > 3 left join product p on p.id = o.product_id where true",
+		"product p join orders o on o.product_id = p.id and o.qty < p.price join customer c on c.id = o.customer_id where true",
+		"tag t full join orders o on t.order_id = o.id join customer c on c.id = o.customer_id left join product p on p.id = o.product_id where true",
 	}
+	// Every setting must give the same rows. The last is the executor with
+	// nothing left to choose: joins as written, by nested loops, without
+	// indexes — what every other plan is an optimisation of. The ones with
+	// a small work_mem send sorts and hash tables to disk.
+	const all = "set enable_indexscan = on; set join_collapse_limit = 8; set enable_hashjoin = on; set enable_mergejoin = on; set enable_nestloop = on; set work_mem = '4MB'; "
 	settings := []string{
-		"set enable_indexscan = on; set join_collapse_limit = 8",
-		"set enable_indexscan = off; set join_collapse_limit = 8",
-		"set enable_indexscan = on; set join_collapse_limit = 1",
-		"set enable_indexscan = off; set join_collapse_limit = 1",
+		all,
+		all + "set enable_indexscan = off",
+		all + "set join_collapse_limit = 1",
+		all + "set enable_hashjoin = off",
+		all + "set enable_mergejoin = off; set enable_indexscan = off; set work_mem = '64kB'",
+		all + "set enable_hashjoin = off; set enable_indexscan = off; set work_mem = '64kB'",
+		all + "set enable_hashjoin = off; set enable_mergejoin = off",
+		all + "set enable_nestloop = off; set enable_indexscan = off",
+		all + "set enable_nestloop = off; set enable_hashjoin = off; set join_collapse_limit = 1",
+		all + "set enable_hashjoin = off; set enable_mergejoin = off; set enable_indexscan = off; set join_collapse_limit = 1",
 	}
 	nonEmpty := 0
 	for i := 0; i < 400; i++ {
@@ -431,11 +461,11 @@ func TestPlansAgree(t *testing.T) {
 			}
 		}
 	}
-	// A test that compares four empty results proves nothing.
+	// A test that compares empty results proves nothing.
 	if nonEmpty < 150 {
 		t.Errorf("only %d of 400 random queries returned rows; the generator is too restrictive", nonEmpty)
 	}
-	t.Logf("400 random queries, %d with results, each run under 4 planner settings: all agree", nonEmpty)
+	t.Logf("400 random queries, %d with results, each run under %d planner and executor settings: all agree", nonEmpty, len(settings))
 }
 
 // A condition containing a subquery may depend on any table of the FROM

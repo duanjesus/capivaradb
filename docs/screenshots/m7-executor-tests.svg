@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1637" height="470" viewBox="0 0 1637 470" role="img" aria-label="executor tests">
+<rect width="1637" height="470" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h1617 a10 10 0 0 1 10 10v24 h-1637 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="818" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">executor tests</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ go test ./internal/engine -v -run &#34;TestSetOperations|TestOuterJoins|TestJoinKeys|TestLimitStops|Cursor|TestSpilling|TestHashJoinWithOne|TestTopN|TestExternalSort|TestMemory|TestPlansAgree&#34;</text>
+<text x="18" y="86" fill="#7ee787">--- PASS: TestSetOperations (0.00s)</text>
+<text x="18" y="106" fill="#7ee787">--- PASS: TestOuterJoins (0.01s)</text>
+<text x="18" y="126" fill="#7ee787">--- PASS: TestLimitStopsTheScan (0.04s)</text>
+<text x="18" y="146" fill="#7ee787">--- PASS: TestCursorReadsItsSnapshot (0.04s)</text>
+<text x="18" y="166" fill="#7ee787">--- PASS: TestIndexCursorReadsItsSnapshot (0.08s)</text>
+<text x="18" y="186" fill="#7ee787">--- PASS: TestAbandonedCursor (0.08s)</text>
+<text x="18" y="206" fill="#7ee787">--- PASS: TestSpillingGivesTheSameRows (2.66s)</text>
+<text x="18" y="226" fill="#7ee787">--- PASS: TestHashJoinWithOneHugeKey (0.03s)</text>
+<text x="18" y="246" fill="#7ee787">--- PASS: TestTopN (0.07s)</text>
+<text x="18" y="266" fill="#7ee787">--- PASS: TestExternalSortIsStable (0.04s)</text>
+<text x="18" y="286" fill="#e6edf3">    scan      40000 rows:    64 kB of heap with work_mem = 1GB,    65 kB with work_mem = 256kB</text>
+<text x="18" y="306" fill="#e6edf3">    sort      40000 rows:  6412 kB of heap with work_mem = 1GB,   932 kB with work_mem = 256kB</text>
+<text x="18" y="326" fill="#e6edf3">    hash join 40000 rows: 13614 kB of heap with work_mem = 1GB,  2099 kB with work_mem = 256kB</text>
+<text x="18" y="346" fill="#7ee787">--- PASS: TestMemoryIsBoundedByWorkMem (1.08s)</text>
+<text x="18" y="366" fill="#7ee787">--- PASS: TestJoinKeysByEveryMethod (0.01s)</text>
+<text x="18" y="386" fill="#e6edf3">    400 random queries, 248 with results, each run under 10 planner and executor settings: all agree</text>
+<text x="18" y="406" fill="#7ee787">--- PASS: TestPlansAgree (10.69s)</text>
+<text x="18" y="426" fill="#7ee787">PASS</text>
+<text x="18" y="446" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/engine</text>
+</g>
+</svg>

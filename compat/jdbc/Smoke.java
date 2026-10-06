@@ -126,6 +126,57 @@ public class Smoke {
                 rs.next();
                 check("score after committed batch", rs.getDouble(1), 10.5);
             }
+
+            // A real cursor: with autocommit off and a fetch size, the driver
+            // asks for the rows fifty at a time and the server keeps the
+            // query suspended in between. Half-way through, another
+            // connection deletes every row and vacuums; the cursor must go
+            // on returning what existed when it was opened.
+            try (Statement st = conn.createStatement()) {
+                st.executeUpdate("create table seq (n int primary key)");
+                st.executeUpdate("insert into seq values (0), (1), (2), (3), (4)");
+                for (int size = 5; size < 640; size *= 2) {
+                    st.executeUpdate("insert into seq select n + " + size + " from seq");
+                }
+            }
+            conn.setAutoCommit(false);
+            try (Statement st = conn.createStatement()) {
+                st.setFetchSize(50);
+                try (ResultSet rs = st.executeQuery("select n from seq")) {
+                    long sum = 0;
+                    int rows = 0;
+                    while (rs.next()) {
+                        sum += rs.getInt(1);
+                        if (++rows == 120) {
+                            try (Connection other = DriverManager.getConnection(url, "ana", "");
+                                 Statement del = other.createStatement()) {
+                                check("rows deleted under the open cursor", del.executeUpdate("delete from seq"), 640);
+                                del.execute("vacuum seq");
+                            }
+                        }
+                    }
+                    check("rows read through the cursor", rows, 640);
+                    check("their sum", sum, 640L * 639 / 2);
+                }
+                try (ResultSet rs = st.executeQuery("select count(*) from seq")) {
+                    rs.next();
+                    check("rows a new statement sees", rs.getInt(1), 0);
+                }
+            }
+            conn.commit();
+            conn.setAutoCommit(true);
+
+            // Set operations and a full join, as seen by the driver.
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                     "select a.x, b.x from (select 1 as x union select 2) a "
+                     + "full join (select 2 as x union all select 3) b on a.x = b.x order by a.x, b.x")) {
+                StringBuilder got = new StringBuilder();
+                while (rs.next()) {
+                    got.append(rs.getObject(1)).append('|').append(rs.getObject(2)).append(' ');
+                }
+                check("full join of two unions", got.toString().trim(), "1|null 2|2 null|3");
+            }
         }
         if (failures > 0) {
             System.out.println(failures + " check(s) failed");

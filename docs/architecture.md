@@ -54,9 +54,10 @@ of the two:
 - `Prepare` returns parameter types and result columns *without executing*,
   because a driver sends `Describe` before `Bind` and expects both.
 - `Rows` is an iterator rather than a slice because `Execute` can ask for
-  at most N rows and come back later for more. The milestone-1 engine
-  materialises results anyway; the Volcano executor of milestone 7 will
-  produce them lazily through the same interface.
+  at most N rows and come back later for more. For six milestones the
+  engine computed whole results anyway; since the seventh they are
+  produced lazily through the same interface, and each call to `Next` may
+  arrive with a context of its own.
 - `context.Context` carries cancellation from a `CancelRequest`, which
   arrives on a different connection, into whatever the statement is doing.
 
@@ -150,17 +151,24 @@ scan and an index, and orders the joins by estimated cost, using the
 statistics in `engine/stats.go`. The same tree is what `EXPLAIN` prints.
 See [planner.md](planner.md).
 
-**Executor.** `engine/select.go` runs the rest in the textbook order —
-grouping, `HAVING`, select list, `DISTINCT`, `ORDER BY`, `OFFSET`/`LIMIT`
-— and each step materialises its result. Joins are nested loops,
-optionally with an index lookup on the inner side. With
-`enable_indexscan = off` and `join_collapse_limit = 1` it behaves as it did
-before the planner chose anything, which is what the planner is tested
-against.
+**Executor.** A plan is a tree of iterators (`engine/iter.go`,
+`join.go`, `select.go`): each step produces its next row on request, by
+asking the step below for one. The steps are scans, four kinds of join,
+aggregation, the select list, duplicate removal, sorting, limits and set
+operations. Nothing is computed before it is asked for, a step that must
+remember more than `work_mem` writes the excess to temporary files, and
+the result the protocol layer reads from is the top iterator, so rows
+reach the client as they are produced. See [executor.md](executor.md).
+
+With every choice switched off — no index scans, no hash or merge joins,
+joins in the order written — a query runs the way the first executor ran
+it, which is what every other configuration is tested against.
 
 **Storage.** Each table is a B+tree and so is each index; see
 [storage.md](storage.md). A scan decodes the rows of the tree, or of the
-range of it an index condition selects, under the database's read lock; writers hold the write lock for the statement, and a
+range of it an index condition selects, a batch at a time: it takes the
+database's read lock for each batch and between batches holds only the key
+it stopped at; writers hold the write lock for the statement, and a
 subquery inside a writing statement is told the lock is already held. An
 `UPDATE` or `DELETE` reads all the rows it might touch before changing any,
 because a changed row can move within the tree.
@@ -181,7 +189,8 @@ only freed after the commit. See [recovery.md](recovery.md).
 
 **Isolation.** Rows are versioned: each version records the transaction
 that created it and the one that deleted it, and every statement reads
-through a snapshot that decides which versions exist for it. Readers and
+through a snapshot that decides which versions exist for it; a query keeps
+its snapshot for as long as its cursor is open. Readers and
 writers do not block each other; writers that want the same row wait for
 one another, with deadlock detection. Two levels are offered, read
 committed and repeatable read (snapshot isolation). See [mvcc.md](mvcc.md).
@@ -201,12 +210,15 @@ Integer arithmetic detects overflow and reports `22003` instead of wrapping.
 Integer literals are `integer` if they fit in 32 bits and `bigint`
 otherwise, as in PostgreSQL.
 
-## What the next milestones replace
+## What the boundary was for
 
-| Today | Replaced by |
-|-------|-------------|
-| One writer at a time under a database-wide lock | Not planned: MVCC gives isolation, not parallel writes |
-| Every step materialised, nested-loop joins | Iterator tree behind the same `Rows` interface (M7) |
+The engine behind `internal/pgwire` was rebuilt milestone after milestone —
+rows in memory, then B+trees on disk, then versioned rows, then an
+iterator tree — and the protocol code and the client tests under `compat/`
+did not change for any of it.
+The last replacement even changed what a result *is*, from a list of rows
+to a cursor over a running plan, and the `Rows` interface written in
+milestone 1 already had the shape for it: `Next`, and `Close`.
 
-`internal/pgwire` and the tests under `compat/` are expected to survive all
-of that unchanged.
+What is still as simple as it was on day one: one writer at a time, under
+a database-wide lock. MVCC gave isolation, not parallel writes.

@@ -139,12 +139,57 @@ Acceptance, as delivered:
 Details in [planner.md](planner.md) and
 [decisions/0008](decisions/0008-planner-design.md).
 
-## 7. Executor
+## 7. Executor — done
 
-- Volcano iterators behind the existing `Rows` interface
-- Hash join, merge join, hash aggregation, external merge sort
-- Set operations (`UNION`, `INTERSECT`, `EXCEPT`), `RIGHT`/`FULL` joins
-- Vectorised execution if time allows
+- Volcano iterators behind the existing `Rows` interface: results are
+  cursors, and rows are computed as the client asks for them
+- Scans in batches that find their place again by key, holding no lock
+  between batches; a query keeps its own snapshot until it is closed
+- Hash join (inner, left, full) with Grace partitioning to disk; merge
+  join, with sorts skipped for inputs in primary key order; nested loops
+  that keep their inner side in a spillable buffer
+- External merge sort, and a heap for `ORDER BY ... LIMIT`; all stable
+- `work_mem`, and `enable_hashjoin` / `enable_mergejoin` /
+  `enable_nestloop`
+- `UNION`, `INTERSECT`, `EXCEPT`, each with `ALL`; `RIGHT` and `FULL`
+  joins; `JOIN ... USING`
+- The limit of two million intermediate rows per join is gone
+
+Acceptance, as delivered:
+
+- every set operation and join kind tested against answers worked out by
+  hand;
+- the planner's 400 random queries now run under ten settings — each join
+  method alone, with and without indexes, with sorts and hash tables
+  forced to disk — and all must agree;
+- memory measured: sorting 40 000 rows holds 6.4 MB with room and 0.9 MB
+  with `work_mem = 256kB`; a scan holds 64 kB whatever the table's size;
+- a cursor read through the JDBC driver, fifty rows at a time, while
+  another connection deletes the table and vacuums it;
+- sqllogictest at 109 399 of 109 414 records: `select4.test`, the last
+  script with real failures, from 74.1% to 100%;
+- mutation testing extended with seventeen ways of making the executor
+  almost right, all caught; the script now refuses mutants that do not
+  compile, which exposed one from milestone 6 that had been passing for
+  that reason.
+
+Not done: vectorised execution, which the plan had as "if time allows".
+Details in [executor.md](executor.md) and
+[decisions/0009](decisions/0009-executor-design.md).
+
+## After the seven
+
+The plan is complete. What a next round would take on, roughly in order of
+what it would buy:
+
+- spilling for `GROUP BY` and `DISTINCT`, the one place a query's memory
+  still follows its data;
+- using index order for `ORDER BY`, so that `ORDER BY id LIMIT 10` reads
+  ten rows;
+- writers in parallel: latches per page instead of one lock per database;
+- group commit, to get past one `fsync` per transaction;
+- system catalogs, so that `\d` and GUI tools work;
+- more types: `numeric`, dates and times.
 
 ## Throughout
 

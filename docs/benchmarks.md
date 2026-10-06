@@ -12,7 +12,79 @@ SSD, Windows 11, Go 1.27, single-threaded, 2 seconds per benchmark. One run
 on a laptop: repeat runs differ by up to a quarter, so read these as orders
 of magnitude.
 
+## What the executor buys (milestone 7)
+
+`internal/engine`: prepared statements on 20 000 orders, 1 000 customers
+and 100 products, in an in-memory database, every row of the result read.
+
+**The join method.** Every order with its customer, with no index to help:
+
+| Method | Time | |
+|---|---:|---|
+| Hash join | 8.0 ms | The customers are hashed; the orders go past once |
+| Merge join | 15.3 ms | The customers are in key order already; the orders are sorted first |
+| Nested loop | 494 ms | 20 million pairs compared |
+| Hash join, `work_mem = 64kB` | 33 ms | Both sides partitioned to disk, joined a partition at a time |
+
+**Not computing what nobody asked for:**
+
+| Query | Time |
+|---|---:|
+| `select * from orders where qty > $1`, all 20 000 rows | 5.0 ms |
+| The same with `limit 10` | 11.8 µs |
+| `select exists (select 1 from orders where qty > $1)` | 11.2 µs |
+
+**Sorting** 20 000 rows by two keys:
+
+| | Time |
+|---|---:|
+| In memory | 9.4 ms |
+| External merge, `work_mem = 64kB` | 23.9 ms |
+| `limit 10`: a heap of ten rows | 6.4 ms |
+
+**Set operations** over two overlapping halves of the orders (10 000 and
+15 000 rows): `UNION ALL` 7.1 ms, `UNION` 7.7 ms, `INTERSECT` 8.2 ms,
+`EXCEPT` 7.5 ms.
+
+**Memory**, as live heap while 40 000 rows are read through a cursor
+(`go test ./internal/engine -run TestMemoryIsBoundedByWorkMem -v`):
+
+| Query | `work_mem = 1GB` | `work_mem = 256kB` |
+|---|---:|---:|
+| Scan | 64 kB | 64 kB |
+| Sort | 6.4 MB | 0.9 MB |
+| Hash join of the table with itself | 13.6 MB | 2.1 MB |
+
+How to read them:
+
+- **The join method is worth as much as an index.** A hash join is sixty
+  times faster than the nested loop it replaces, on tables this small,
+  and the gap widens with their size: one is linear, the other quadratic.
+- **Going to disk costs about four times** for the hash join and two and a
+  half for the sort, with "disk" here being the operating system's file
+  cache: the files are written and read back within milliseconds. That is
+  the price of a query that would otherwise not run at all in the memory
+  it is given, and `work_mem` is how to avoid paying it when there is
+  room.
+- **A tight `work_mem` is not the amount of memory used.** With 256 kB the
+  sort holds 0.9 MB and the hash join 2.1 MB: the allowance, plus a buffer
+  for each temporary file being written or read. What matters is that
+  these numbers do not grow with the table.
+- **The heap for `LIMIT` saves a third**, not more: the sort was never the
+  expensive part of this query. The 20 000 rows are still read and
+  compared; only the keeping is avoided.
+- **`limit 10` is four hundred times faster than reading everything**
+  because the scan stops; before this milestone it was no faster at all.
+- **What the iterators cost.** A plain scan of 20 000 rows takes the same
+  5 ms it took when the executor built its whole result first — measured
+  on the same machine, one build against the other. Row-at-a-time
+  execution is not faster per row, and a vectorised executor would be;
+  what it buys is everything above.
+
 ## What the planner buys (milestone 6)
+
+These are the numbers published with milestone 6, kept as they were. Then,
+"without indexes" also meant nested loops, the only join there was.
 
 `internal/engine`: prepared statements on 20 000 orders, 1 000 customers
 and 100 products, in memory, with a different parameter on every
@@ -121,5 +193,5 @@ How to read them:
   device dominates.
 
 What none of this shows: concurrency (readers do not block, but there is no
-benchmark of it yet), or queries over data larger than memory (the executor
-materialises every step).
+benchmark of it yet), tables larger than the machine's memory (the largest
+here has a million small rows), or a real disk under the temporary files.

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1089" height="1430" viewBox="0 0 1089 1430" role="img" aria-label="psql: set operations, RIGHT and FULL JOIN, USING">
+<rect width="1089" height="1430" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h1069 a10 10 0 0 1 10 10v24 h-1089 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="544" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">psql: set operations, RIGHT and FULL JOIN, USING</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">-- Set operations.</text>
+<text x="18" y="86" fill="#e6edf3">select city from customer union select &#39;Caruaru&#39; order by 1;</text>
+<text x="18" y="106" fill="#e6edf3">  city</text>
+<text x="18" y="126" fill="#8b949e">---------</text>
+<text x="18" y="146" fill="#e6edf3"> Caruaru</text>
+<text x="18" y="166" fill="#e6edf3"> Natal</text>
+<text x="18" y="186" fill="#e6edf3"> Olinda</text>
+<text x="18" y="206" fill="#e6edf3"> Recife</text>
+<text x="18" y="226" fill="#e6edf3">(4 rows)</text>
+<text x="18" y="266" fill="#e6edf3">select customer_id from orders intersect select id from customer order by 1;</text>
+<text x="18" y="286" fill="#e6edf3"> customer_id</text>
+<text x="18" y="306" fill="#8b949e">-------------</text>
+<text x="18" y="326" fill="#e6edf3">           1</text>
+<text x="18" y="346" fill="#e6edf3">           2</text>
+<text x="18" y="366" fill="#e6edf3">           3</text>
+<text x="18" y="386" fill="#e6edf3">(3 rows)</text>
+<text x="18" y="426" fill="#e6edf3">select id from customer except select customer_id from orders;</text>
+<text x="18" y="446" fill="#e6edf3"> id</text>
+<text x="18" y="466" fill="#8b949e">----</text>
+<text x="18" y="486" fill="#e6edf3">  4</text>
+<text x="18" y="506" fill="#e6edf3">(1 row)</text>
+<text x="18" y="546" fill="#e6edf3">select customer_id from orders where total &gt; 30 union all select customer_id from orders where total &lt; 60 order by 1 limit 4;</text>
+<text x="18" y="566" fill="#e6edf3"> customer_id</text>
+<text x="18" y="586" fill="#8b949e">-------------</text>
+<text x="18" y="606" fill="#e6edf3">           1</text>
+<text x="18" y="626" fill="#e6edf3">           1</text>
+<text x="18" y="646" fill="#e6edf3">           1</text>
+<text x="18" y="666" fill="#e6edf3">           2</text>
+<text x="18" y="686" fill="#e6edf3">(4 rows)</text>
+<text x="18" y="726" fill="#8b949e">-- The joins that keep unmatched rows of the right side, or of both.</text>
+<text x="18" y="746" fill="#e6edf3">select o.id, c.name from orders o right join customer c on c.id = o.customer_id order by c.name, o.id;</text>
+<text x="18" y="766" fill="#e6edf3"> id | name</text>
+<text x="18" y="786" fill="#8b949e">----+------</text>
+<text x="18" y="806" fill="#e6edf3"> 10 | Ana</text>
+<text x="18" y="826" fill="#e6edf3"> 11 | Ana</text>
+<text x="18" y="846" fill="#e6edf3"> 12 | Bia</text>
+<text x="18" y="866" fill="#e6edf3"> 13 | Caio</text>
+<text x="18" y="886" fill="#e6edf3">    | Duda</text>
+<text x="18" y="906" fill="#e6edf3">(5 rows)</text>
+<text x="18" y="946" fill="#e6edf3">select o.id, c.name from orders o full join customer c on c.id = o.customer_id order by o.id, c.name;</text>
+<text x="18" y="966" fill="#e6edf3"> id | name</text>
+<text x="18" y="986" fill="#8b949e">----+------</text>
+<text x="18" y="1006" fill="#e6edf3"> 10 | Ana</text>
+<text x="18" y="1026" fill="#e6edf3"> 11 | Ana</text>
+<text x="18" y="1046" fill="#e6edf3"> 12 | Bia</text>
+<text x="18" y="1066" fill="#e6edf3"> 13 | Caio</text>
+<text x="18" y="1086" fill="#e6edf3"> 14 |</text>
+<text x="18" y="1106" fill="#e6edf3"> 15 |</text>
+<text x="18" y="1126" fill="#e6edf3">    | Duda</text>
+<text x="18" y="1146" fill="#e6edf3">(7 rows)</text>
+<text x="18" y="1186" fill="#8b949e">-- USING: the column appears once.</text>
+<text x="18" y="1206" fill="#e6edf3">create table city (city text, state text);</text>
+<text x="18" y="1226" fill="#e6edf3">CREATE TABLE</text>
+<text x="18" y="1246" fill="#e6edf3">insert into city values (&#39;Recife&#39;, &#39;PE&#39;), (&#39;Natal&#39;, &#39;RN&#39;), (&#39;Maceió&#39;, &#39;AL&#39;);</text>
+<text x="18" y="1266" fill="#e6edf3">INSERT 0 3</text>
+<text x="18" y="1286" fill="#e6edf3">select * from customer join city using (city) order by id;</text>
+<text x="18" y="1306" fill="#e6edf3">  city  | id | name | state</text>
+<text x="18" y="1326" fill="#8b949e">--------+----+------+-------</text>
+<text x="18" y="1346" fill="#e6edf3"> Recife |  1 | Ana  | PE</text>
+<text x="18" y="1366" fill="#e6edf3"> Recife |  2 | Bia  | PE</text>
+<text x="18" y="1386" fill="#e6edf3"> Natal  |  3 | Caio | RN</text>
+<text x="18" y="1406" fill="#e6edf3">(3 rows)</text>
+</g>
+</svg>

@@ -28,6 +28,14 @@ type Select struct {
 	OrderBy  []OrderItem
 	Limit    Expr
 	Offset   Expr
+
+	// A set operation. When Op is not empty the query is
+	// "Left Op [ALL] Right": Op is "union", "intersect" or "except", and
+	// of the fields above only OrderBy, Limit and Offset are used, applying
+	// to the combined result.
+	Op          string
+	All         bool
+	Left, Right *Select
 }
 
 // SelectItem is one entry of the select list: an expression, "*" or "t.*".
@@ -65,6 +73,8 @@ const (
 	InnerJoin JoinKind = iota
 	LeftJoin
 	CrossJoin
+	RightJoin
+	FullJoin
 )
 
 func (k JoinKind) String() string {
@@ -73,6 +83,10 @@ func (k JoinKind) String() string {
 		return "left join"
 	case CrossJoin:
 		return "cross join"
+	case RightJoin:
+		return "right join"
+	case FullJoin:
+		return "full join"
 	}
 	return "inner join"
 }
@@ -81,7 +95,10 @@ type Join struct {
 	Kind  JoinKind
 	Left  TableExpr
 	Right TableExpr
-	On    Expr // nil for a cross join
+	On    Expr // nil for a cross join, or when Using is set
+	// Using lists the columns of JOIN ... USING (a, b): the join condition
+	// is equality of those columns, and each appears once in the result.
+	Using []Ident
 	Pos   int
 }
 

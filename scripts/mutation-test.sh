@@ -18,7 +18,11 @@ MVCC=internal/engine/mvcc.go
 STORE=internal/engine/store.go
 DB=internal/engine/db.go
 PLAN=internal/engine/plan.go
-FILES=("$PAGER" "$RECOVERY" "$MVCC" "$STORE" "$DB" "$PLAN")
+JOIN=internal/engine/join.go
+ITER=internal/engine/iter.go
+SELECT=internal/engine/select.go
+EXEC=internal/engine/exec.go
+FILES=("$PAGER" "$RECOVERY" "$MVCC" "$STORE" "$DB" "$PLAN" "$JOIN" "$ITER" "$SELECT" "$EXEC")
 
 BACKUP="$CACHE/mutation"
 mkdir -p "$BACKUP"
@@ -40,7 +44,12 @@ mutant() {
     survivors=$((survivors + 1))
     return
   fi
-  if "${TESTS[@]}" >/dev/null 2>&1; then
+  # A mutant that does not compile fails every test without any test having
+  # looked at it. That is not a kill.
+  if ! go build ./internal/... >/dev/null 2>&1; then
+    echo "  DOES NOT COMPILE: the mutation is malformed; fix this script" >&2
+    survivors=$((survivors + 1))
+  elif "${TESTS[@]}" >/dev/null 2>&1; then
     echo "  SURVIVED: the tests did not notice"
     survivors=$((survivors + 1))
   else
@@ -129,26 +138,85 @@ mutant "a transaction's versions become visible to others before it commits" "$M
 echo
 echo "== planner =="
 # The planner may choose any plan, never a different answer.
-TESTS=(go test -count=1 -timeout 120s -run 'TestIndexScanResults|TestLeftJoinPlans|TestPlansAgree|TestJoins|TestSubquer|TestIndexScanRespects' ./internal/engine)
+TESTS=(go test -count=1 -timeout 180s -run 'TestIndexScanResults|TestLeftJoinPlans|TestPlansAgree|TestJoins|TestSubquer|TestIndexScanRespects|TestOuterJoins' ./internal/engine)
 baseline
 
 mutant "a WHERE condition on the nullable side of a LEFT JOIN is pushed below the join" "$PLAN" \
-  's|^\t\tif !c.opaque \&\& inside(c.cols, loff, lend) {$|\t\tif !c.opaque {|'
+  's|^\t\tif u.kind != joinFull \&\& !c.opaque \&\& inside(c.cols, loff, lend) {$|\t\tif u.kind != joinFull \&\& !c.opaque {|'
 
-mutant "a LEFT JOIN drops the rows that have no match" "$PLAN" \
-  's|if !matched {$|if false {|'
+mutant "a LEFT JOIN drops the rows that have no match" "$JOIN" \
+  's|if !matched \&\& it.j.kind != joinInner {$|if !matched \&\& false {|'
 
 mutant "a condition with a subquery is applied before all tables are joined" "$PLAN" \
   's|^\t\tif c.opaque {$|\t\tif false {|'
 
 mutant "an index scan returns versions the snapshot cannot see" "$STORE" \
-  's|^\t\tif sn != nil \&\& !sn.visible(xmin, binary.BigEndian.Uint64(val)) {$|\t\tif false {|'
+  's|^\t\tif sn != nil \&\& !sn.visible(xmin, binary.BigEndian.Uint64(val)) {$|\t\tif sn != nil \&\& !sn.visible(xmin, binary.BigEndian.Uint64(val)) \&\& false {|'
 
 mutant "an inclusive upper bound of an index range is treated as exclusive" "$STORE" \
   's|^\t\t\t\tif !kb.hiIncl {$|\t\t\t\tif true {|'
 
-mutant "a join condition is not checked when the inner table is reached through an index" "$PLAN" \
-  's|^\t\t\t\t\t\t\tok, err = allMatch(evals, en)$|\t\t\t\t\t\t\tok = true|'
+mutant "a join condition is not checked when the inner table is reached through an index" "$JOIN" \
+  's|^\t\t\tok, err = allMatch(it.j.conds, it.en)$|\t\t\tok = true|'
+
+echo
+echo "== executor =="
+# Hash joins, merge joins, sorts on disk, set operations and cursors: each
+# has a way of being almost right.
+TESTS=(go test -count=1 -timeout 180s -run 'TestSetOperations|TestOuterJoins|TestJoinKeys|TestCursor|TestIndexCursor|TestSpilling|TestTopN|TestExternalSort|TestPlansAgree' ./internal/engine)
+baseline
+
+mutant "a scan that resumes returns again the row it stopped at" "$STORE" \
+  's|^\t\tstart = append(append(\[\]byte(nil), resume...), 0)$|\t\tstart = append([]byte(nil), resume...)|'
+
+mutant "a cursor reads through the snapshot of the session's latest statement, not its own" "$PLAN" \
+  's|sc.db.scanBatch(sc.t, sc.ix, sc.cx.q.snap,|sc.db.scanBatch(sc.t, sc.ix, sc.cx.q.sess.snap,|'
+
+mutant "a cursor's snapshot is released as soon as the query has started" "$EXEC" \
+  's|^\treturn \&result{it: it, live: live, release: done}, nil$|\trelease()\n\treturn \&result{it: it, live: live, release: cx.q.cleanup}, nil|'
+
+mutant "a hash join compares an integer with a double precision by their encodings" "$JOIN" \
+  's|^\t\tif i, ok := v.(int64); ok \&\& k.float {$|\t\tif i, ok := v.(int64); ok \&\& false {|'
+
+mutant "a hash join takes two NULL keys for equal" "$JOIN" \
+  's|^\t\tif err != nil \|\| v == nil {$|\t\tif err != nil {|'
+
+mutant "a hash FULL JOIN forgets the rows of its hashed side that matched nothing" "$JOIN" \
+  's|^\t\t\t\th.tail = 0$|\t\t\t\th.tail = -1|'
+
+mutant "a nested-loop FULL JOIN forgets the inner rows that matched nothing" "$JOIN" \
+  's|^\t\t\tif !it.innerMatched\[it.tailIdx-1\] {$|\t\t\tif false {|'
+
+mutant "an outer hash join on disk drops the rows whose key is NULL" "$JOIN" \
+  's|^\t\tif !keepNull {$|\t\tif true {|'
+
+mutant "a hash join that splits a partition again sends the two sides to different places" "$JOIN" \
+  's|h.route(build, r, h.buildKeys, pp.depth, h.j.kind == joinFull)|h.route(build, r, h.buildKeys, pp.depth+1, h.j.kind == joinFull)|'
+
+mutant "a merge join matches only the first of several outer rows with the same key" "$JOIN" \
+  's|^\t\tif m.group != nil \&\& m.same(key, m.groupKey) == 0 {$|\t\tif false {|'
+
+mutant "an external sort is not stable: equal rows from later runs come first" "$ITER" \
+  's|^\treturn h.e\[i\].run < h.e\[j\].run$|\treturn h.e[i].run > h.e[j].run|'
+
+mutant "ORDER BY with LIMIT keeps the last rows instead of the first" "$ITER" \
+  's|} else if so.top.less(e, so.top.e\[0\]) {|} else if so.top.less(so.top.e[0], e) {|'
+
+mutant "RIGHT JOIN keeps the rows of the left side" "$PLAN" \
+  's|^\t\t\t\tu.left, u.right = right, left$|\t\t\t\tu.left, u.right = left, right|'
+
+mutant "JOIN ... USING in a right join shows the left side's column" "$PLAN" \
+  's|^\t\t\tshown, hidden = r, l$|\t\t\tshown, hidden = l, r|'
+
+mutant "UNION does not remove duplicates" "$SELECT" \
+  's|distinct: n.Op == "union" \&\& !n.All, width: width,|distinct: false, width: width,|'
+
+mutant "INTERSECT ALL returns a row as often as the left side has it" "$SELECT" \
+  's|^\t\t\ts.counts\[string(s.keyBuf)\] = n - 1$|\t\t\ts.counts[string(s.keyBuf)] = n|'
+
+mutant "EXCEPT ignores the right side" "$SELECT" \
+  's|^\t\t\tif !onRight {$|\t\t\tif !onRight \|\| true {|'
+
 echo
 if [ "$survivors" -gt 0 ]; then
   echo "$survivors mutant(s) survived"
