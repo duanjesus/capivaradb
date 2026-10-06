@@ -175,9 +175,6 @@ It runs:
 
 ## What is not there yet
 
-- **Using indexes to answer queries.** Indexes are maintained and enforce
-  uniqueness, but every query still scans its tables. Choosing an index is
-  the planner's job (milestone 6).
 - **Streaming scans.** The executor materialises each table it reads, so a
   query needs memory proportional to the tables it touches regardless of
   the buffer pool. The iterator executor (milestone 7) removes that.

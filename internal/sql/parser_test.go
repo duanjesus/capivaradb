@@ -249,6 +249,12 @@ var corpus = []struct{ src, canonical string }{
 	{"show time zone", "show timezone"},
 	{"CHECKPOINT", "checkpoint"},
 	{"VACUUM", "vacuum"},
+	{"analyze", "analyze"},
+	{"ANALYZE emp", "analyze emp"},
+	{"explain select 1", "explain select 1"},
+	{"explain analyze select a from t where a = 1", "explain (analyze) select a from t where (a = 1)"},
+	{"explain (analyze, costs off, timing false) delete from t", "explain (analyze, costs off, timing off) delete from t"},
+	{"explain (costs on, analyze off) update t set a = 1", "explain update t set a = 1"},
 	{"vacuum \"My Table\"", "vacuum \"My Table\""},
 }
 

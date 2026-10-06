@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -83,6 +84,127 @@ func BenchmarkInsertHundredPerTransaction(b *testing.B) {
 				}
 			}
 			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "rows/s")
+		})
+	}
+}
+
+// The benchmarks below compare the plan the planner chooses with the plan
+// it rejected, on the same data and the same query, by turning its switches
+// off. That is the only fair way to say what a planner is worth.
+
+const benchOrders = 20000
+
+func benchShop(b *testing.B) (*DB, *harness) {
+	b.Helper()
+	db := New()
+	sess, _ := db.NewSession(map[string]string{"user": "bench"})
+	run := func(q string) {
+		if err := execSQL(sess, q); err != nil {
+			b.Fatal(err)
+		}
+	}
+	run(`create table customer (id int primary key, name text not null);
+	     create table product (id int primary key, name text not null);
+	     create table orders (id int primary key, customer_id int not null, product_id int not null, qty int not null);
+	     create index orders_customer on orders (customer_id);
+	     create unique index customer_name on customer (name)`)
+	insert := func(table string, n int, row func(i int) string) {
+		for start := 0; start < n; start += 500 {
+			q := "insert into " + table + " values "
+			for i := start; i < start+500 && i < n; i++ {
+				if i > start {
+					q += ","
+				}
+				q += row(i)
+			}
+			run(q)
+		}
+	}
+	insert("customer", 1000, func(i int) string { return fmt.Sprintf("(%d, 'c%d')", i, i) })
+	insert("product", 100, func(i int) string { return fmt.Sprintf("(%d, 'p%d')", i, i) })
+	insert("orders", benchOrders, func(i int) string {
+		return fmt.Sprintf("(%d, %d, %d, %d)", i, (i*7)%1000, (i*3)%100, 1+i%5)
+	})
+	run("analyze")
+	b.Cleanup(func() { sess.Close() })
+	return db, &harness{sess: sess}
+}
+
+// benchQuery prepares a statement under the given planner settings and runs
+// it b.N times, with a different parameter each time.
+func benchQuery(b *testing.B, h *harness, settings, query string, param func(i int) any) {
+	b.Helper()
+	if err := execSQL(h.sess, settings); err != nil {
+		b.Fatal(err)
+	}
+	stmts, _ := h.sess.Parse(query)
+	p, err := h.sess.Prepare(stmts[0], nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := p.Execute(b.Context(), []any{param(i)})
+		if err != nil {
+			b.Fatal(err)
+		}
+		for {
+			if _, err := rows.Next(b.Context()); err != nil {
+				break
+			}
+		}
+	}
+}
+
+const (
+	planned   = "set enable_indexscan = on; set join_collapse_limit = 8"
+	noIndexes = "set enable_indexscan = off; set join_collapse_limit = 8"
+	asWritten = "set enable_indexscan = off; set join_collapse_limit = 1"
+)
+
+func BenchmarkPointLookup(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, settings string }{{"index scan", planned}, {"sequential scan", noIndexes}} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, "select * from orders where id = $1",
+				func(i int) any { return int64(i * 7919 % benchOrders) })
+		})
+	}
+}
+
+func BenchmarkSecondaryIndex(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, settings string }{{"index scan", planned}, {"sequential scan", noIndexes}} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, "select * from orders where customer_id = $1",
+				func(i int) any { return int64(i % 1000) })
+		})
+	}
+}
+
+func BenchmarkUpdateByKey(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, settings string }{{"index scan", planned}, {"sequential scan", noIndexes}} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, "update orders set qty = qty + 1 where id = $1",
+				func(i int) any { return int64(i * 7919 % benchOrders) })
+		})
+	}
+}
+
+// One customer's orders with their products: three tables, written with the
+// largest first.
+func BenchmarkThreeTableJoin(b *testing.B) {
+	_, h := benchShop(b)
+	query := `select o.id, p.name from orders o, customer c, product p
+	          where o.customer_id = c.id and o.product_id = p.id and c.name = $1`
+	for _, mode := range []struct{ name, settings string }{
+		{"planned", planned},
+		{"reordered, no indexes", noIndexes},
+		{"as written, no indexes", asWritten},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, query, func(i int) any { return fmt.Sprintf("c%d", i%1000) })
 		})
 	}
 }

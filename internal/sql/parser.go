@@ -244,6 +244,16 @@ func (p *parser) statement() (Node, error) {
 		p.i++
 		p.txnNoise()
 		return &Rollback{}, nil
+	case "explain":
+		return p.explainStmt()
+	case "analyze":
+		p.i++
+		a := &Analyze{}
+		if p.isIdent() {
+			t := p.next()
+			a.Table, a.Pos = t.Text, t.Pos
+		}
+		return a, nil
 	case "vacuum":
 		p.i++
 		v := &Vacuum{}
@@ -1366,4 +1376,67 @@ func intLiteral(v int64, pos int) *Literal {
 		typ = Int4
 	}
 	return &Literal{Val: v, Type: typ, Pos: pos}
+}
+
+// explainStmt parses EXPLAIN [ANALYZE] statement and the parenthesised form
+// EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) statement.
+func (p *parser) explainStmt() (Node, error) {
+	ex := &Explain{Pos: p.next().Pos}
+	onOff := func() (bool, error) {
+		switch {
+		case p.acceptKw("off"), p.acceptKw("false"):
+			return false, nil
+		case p.acceptKw("on"), p.acceptKw("true"):
+			return true, nil
+		}
+		// A bare option name means "on".
+		if p.isOp(",") || p.isOp(")") {
+			return true, nil
+		}
+		return false, p.syntaxError()
+	}
+	if p.acceptOp("(") {
+		for {
+			var err error
+			var on bool
+			switch {
+			case p.acceptKw("analyze"):
+				ex.Analyze, err = onOff()
+			case p.acceptKw("costs"):
+				on, err = onOff()
+				ex.NoCosts = !on
+			case p.acceptKw("timing"):
+				on, err = onOff()
+				ex.NoTiming = !on
+			default:
+				err = p.syntaxError()
+			}
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+	} else if p.acceptKw("analyze") {
+		ex.Analyze = true
+	}
+	// Only statements that have a plan can be explained, as in PostgreSQL.
+	// Besides being meaningless, "explain (costs on) analyze t" would print
+	// as "explain analyze t", which is a different statement.
+	start := p.peek()
+	stmt, err := p.statement()
+	if err != nil {
+		return nil, err
+	}
+	switch stmt.(type) {
+	case *Select, *Insert, *Update, *Delete:
+	default:
+		return nil, pgerr.New(pgerr.SyntaxError, "syntax error at or near %q", start.Raw).At(start.Pos)
+	}
+	ex.Stmt = stmt
+	return ex, nil
 }

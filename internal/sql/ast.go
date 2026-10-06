@@ -364,3 +364,22 @@ type Vacuum struct {
 	Table string
 	Pos   int
 }
+
+// Explain shows the plan of a statement instead of running it, or, with
+// Analyze, runs it and shows what happened.
+type Explain struct {
+	Stmt    Node
+	Analyze bool
+	// NoCosts and NoTiming leave the estimates and the measured times out,
+	// which makes the output reproducible.
+	NoCosts  bool
+	NoTiming bool
+	Pos      int
+}
+
+// Analyze gathers planner statistics, for one table or, with an empty
+// Table, for all of them.
+type Analyze struct {
+	Table string
+	Pos   int
+}

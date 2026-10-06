@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="676" height="690" viewBox="0 0 676 690" role="img" aria-label="psql: the plan chosen, and the plan rejected">
+<rect width="676" height="690" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h656 a10 10 0 0 1 10 10v24 h-676 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="338" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">psql: the plan chosen, and the plan rejected</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">-- A join written orders-first. The planner starts from the one customer</text>
+<text x="18" y="86" fill="#8b949e">-- asked for, found through the unique index on its name, and looks its</text>
+<text x="18" y="106" fill="#8b949e">-- orders up through the index on customer_id.</text>
+<text x="18" y="126" fill="#e6edf3">explain select c.name, o.total</text>
+<text x="18" y="146" fill="#e6edf3">from orders o join customer c on c.id = o.customer_id</text>
+<text x="18" y="166" fill="#e6edf3">where c.name = &#39;Bia&#39;;</text>
+<text x="18" y="186" fill="#e6edf3">                                 QUERY PLAN</text>
+<text x="18" y="206" fill="#8b949e">----------------------------------------------------------------------------</text>
+<text x="18" y="226" fill="#e6edf3"> Nested Loop  (cost=28.75 rows=4)</text>
+<text x="18" y="246" fill="#e6edf3">   -&gt;  Index Scan using customer_name_key on customer c  (cost=7.00 rows=1)</text>
+<text x="18" y="266" fill="#e6edf3">         Index Cond: (c.name = &#39;Bia&#39;)</text>
+<text x="18" y="286" fill="#e6edf3">   -&gt;  Index Scan using orders_customer on orders o  (cost=18.00 rows=4)</text>
+<text x="18" y="306" fill="#e6edf3">         Index Cond: (c.id = o.customer_id)</text>
+<text x="18" y="326" fill="#e6edf3">(5 rows)</text>
+<text x="18" y="366" fill="#8b949e">-- The same query with the planner&#39;s switches off: the plan it rejected.</text>
+<text x="18" y="386" fill="#e6edf3">set enable_indexscan = off;</text>
+<text x="18" y="406" fill="#e6edf3">SET</text>
+<text x="18" y="426" fill="#e6edf3">set join_collapse_limit = 1;</text>
+<text x="18" y="446" fill="#e6edf3">SET</text>
+<text x="18" y="466" fill="#e6edf3">explain select c.name, o.total</text>
+<text x="18" y="486" fill="#e6edf3">from orders o join customer c on c.id = o.customer_id</text>
+<text x="18" y="506" fill="#e6edf3">where c.name = &#39;Bia&#39;;</text>
+<text x="18" y="526" fill="#e6edf3">                     QUERY PLAN</text>
+<text x="18" y="546" fill="#8b949e">----------------------------------------------------</text>
+<text x="18" y="566" fill="#e6edf3"> Nested Loop  (cost=731.75 rows=4)</text>
+<text x="18" y="586" fill="#e6edf3">   Join Filter: (c.id = o.customer_id)</text>
+<text x="18" y="606" fill="#e6edf3">   -&gt;  Seq Scan on orders o  (cost=480.00 rows=480)</text>
+<text x="18" y="626" fill="#e6edf3">   -&gt;  Seq Scan on customer c  (cost=128.00 rows=1)</text>
+<text x="18" y="646" fill="#e6edf3">         Filter: (c.name = &#39;Bia&#39;)</text>
+<text x="18" y="666" fill="#e6edf3">(5 rows)</text>
+</g>
+</svg>

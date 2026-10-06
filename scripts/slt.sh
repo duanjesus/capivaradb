@@ -21,6 +21,8 @@ SCRIPTS=(
   select1.test
   select2.test
   select3.test
+  select4.test
+  select5.test
   evidence/in1.test
   evidence/in2.test
   evidence/slt_lang_aggfunc.test

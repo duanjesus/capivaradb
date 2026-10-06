@@ -208,6 +208,12 @@ type table struct {
 	// dead counts the versions deleted since the table was last vacuumed;
 	// vacuumAt is the count at which it is vacuumed again.
 	dead, vacuumAt int
+	// stats are the statistics gathered by the last ANALYZE, nil if there
+	// has been none. delta is the net number of rows added since, and mods
+	// the number of rows changed in any way; neither is corrected for
+	// rollbacks, which is good enough for an estimate.
+	stats       *tableStats
+	delta, mods int
 }
 
 type column struct {
@@ -395,6 +401,11 @@ func (db *DB) NewSession(params map[string]string) (pgwire.Session, error) {
 			"standard_conforming_strings": "on",
 			"search_path":                 "public",
 			"application_name":            params["application_name"],
+			// Planner switches, named after PostgreSQL's. They exist to
+			// compare plans: turning them off gives the plan the planner
+			// would otherwise have rejected.
+			"enable_indexscan":    "on",
+			"join_collapse_limit": "8",
 		},
 	}
 	s.tx = changes{db: db, sess: s}
@@ -651,36 +662,59 @@ func (s *Session) attempt(fn func(ch *changes) (string, error)) (tag string, wai
 }
 
 // housekeeping does the periodic work that follows a commit: vacuuming
-// tables that have accumulated dead versions, and checkpointing if enough
-// log has built up. The caller must hold db.mu.
+// tables that have accumulated dead versions, refreshing the statistics of
+// tables that have changed a lot, and checkpointing if enough log has built
+// up. The caller must hold db.mu.
 func (db *DB) housekeeping() error {
 	for _, name := range db.tableNames() {
 		t := db.tables[name]
-		if t.dead < max(t.vacuumAt, autoVacuumThreshold) {
-			continue
-		}
-		ch := changes{db: db}
-		removed, err := db.vacuum(t, &ch)
-		if err != nil {
-			ch.revert()
-		}
-		if ch.tx != 0 {
-			if err == nil {
-				err = db.pager.Commit(ch.tx, nil)
-			} else {
-				db.pager.End(ch.tx)
+		if t.dead >= max(t.vacuumAt, autoVacuumThreshold) {
+			err := db.internalTx(func(ch *changes) error {
+				removed, err := db.vacuum(t, ch)
+				// What could not be removed is still wanted by some
+				// snapshot; wait for as many new dead versions again
+				// before retrying.
+				t.dead -= removed
+				t.vacuumAt = t.dead + autoVacuumThreshold
+				return err
+			})
+			if err != nil {
+				return err
 			}
-			db.finishTx(ch.tx)
 		}
-		if err != nil {
-			return err
+		if t.needsAnalyze() {
+			err := db.internalTx(func(ch *changes) error {
+				st, err := db.analyze(t, db.newSnapshot(0))
+				if err != nil {
+					return err
+				}
+				return db.storeStats(t, st, ch)
+			})
+			if err != nil {
+				return err
+			}
 		}
-		// What could not be removed is still wanted by some snapshot;
-		// wait for as many new dead versions again before retrying.
-		t.dead -= removed
-		t.vacuumAt = t.dead + autoVacuumThreshold
 	}
 	return db.maybeCheckpoint()
+}
+
+// internalTx runs maintenance work as a transaction of its own. The caller
+// must hold db.mu.
+func (db *DB) internalTx(fn func(ch *changes) error) error {
+	ch := changes{db: db}
+	err := fn(&ch)
+	if err != nil {
+		ch.revert()
+	}
+	if ch.tx != 0 {
+		if err == nil {
+			err = db.pager.Commit(ch.tx, nil)
+		} else {
+			db.pager.End(ch.tx)
+		}
+		db.finishTx(ch.tx)
+	}
+	return err
 }
 
 // othersWriting reports whether a session other than s has uncommitted

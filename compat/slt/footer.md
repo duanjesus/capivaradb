@@ -1,8 +1,12 @@
 
 ## The records that fail
 
-All fifteen are places where the scripts expect SQLite's behaviour and
-PostgreSQL itself answers differently, so they are left as they are:
+**In `select4.test`, 1000 records** use `UNION`, `EXCEPT` or `INTERSECT`,
+which are not implemented yet (they are planned with the executor,
+milestone 7).
+
+**The other fifteen** are places where the scripts expect SQLite's behaviour
+and PostgreSQL itself answers differently, so they are left as they are:
 
 - `1 IN ()` — an empty list is a syntax error in PostgreSQL.
 - `x'303132'` — SQLite's blob literal.

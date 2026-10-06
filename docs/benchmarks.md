@@ -12,7 +12,55 @@ SSD, Windows 11, Go 1.27, single-threaded, 2 seconds per benchmark. One run
 on a laptop: repeat runs differ by up to a quarter, so read these as orders
 of magnitude.
 
+## What the planner buys (milestone 6)
+
+`internal/engine`: prepared statements on 20 000 orders, 1 000 customers
+and 100 products, in memory, with a different parameter on every
+execution. Each query is timed under the plan the planner chooses and
+under the one it rejected, obtained by switching the planner off
+(`enable_indexscan = off`, `join_collapse_limit = 1`).
+
+| Query | Chosen plan | Without indexes | |
+|---|---:|---:|---:|
+| `select * from orders where id = $1` | 6.0 µs | 4.8 ms | 790× |
+| `select * from orders where customer_id = $1` (20 rows) | 28.7 µs | 4.1 ms | 140× |
+| `update orders set qty = qty + 1 where id = $1` | 31.3 µs | 4.0 ms | 130× |
+
+One customer's orders with their products — three tables, written with the
+largest first:
+
+| Plan | Time |
+|---|---:|
+| Chosen: customer by name, its orders by index, each product by key | 144 µs |
+| Joins reordered, no indexes | 6.7 ms |
+| As written, no indexes | 5.4 ms |
+
+How to read them:
+
+- **Without an index, every query costs a scan of the table**: about 4 ms
+  for 20 000 rows, 0.2 µs per row, whatever is asked. With one, the cost
+  follows the number of rows wanted.
+- **The update shows it is not only reads.** Finding the row was 99% of
+  the work of changing it.
+- **Reordering alone bought nothing in the join**, and the table says so:
+  with no index, both orders compare the same 20 000 pairs of order and
+  customer, and the difference between the two rows is noise. It is the
+  index lookups that make the join 38 times faster, and reordering that
+  makes them possible, by putting the one customer first.
+- The ratios grow with the table: a scan is linear in its size and a
+  lookup logarithmic. On 20 000 rows these are modest numbers; they are
+  here to show that the planner chooses the right side, not to impress.
+- These timings moved more between runs than the others on this page. A
+  second run gave 5.5 µs and 8.2 ms for the first row, and 123 µs, 5.8 ms
+  and 5.2 ms for the join. The conclusions do not depend on which run is
+  read.
+
+sqllogictest gives the other measure: its two scripts of many-table joins
+went from minutes, with most queries timing out, to seconds
+([sqllogictest.md](sqllogictest.md)).
+
 ## What a commit costs (milestone 4)
+
 
 `internal/engine`: a prepared `INSERT` of one small row into a table with a
 primary key, through the binder, the B+tree and the write-ahead log.
@@ -73,5 +121,5 @@ How to read them:
   device dominates.
 
 What none of this shows: concurrency (readers do not block, but there is no
-benchmark of it yet), or SQL queries (the executor materialises whole
-tables and would dominate).
+benchmark of it yet), or queries over data larger than memory (the executor
+materialises every step).

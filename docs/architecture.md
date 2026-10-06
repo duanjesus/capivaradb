@@ -143,17 +143,24 @@ again.
   and the elements of `IN` are brought to one type: integers widen to
   `bigint` and to `double precision`; anything else must match.
 
-**Executor.** `engine/select.go` runs a query in the textbook order —
-`FROM`, `WHERE`, grouping, `HAVING`, select list, `DISTINCT`, `ORDER BY`,
-`OFFSET`/`LIMIT` — and each step materialises its result. Joins are nested
-loops in the order written. This is deliberately the least clever correct
-implementation: it is the reference that the planner (milestone 6) and the
-iterator executor (milestone 7) must agree with, and sqllogictest pins its
-answers.
+**Planner.** `engine/plan.go` turns `FROM` and `WHERE` into a tree of
+scans and joins: it splits the `WHERE` clause into conditions and places
+each as early as it can go, chooses for every table between a sequential
+scan and an index, and orders the joins by estimated cost, using the
+statistics in `engine/stats.go`. The same tree is what `EXPLAIN` prints.
+See [planner.md](planner.md).
+
+**Executor.** `engine/select.go` runs the rest in the textbook order —
+grouping, `HAVING`, select list, `DISTINCT`, `ORDER BY`, `OFFSET`/`LIMIT`
+— and each step materialises its result. Joins are nested loops,
+optionally with an index lookup on the inner side. With
+`enable_indexscan = off` and `join_collapse_limit = 1` it behaves as it did
+before the planner chose anything, which is what the planner is tested
+against.
 
 **Storage.** Each table is a B+tree and so is each index; see
-[storage.md](storage.md). A scan decodes every row of the tree under the
-database's read lock; writers hold the write lock for the statement, and a
+[storage.md](storage.md). A scan decodes the rows of the tree, or of the
+range of it an index condition selects, under the database's read lock; writers hold the write lock for the statement, and a
 subquery inside a writing statement is told the lock is already held. An
 `UPDATE` or `DELETE` reads all the rows it might touch before changing any,
 because a changed row can move within the tree.
@@ -198,9 +205,7 @@ otherwise, as in PostgreSQL.
 
 | Today | Replaced by |
 |-------|-------------|
-| Indexes maintained but never read by queries | Index scans chosen by the planner (M6) |
 | One writer at a time under a database-wide lock | Not planned: MVCC gives isolation, not parallel writes |
-| Joins in the order written, filters applied last | Cost-based planner (M6) |
 | Every step materialised, nested-loop joins | Iterator tree behind the same `Rows` interface (M7) |
 
 `internal/pgwire` and the tests under `compat/` are expected to survive all

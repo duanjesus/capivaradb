@@ -627,3 +627,40 @@ func TestConcurrentTransfers(t *testing.T) {
 		})
 	}
 }
+
+// An index entry points at a version; whether a reader may see that version
+// is decided in the table, exactly as for a scan. This transcript only
+// means something if the queries really go through the index, so that is
+// checked first.
+func TestIndexScanRespectsSnapshot(t *testing.T) {
+	setup := "create table item (id int primary key, owner int not null, v int not null); create index item_owner on item (owner)"
+	for i := 0; i < 300; i++ {
+		setup += fmt.Sprintf("; insert into item values (%d, %d, 0)", i, i/3)
+	}
+	it := newIsoTest(t, setup+"; analyze")
+	h := &harness{t: t, sess: it.session("check").sess}
+	for _, q := range []string{"select v from item where id = 7", "select id, v from item where owner = 2 order by id"} {
+		if plan := h.plan(q); !strings.Contains(plan, "Index Scan") {
+			t.Fatalf("%s is not planned as an index scan:\n%s", q, plan)
+		}
+	}
+	it.run([]isoStep{
+		{"old", "begin isolation level repeatable read", "BEGIN"},
+		{"old", "select id, v from item where owner = 2 order by id", "6|0;7|0;8|0"},
+		{"a", "begin", "BEGIN"},
+		{"a", "update item set v = 1 where id = 7", "UPDATE 1"},
+		{"a", "delete from item where id = 8", "DELETE 1"},
+		{"a", "insert into item values (1000, 2, 9)", "INSERT 0 1"},
+		// Through the primary key and through the secondary index, b sees
+		// none of a's uncommitted work, and a sees all of its own.
+		{"b", "select v from item where id = 7", "0"},
+		{"b", "select id, v from item where owner = 2 order by id", "6|0;7|0;8|0"},
+		{"a", "select id, v from item where owner = 2 order by id", "6|0;7|1;1000|9"},
+		{"a", "commit", "COMMIT"},
+		{"b", "select id, v from item where owner = 2 order by id", "6|0;7|1;1000|9"},
+		// The older snapshot still reads the old versions through the index.
+		{"old", "select v from item where id = 7", "0"},
+		{"old", "select id, v from item where owner = 2 order by id", "6|0;7|0;8|0"},
+		{"old", "commit", "COMMIT"},
+	})
+}

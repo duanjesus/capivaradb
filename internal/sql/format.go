@@ -182,6 +182,27 @@ func (f *formatter) stmt(node Node) {
 		}
 	case *Commit:
 		f.w("commit")
+	case *Explain:
+		f.w("explain ")
+		var opts []string
+		if n.Analyze {
+			opts = append(opts, "analyze")
+		}
+		if n.NoCosts {
+			opts = append(opts, "costs off")
+		}
+		if n.NoTiming {
+			opts = append(opts, "timing off")
+		}
+		if len(opts) > 0 {
+			f.w("(", strings.Join(opts, ", "), ") ")
+		}
+		f.stmt(n.Stmt)
+	case *Analyze:
+		f.w("analyze")
+		if n.Table != "" {
+			f.w(" ", QuoteIdent(n.Table))
+		}
 	case *Vacuum:
 		f.w("vacuum")
 		if n.Table != "" {

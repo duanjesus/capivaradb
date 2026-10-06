@@ -107,15 +107,37 @@ Acceptance:
 Details in [mvcc.md](mvcc.md) and
 [decisions/0007](decisions/0007-mvcc-design.md).
 
-## 6. Planner
+## 6. Planner — done
 
-- Table statistics
-- Access path choice between sequential scan and index scan
-- Join ordering by dynamic programming for small join counts
-- `EXPLAIN` and `EXPLAIN ANALYZE`
+- `WHERE` split into conditions, each checked at the earliest point where
+  its tables are available; the rules for what may move across a
+  `LEFT JOIN`
+- Access path choice between a sequential scan and a scan of the primary
+  key or an index (equalities on leading columns, then one range); used by
+  `UPDATE` and `DELETE` too
+- Join ordering: exact, by dynamic programming over sets of tables, up to
+  ten tables; greedy beyond. Nested loops, with an index lookup on the
+  inner side where there is one
+- Table statistics: `ANALYZE`, automatic re-analysis, persisted in the
+  catalog
+- `EXPLAIN` and `EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF)`
+- `enable_indexscan` and `join_collapse_limit`, to see the rejected plan
 
-Acceptance: plan tests asserting the chosen plan, and benchmarks showing
-the chosen plan beating the alternative.
+Acceptance, as delivered:
+
+- plan tests asserting the `EXPLAIN` output of representative queries;
+- 400 random queries run under every combination of the planner's
+  switches, which must agree row for row;
+- sqllogictest's two many-table join scripts added to the regular run:
+  `select5.test` from 51.5% (most failures being timeouts) to 100%,
+  `select4.test` from 39.0% to 74.1%, the rest needing set operations;
+- benchmarks of the chosen plan against the rejected one: 38 to 790 times
+  faster on 20 000 rows;
+- mutation testing extended with six ways of making the planner return
+  wrong rows, all caught.
+
+Details in [planner.md](planner.md) and
+[decisions/0008](decisions/0008-planner-design.md).
 
 ## 7. Executor
 

@@ -25,22 +25,23 @@ if any pass count drops below `compat/slt/baseline.txt`.
   small tables, integers, floats and text. They say nothing about
   durability, concurrency or performance.
 
-## Not in the regular run
+## What the planner changed
 
-Two scripts are measured separately because they need what the engine does
-not have yet. They are kept out of CI only because of how long the failures
-take to time out.
+Two scripts join many tables at once and could not be run to completion
+before milestone 6: joins ran as nested loops in the order written and
+the `WHERE` clause was applied only at the end, so a query like
+`FROM t1, t2, ... t15 WHERE ...` built a cross product of fifteen tables
+before discarding almost all of it. They were measured with a 300 ms limit
+per query; the planner made the limit irrelevant.
 
-| Script | Records | Passed | Why the rest fail |
-|---|---:|---:|---|
-| `select4.test` | 3857 | 1506 (39.0%) | 1000 use `UNION`/`EXCEPT`/`INTERSECT`, which are not implemented; 1351 time out (300 ms limit) |
-| `select5.test` | 1436 | 739 (51.5%) | 697 time out (300 ms limit) |
+| Script | Records | Before the planner | With the planner |
+|---|---:|---|---|
+| `select4.test` | 3857 | 1506 passed (39.0%) in 441 s; 1351 timed out | 2857 passed (74.1%) in 2 s; none time out |
+| `select5.test` | 1436 | 739 passed (51.5%) in 217 s; 697 timed out | **1436 passed (100%)** in 1 s |
 
-The timeouts are queries like `FROM t1, t2, t3, t4, t5, t6 WHERE ...`. Joins
-run as nested loops in the order written and the `WHERE` clause is applied
-only at the end, so the full cross product is built first. Pushing
-predicates down and choosing a join order is the planner's job (milestone
-6); these two scripts are its benchmark.
+Every record `select4.test` still fails uses `UNION`, `EXCEPT` or
+`INTERSECT`, which are not implemented. Both scripts are now part of the
+regular run below.
 
 ## Regular run
 

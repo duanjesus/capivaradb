@@ -72,7 +72,6 @@ select name, weight, wild from capivaras where id = 5;
 
 -- The offline check at the end compares the index with the rows, entry by
 -- entry.
--- (Queries do not use indexes yet: choosing one is the planner's job.)
 select name from capivaras where weight > 46 order by weight;
   name  
 --------

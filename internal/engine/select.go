@@ -1,18 +1,21 @@
 package engine
 
 import (
+	"math"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
 	"github.com/duanjesus/capivaradb/internal/sql"
 )
 
-// This file runs SELECT the simplest way that is correct: every step
-// materialises its whole result, joins are nested loops, and nothing is
-// reordered. It is the reference the planner (milestone 6) and the iterator
-// executor (milestone 7) will be measured against, and the semantics settled
-// here — scoping, grouping rules, NULL ordering — stay.
+// This file runs what a SELECT does after its FROM and WHERE clauses, which
+// plan.go plans: grouping, the select list, DISTINCT, ordering and limits.
+// Every step materialises its whole result. It is what the iterator executor
+// (milestone 7) will be measured against, and the semantics settled here —
+// scoping, grouping rules, NULL ordering — stay.
 
 // selectPlan is a SELECT ready to run.
 type selectPlan struct {
@@ -23,116 +26,8 @@ type selectPlan struct {
 	// context, the parameters and the outer rows a correlated subquery
 	// refers to.
 	run func(cx *env) ([][]any, error)
-}
-
-// maxJoinRows caps what a join may materialise. Joins run in the order they
-// are written and filter only afterwards, so "FROM a, b, c, d, e WHERE ..."
-// builds the full cross product first. Until the planner pushes predicates
-// down and reorders joins (milestone 6), failing is better than exhausting
-// the machine's memory.
-const maxJoinRows = 2_000_000
-
-// relation is the result of planning a FROM clause.
-type relation struct {
-	cols []scopeCol
-	rows func(cx *env) ([][]any, error)
-}
-
-func (s *Session) planFrom(te sql.TableExpr, parent *scope, ptypes []sql.Type) (*relation, error) {
-	switch te := te.(type) {
-	case *sql.TableRef:
-		s.db.mu.RLock()
-		t, err := s.db.lookup(*te)
-		s.db.mu.RUnlock()
-		if err != nil {
-			return nil, err
-		}
-		return &relation{cols: t.scopeCols(te.Alias), rows: func(cx *env) ([][]any, error) {
-			return s.db.rows(t, s.snap, cx.locked)
-		}}, nil
-
-	case *sql.DerivedTable:
-		// A subquery in FROM sees the enclosing query's outer scope, but
-		// not its sibling FROM items.
-		plan, err := s.planSelect(te.Select, parent, ptypes)
-		if err != nil {
-			return nil, err
-		}
-		cols := make([]scopeCol, len(plan.cols))
-		for i, c := range plan.cols {
-			cols[i] = scopeCol{table: te.Alias, name: c.Name, typ: plan.types[i]}
-		}
-		return &relation{cols: cols, rows: plan.run}, nil
-
-	case *sql.Join:
-		left, err := s.planFrom(te.Left, parent, ptypes)
-		if err != nil {
-			return nil, err
-		}
-		right, err := s.planFrom(te.Right, parent, ptypes)
-		if err != nil {
-			return nil, err
-		}
-		cols := append(append([]scopeCol(nil), left.cols...), right.cols...)
-		b := &binder{sess: s, scope: &scope{cols: cols, parent: parent}, ptypes: ptypes}
-		on, err := b.bindWhere(te.On, "JOIN/ON")
-		if err != nil {
-			return nil, err
-		}
-		outer, nLeft := te.Kind == sql.LeftJoin, len(left.cols)
-		return &relation{cols: cols, rows: func(cx *env) ([][]any, error) {
-			lrows, err := left.rows(cx)
-			if err != nil {
-				return nil, err
-			}
-			rrows, err := right.rows(cx)
-			if err != nil {
-				return nil, err
-			}
-			en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
-			var out [][]any
-			steps := 0
-			buf := make([]any, len(cols))
-			for _, l := range lrows {
-				if err := cx.ctx.Err(); err != nil {
-					return nil, err
-				}
-				copy(buf, l)
-				matched := false
-				for _, r := range rrows {
-					if steps++; steps&0xfff == 0 {
-						if err := cx.ctx.Err(); err != nil {
-							return nil, err
-						}
-					}
-					if len(out) > maxJoinRows {
-						return nil, pgerr.New(pgerr.ProgramLimitExceeded,
-							"join produced more than %d intermediate rows", maxJoinRows)
-					}
-					copy(buf[nLeft:], r)
-					en.row = buf
-					ok, err := matches(on, en)
-					if err != nil {
-						return nil, err
-					}
-					if ok {
-						matched = true
-						out = append(out, buf)
-						buf = make([]any, len(cols))
-						copy(buf, l)
-					}
-				}
-				// A left join keeps unmatched left rows, padded with NULLs.
-				if outer && !matched {
-					padded := make([]any, len(cols))
-					copy(padded, l)
-					out = append(out, padded)
-				}
-			}
-			return out, nil
-		}}, nil
-	}
-	return nil, pgerr.New(pgerr.InternalError, "unhandled FROM item %T", te)
+	// root is the plan as a tree, for EXPLAIN.
+	root *planNode
 }
 
 func (t *table) scopeCols(alias string) []scopeCol {
@@ -155,21 +50,42 @@ type sortKey struct {
 }
 
 func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*selectPlan, error) {
-	// FROM. Without one a query produces exactly one row with no columns.
-	rel := &relation{rows: func(*env) ([][]any, error) { return [][]any{nil}, nil }}
+	// FROM and WHERE are planned together: where each condition is
+	// applied, how each table is read and in what order they are joined
+	// is the planner's business (plan.go). What comes back is a plan
+	// producing the rows that satisfy WHERE, with the columns of the FROM
+	// clause in the order they were written.
+	var fromCols []scopeCol
+	var source *planNode
 	if n.From != nil {
 		var err error
-		if rel, err = s.planFrom(n.From, parent, ptypes); err != nil {
+		if fromCols, source, err = s.planFromWhere(n.From, n.Where, parent, ptypes); err != nil {
 			return nil, err
 		}
+	} else {
+		// Without FROM a query produces exactly one row with no columns,
+		// or none if WHERE says so.
+		cond, err := (&binder{sess: s, scope: &scope{parent: parent}, ptypes: ptypes}).bindWhere(n.Where, "WHERE")
+		if err != nil {
+			return nil, err
+		}
+		source = &planNode{op: "Result", rows: 1, cost: 0.01}
+		if n.Where != nil {
+			source.lines = []string{"One-Time Filter: " + sql.FormatExpr(n.Where)}
+		}
+		source.run = func(cx *env) ([][]any, error) {
+			ok, err := matches(cond, &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked})
+			if err != nil || !ok {
+				return nil, err
+			}
+			return [][]any{nil}, nil
+		}
 	}
-	sc := &scope{cols: rel.cols, parent: parent}
+	sc := &scope{cols: fromCols, parent: parent}
 	b := &binder{sess: s, scope: sc, ptypes: ptypes}
-
-	where, err := b.bindWhere(n.Where, "WHERE")
-	if err != nil {
-		return nil, err
-	}
+	// The rows arrive already filtered.
+	var where evalFn
+	var err error
 
 	// Expand "*" and "t.*" into the columns they stand for.
 	type item struct {
@@ -340,13 +256,63 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 		return nil, err
 	}
 
+	// The steps after the join, as plan nodes. They all run inside the one
+	// function below; the nodes exist so that EXPLAIN can show them.
+	root := source
+	stage := func(op string, rows float64, lines ...string) *planNode {
+		root = &planNode{op: op, lines: lines, kids: []*planNode{root}, rows: math.Max(rows, 1), cost: root.cost + root.rows*0.1}
+		return root
+	}
+	var aggNode, distinctNode, sortNode, limitNode *planNode
+	if grouped {
+		var lines []string
+		op, rows := "Aggregate", 1.0
+		if len(groupExprs) > 0 {
+			op, rows = "HashAggregate", source.rows/10
+			lines = append(lines, "Group Key: "+exprCSV(groupExprs))
+		}
+		if n.Having != nil {
+			lines = append(lines, "Filter: "+sql.FormatExpr(n.Having))
+		}
+		aggNode = stage(op, rows, lines...)
+	}
+	if n.Distinct {
+		distinctNode = stage("Unique", root.rows/2)
+	}
+	if len(n.OrderBy) > 0 {
+		sortExprs := make([]sql.Expr, len(n.OrderBy))
+		for i, o := range n.OrderBy {
+			sortExprs[i] = o.Expr
+		}
+		sortNode = stage("Sort", root.rows, "Sort Key: "+exprCSV(sortExprs))
+		sortNode.cost += root.rows * math.Log2(root.rows+2) * 0.05
+	}
+	if n.Limit != nil || n.Offset != nil {
+		rows := root.rows
+		if lit, ok := n.Limit.(*sql.Literal); ok && lit.Type.IsInt() {
+			rows = math.Min(rows, float64(lit.Val.(int64)))
+		}
+		limitNode = stage("Limit", rows)
+	}
+	plan.root = root
+
 	nCols, distinct := len(sc.cols), n.Distinct
 	plan.run = func(cx *env) ([][]any, error) {
-		input, err := rel.rows(cx)
+		started := time.Now()
+		input, err := source.exec(cx)
 		if err != nil {
 			return nil, err
 		}
 		en := &env{ctx: cx.ctx, params: cx.params, outer: cx, locked: cx.locked}
+		// done records, for EXPLAIN ANALYZE, that a step has finished and
+		// how many rows it left.
+		done := func(node *planNode, rows int) {
+			if node != nil {
+				node.loops++
+				node.actual += rows
+				node.elapsed += time.Since(started)
+			}
+		}
 
 		type outRow struct {
 			vals []any
@@ -455,6 +421,7 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 			}
 		}
 
+		done(aggNode, len(out))
 		if distinct {
 			seen := make(map[string]struct{}, len(out))
 			kept := out[:0]
@@ -471,6 +438,7 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 			}
 			out = kept
 		}
+		done(distinctNode, len(out))
 
 		if len(keys) > 0 {
 			sort.SliceStable(out, func(i, j int) bool {
@@ -494,6 +462,7 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 			})
 		}
 
+		done(sortNode, len(out))
 		skip, err := offset(cx, 0)
 		if err != nil {
 			return nil, err
@@ -509,6 +478,7 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 		for i := range rows {
 			rows[i] = out[skip+i].vals
 		}
+		done(limitNode, len(rows))
 		return rows, nil
 	}
 	return plan, nil
@@ -582,4 +552,16 @@ func columnName(e sql.Expr) string {
 		return "text"
 	}
 	return "?column?"
+}
+
+func exprCSV(exprs []sql.Expr) string {
+	parts := make([]string, len(exprs))
+	for i, e := range exprs {
+		if _, positional := e.(*colIdx); positional {
+			parts[i] = "*"
+		} else {
+			parts[i] = sql.FormatExpr(e)
+		}
+	}
+	return strings.Join(parts, ", ")
 }

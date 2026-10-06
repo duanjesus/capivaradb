@@ -1,0 +1,130 @@
+-- Milestone 6: the planner, seen through EXPLAIN.
+-- Checked against planner.out by scripts/psql-smoke.sh.
+create table customer (id int primary key, name text not null unique, city text);
+CREATE TABLE
+create table orders (id int primary key, customer_id int not null, total int not null);
+CREATE TABLE
+create index orders_customer on orders (customer_id);
+CREATE INDEX
+insert into customer values (1, 'Ana', 'Recife'), (2, 'Bia', 'Recife'), (3, 'Caio', 'Natal'), (4, 'Duda', 'Natal');
+INSERT 0 4
+insert into orders values
+    (10, 1, 50), (11, 1, 70), (12, 2, 20), (13, 2, 90), (14, 2, 10),
+    (15, 3, 35), (16, 3, 60), (17, 1, 15), (18, 4, 80), (19, 2, 45),
+    (20, 1, 25), (21, 3, 55), (22, 4, 65), (23, 2, 30), (24, 1, 95);
+INSERT 0 15
+-- Enough rows, and enough different customers, for an index to be worth
+-- using: 15 orders become 480, 4 customers become 128.
+insert into orders select id + 100, customer_id + 10, total from orders;
+INSERT 0 15
+insert into orders select id + 200, customer_id + 20, total from orders;
+INSERT 0 30
+insert into orders select id + 400, customer_id + 40, total from orders;
+INSERT 0 60
+insert into orders select id + 800, customer_id + 80, total from orders;
+INSERT 0 120
+insert into orders select id + 1600, customer_id + 160, total from orders;
+INSERT 0 240
+insert into customer select distinct customer_id, 'Cliente ' || customer_id, 'Olinda' from orders where customer_id > 4;
+INSERT 0 124
+analyze;
+ANALYZE
+-- The primary key finds one row without reading the table.
+explain select * from orders where id = 17;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Index Scan using orders_pkey on orders  (cost=4.20 rows=1)
+   Index Cond: (id = 17)
+(2 rows)
+
+-- A secondary index; the condition it cannot use stays as a filter.
+explain select * from orders where customer_id = 2 and total > 40;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Index Scan using orders_customer on orders  (cost=18.00 rows=2)
+   Index Cond: (customer_id = 2)
+   Filter: (total > 40)
+(3 rows)
+
+-- Nothing to go on: a sequential scan.
+explain select * from orders where total > 40;
+                 QUERY PLAN                 
+--------------------------------------------
+ Seq Scan on orders  (cost=480.00 rows=311)
+   Filter: (total > 40)
+(2 rows)
+
+-- A join written orders-first. The planner starts from the one customer
+-- asked for, found through the unique index on its name, and looks its
+-- orders up through the index on customer_id.
+explain select c.name, o.total
+from orders o join customer c on c.id = o.customer_id
+where c.name = 'Bia';
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Nested Loop  (cost=28.75 rows=4)
+   ->  Index Scan using customer_name_key on customer c  (cost=7.00 rows=1)
+         Index Cond: (c.name = 'Bia')
+   ->  Index Scan using orders_customer on orders o  (cost=18.00 rows=4)
+         Index Cond: (c.id = o.customer_id)
+(5 rows)
+
+-- The same query with the planner's switches off: the plan it rejected.
+set enable_indexscan = off;
+SET
+set join_collapse_limit = 1;
+SET
+explain select c.name, o.total
+from orders o join customer c on c.id = o.customer_id
+where c.name = 'Bia';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Nested Loop  (cost=731.75 rows=4)
+   Join Filter: (c.id = o.customer_id)
+   ->  Seq Scan on orders o  (cost=480.00 rows=480)
+   ->  Seq Scan on customer c  (cost=128.00 rows=1)
+         Filter: (c.name = 'Bia')
+(5 rows)
+
+set enable_indexscan = on;
+SET
+set join_collapse_limit = 8;
+SET
+-- EXPLAIN ANALYZE runs the query and shows what each step really did.
+explain (analyze, timing off)
+select c.city, count(*), sum(o.total)
+from customer c left join orders o on o.customer_id = c.id
+where c.city = 'Recife'
+group by c.city
+order by 2 desc;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Sort  (cost=901.26 rows=4) (actual rows=1 loops=1)
+   Sort Key: 2
+   ->  HashAggregate  (cost=900.27 rows=4) (actual rows=1 loops=1)
+         Group Key: c.city
+         ->  Nested Loop Left Join  (cost=896.00 rows=43) (actual rows=10 loops=1)
+               Join Filter: (o.customer_id = c.id)
+               ->  Seq Scan on customer c  (cost=128.00 rows=43) (actual rows=2 loops=1)
+                     Filter: (c.city = 'Recife')
+               ->  Index Scan using orders_customer on orders o  (cost=18.00 rows=4) (actual rows=10 loops=2)
+                     Index Cond: (o.customer_id = c.id)
+(10 rows)
+
+-- Updates and deletes find their rows the same way.
+explain (costs off) update orders set total = total + 1 where id = 10;
+                  QUERY PLAN                  
+----------------------------------------------
+ Update on orders
+   ->  Index Scan using orders_pkey on orders
+         Index Cond: (id = 10)
+(3 rows)
+
+explain (costs off) delete from orders where customer_id = 2;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Delete on orders
+   ->  Index Scan using orders_customer on orders
+         Index Cond: (customer_id = 2)
+(3 rows)
+

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
@@ -15,6 +16,9 @@ type prepared struct {
 	paramOIDs []uint32
 	cols      []pgwire.Column
 	run       func(ctx context.Context, params []any) (*result, error)
+	// plan is the statement's plan, for EXPLAIN; nil for statements that
+	// have none.
+	plan *planNode
 }
 
 func (p *prepared) ParamOIDs() []uint32      { return p.paramOIDs }
@@ -137,7 +141,7 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &prepared{cols: plan.cols, run: func(ctx context.Context, params []any) (*result, error) {
+		return &prepared{cols: plan.cols, plan: plan.root, run: func(ctx context.Context, params []any) (*result, error) {
 			rows, err := s.read(func() ([][]any, error) {
 				return plan.run(&env{ctx: ctx, params: params})
 			})
@@ -207,6 +211,10 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 		}}, nil
 	case *sql.Show:
 		return s.buildShow(n)
+	case *sql.Analyze:
+		return s.buildAnalyze(n)
+	case *sql.Explain:
+		return s.buildExplain(n, ptypes)
 	case *sql.Vacuum:
 		return s.buildVacuum(n)
 	}
@@ -494,15 +502,19 @@ func (s *Session) buildUpdate(n *sql.Update, ptypes []sql.Type) (*prepared, erro
 	if err != nil {
 		return nil, err
 	}
+	target, err := s.planTarget("Update", t, n.Table, n.Where, ptypes)
+	if err != nil {
+		return nil, err
+	}
 
-	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
+	return &prepared{plan: target.node, run: func(ctx context.Context, params []any) (*result, error) {
 		return s.write(ctx, func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
 			// The rows are read in full before any is changed: an updated
 			// row may move in the tree, and must not be met a second time.
-			rows, err := s.db.scan(t, s.snap)
+			rows, err := target.fetch(&env{ctx: ctx, params: params, locked: true})
 			if err != nil {
 				return "", err
 			}
@@ -544,13 +556,17 @@ func (s *Session) buildDelete(n *sql.Delete, ptypes []sql.Type) (*prepared, erro
 	if err != nil {
 		return nil, err
 	}
+	target, err := s.planTarget("Delete", t, n.Table, n.Where, ptypes)
+	if err != nil {
+		return nil, err
+	}
 
-	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
+	return &prepared{plan: target.node, run: func(ctx context.Context, params []any) (*result, error) {
 		return s.write(ctx, func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
-			rows, err := s.db.scan(t, s.snap)
+			rows, err := target.fetch(&env{ctx: ctx, params: params, locked: true})
 			if err != nil {
 				return "", err
 			}
@@ -719,6 +735,10 @@ func (db *DB) unregister(t *table, ch *changes) error {
 		if err := db.forget('i', ix.name, ch); err != nil {
 			return err
 		}
+	}
+	// Statistics go with the table.
+	if err := db.forget('s', t.name, ch); err != nil {
+		return err
 	}
 	if err := db.forget('t', t.name, ch); err != nil {
 		return err
@@ -901,4 +921,67 @@ func (s *Session) buildDropIndex(n *sql.DropIndex) (*prepared, error) {
 			return "DROP INDEX", nil
 		})
 	}}, nil
+}
+
+// buildAnalyze gathers planner statistics for one table or for all.
+func (s *Session) buildAnalyze(n *sql.Analyze) (*prepared, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
+			names := s.db.tableNames()
+			if n.Table != "" {
+				if _, err := s.db.lookup(sql.TableRef{Name: n.Table, Pos: n.Pos}); err != nil {
+					return "", err
+				}
+				names = []string{n.Table}
+			}
+			for _, name := range names {
+				t := s.db.tables[name]
+				st, err := s.db.analyze(t, s.snap)
+				if err != nil {
+					return "", err
+				}
+				if err := s.db.storeStats(t, st, ch); err != nil {
+					return "", err
+				}
+			}
+			return "ANALYZE", nil
+		})
+	}}, nil
+}
+
+// buildExplain shows the plan of a statement. With ANALYZE the statement is
+// run first — really run, changes and all — and the plan is annotated with
+// what each step actually did.
+func (s *Session) buildExplain(n *sql.Explain, ptypes []sql.Type) (*prepared, error) {
+	inner, err := s.build(n.Stmt, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	if inner.plan == nil {
+		return nil, pgerr.New(pgerr.FeatureNotSupported, "EXPLAIN is not supported for this kind of statement").At(n.Pos)
+	}
+	opt := explainOptions{analyze: n.Analyze, costs: !n.NoCosts, timing: !n.NoTiming}
+	return &prepared{
+		cols: []pgwire.Column{{Name: "QUERY PLAN", OID: pgwire.OIDText}},
+		run: func(ctx context.Context, params []any) (*result, error) {
+			inner.plan.reset()
+			var elapsed time.Duration
+			if n.Analyze {
+				start := time.Now()
+				if _, err := inner.run(ctx, params); err != nil {
+					return nil, err
+				}
+				elapsed = time.Since(start)
+			}
+			lines := inner.plan.explain(opt)
+			if n.Analyze && opt.timing {
+				lines = append(lines, fmt.Sprintf("Execution Time: %.3f ms", float64(elapsed.Microseconds())/1000))
+			}
+			rows := make([][]any, len(lines))
+			for i, line := range lines {
+				rows[i] = []any{line}
+			}
+			return &result{rows: rows, tag: "EXPLAIN"}, nil
+		},
+	}, nil
 }

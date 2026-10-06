@@ -3,6 +3,8 @@
 select1.test 1031 1031
 select2.test 1031 1031
 select3.test 3351 3351
+select4.test 2857 3857
+select5.test 1436 1436
 evidence/in1.test 128 132
 evidence/in2.test 45 53
 evidence/slt_lang_aggfunc.test 5 5

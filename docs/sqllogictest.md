@@ -25,22 +25,23 @@ if any pass count drops below `compat/slt/baseline.txt`.
   small tables, integers, floats and text. They say nothing about
   durability, concurrency or performance.
 
-## Not in the regular run
+## What the planner changed
 
-Two scripts are measured separately because they need what the engine does
-not have yet. They are kept out of CI only because of how long the failures
-take to time out.
+Two scripts join many tables at once and could not be run to completion
+before milestone 6: joins ran as nested loops in the order written and
+the `WHERE` clause was applied only at the end, so a query like
+`FROM t1, t2, ... t15 WHERE ...` built a cross product of fifteen tables
+before discarding almost all of it. They were measured with a 300 ms limit
+per query; the planner made the limit irrelevant.
 
-| Script | Records | Passed | Why the rest fail |
-|---|---:|---:|---|
-| `select4.test` | 3857 | 1506 (39.0%) | 1000 use `UNION`/`EXCEPT`/`INTERSECT`, which are not implemented; 1351 time out (300 ms limit) |
-| `select5.test` | 1436 | 739 (51.5%) | 697 time out (300 ms limit) |
+| Script | Records | Before the planner | With the planner |
+|---|---:|---|---|
+| `select4.test` | 3857 | 1506 passed (39.0%) in 441 s; 1351 timed out | 2857 passed (74.1%) in 2 s; none time out |
+| `select5.test` | 1436 | 739 passed (51.5%) in 217 s; 697 timed out | **1436 passed (100%)** in 1 s |
 
-The timeouts are queries like `FROM t1, t2, t3, t4, t5, t6 WHERE ...`. Joins
-run as nested loops in the order written and the `WHERE` clause is applied
-only at the end, so the full cross product is built first. Pushing
-predicates down and choosing a join order is the planner's job (milestone
-6); these two scripts are its benchmark.
+Every record `select4.test` still fails uses `UNION`, `EXCEPT` or
+`INTERSECT`, which are not implemented. Both scripts are now part of the
+regular run below.
 
 ## Regular run
 
@@ -49,6 +50,8 @@ predicates down and choosing a join order is the planner's job (milestone
 | `select1.test` | 1031 | 1031 | 100.00% |
 | `select2.test` | 1031 | 1031 | 100.00% |
 | `select3.test` | 3351 | 3351 | 100.00% |
+| `select4.test` | 3857 | 2857 | 74.07% |
+| `select5.test` | 1436 | 1436 | 100.00% |
 | `evidence/in1.test` | 132 | 128 | 96.97% |
 | `evidence/in2.test` | 53 | 45 | 84.91% |
 | `evidence/slt_lang_aggfunc.test` | 5 | 5 | 100.00% |
@@ -65,10 +68,13 @@ predicates down and choosing a join order is the planner's job (milestone
 | `random/expr/slt_good_0.test` | 10012 | 10012 | 100.00% |
 | `random/aggregates/slt_good_0.test` | 9130 | 9130 | 100.00% |
 | `random/groupby/slt_good_0.test` | 9050 | 9050 | 100.00% |
-| **Total** | **104121** | **104106** | **99.99%** |
+| **Total** | **109414** | **108399** | **99.07%** |
 
 | Failures | Reason | Example |
 |---:|---|---|
+| 519 | 0A000 UNION is not supported | `SELECT c4 FROM t4 WHERE d4 in (481,449,617,989,356,681,136,86,821,968,249,628,889,794) OR a4 in (952,337,373,7...` |
+| 249 | 0A000 EXCEPT is not supported | `SELECT e1 FROM t1 WHERE a1 in (767,433,637,363,776,109,451) OR c1 in (683,531,654,246,3,876,309,284) OR (b1=73...` |
+| 232 | 0A000 INTERSECT is not supported | `SELECT c8 FROM t8 WHERE d8 in (883,523,81,667,20,690,124,2) OR e8 in (608,874,592,632) OR c8 in (461,461,501,9...` |
 | 10 | 42601 syntax error at or near "…" | `SELECT x'303132' IN (SELECT * FROM t1)` |
 | 2 | 22P02 invalid input syntax for type integer: "…" | `SELECT 'hello' IN (SELECT * FROM t1)` |
 | 2 | wrong result | `SELECT count(*) FROM t1 WHERE x=4` |
@@ -76,8 +82,12 @@ predicates down and choosing a join order is the planner's job (milestone
 
 ## The records that fail
 
-All fifteen are places where the scripts expect SQLite's behaviour and
-PostgreSQL itself answers differently, so they are left as they are:
+**In `select4.test`, 1000 records** use `UNION`, `EXCEPT` or `INTERSECT`,
+which are not implemented yet (they are planned with the executor,
+milestone 7).
+
+**The other fifteen** are places where the scripts expect SQLite's behaviour
+and PostgreSQL itself answers differently, so they are left as they are:
 
 - `1 IN ()` — an empty list is a syntax error in PostgreSQL.
 - `x'303132'` — SQLite's blob literal.

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1595" height="650" viewBox="0 0 1595 650" role="img" aria-label="planner tests: any plan, same answer">
+<rect width="1595" height="650" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h1575 a10 10 0 0 1 10 10v24 h-1595 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="797" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">planner tests: any plan, same answer</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ go test ./internal/engine -v -run &#34;TestAccessPath|TestIndexScan|TestPredicatePushdown|TestJoinOrder|TestLeftJoinPlans|TestExplain|TestStatistics|TestPlansAgree|TestSubqueryConditions&#34;</text>
+<text x="18" y="86" fill="#e6edf3">    old: begin isolation level repeatable read                          BEGIN</text>
+<text x="18" y="106" fill="#e6edf3">    old: select id, v from item where owner = 2 order by id             6|0;7|0;8|0</text>
+<text x="18" y="126" fill="#e6edf3">    a:  begin                                                          BEGIN</text>
+<text x="18" y="146" fill="#e6edf3">    a:  update item set v = 1 where id = 7                             UPDATE 1</text>
+<text x="18" y="166" fill="#e6edf3">    a:  delete from item where id = 8                                  DELETE 1</text>
+<text x="18" y="186" fill="#e6edf3">    a:  insert into item values (1000, 2, 9)                           INSERT 0 1</text>
+<text x="18" y="206" fill="#e6edf3">    b:  select v from item where id = 7                                0</text>
+<text x="18" y="226" fill="#e6edf3">    b:  select id, v from item where owner = 2 order by id             6|0;7|0;8|0</text>
+<text x="18" y="246" fill="#e6edf3">    a:  select id, v from item where owner = 2 order by id             6|0;7|1;1000|9</text>
+<text x="18" y="266" fill="#e6edf3">    a:  commit                                                         COMMIT</text>
+<text x="18" y="286" fill="#e6edf3">    b:  select id, v from item where owner = 2 order by id             6|0;7|1;1000|9</text>
+<text x="18" y="306" fill="#e6edf3">    old: select v from item where id = 7                                0</text>
+<text x="18" y="326" fill="#e6edf3">    old: select id, v from item where owner = 2 order by id             6|0;7|0;8|0</text>
+<text x="18" y="346" fill="#e6edf3">    old: commit                                                         COMMIT</text>
+<text x="18" y="366" fill="#7ee787">--- PASS: TestIndexScanRespectsSnapshot</text>
+<text x="18" y="386" fill="#7ee787">--- PASS: TestAccessPathChoice</text>
+<text x="18" y="406" fill="#7ee787">--- PASS: TestIndexScanResults</text>
+<text x="18" y="426" fill="#7ee787">--- PASS: TestPredicatePushdown</text>
+<text x="18" y="446" fill="#7ee787">--- PASS: TestJoinOrder</text>
+<text x="18" y="466" fill="#7ee787">--- PASS: TestLeftJoinPlans</text>
+<text x="18" y="486" fill="#7ee787">--- PASS: TestExplainUpperNodes</text>
+<text x="18" y="506" fill="#7ee787">--- PASS: TestExplainAnalyze</text>
+<text x="18" y="526" fill="#7ee787">--- PASS: TestStatistics</text>
+<text x="18" y="546" fill="#e6edf3">    400 random queries, 246 with results, each run under 4 planner settings: all agree</text>
+<text x="18" y="566" fill="#7ee787">--- PASS: TestPlansAgree</text>
+<text x="18" y="586" fill="#7ee787">--- PASS: TestSubqueryConditionsInJoins</text>
+<text x="18" y="606" fill="#7ee787">PASS</text>
+<text x="18" y="626" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/engine</text>
+</g>
+</svg>

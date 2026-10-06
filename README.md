@@ -10,12 +10,13 @@ logging with crash recovery, MVCC transactions, and a query planner and
 executor. **The core has no dependencies outside the Go standard library**;
 CI fails if one is added.
 
-> **Status: milestone 5 of 7.** The wire protocol, the SQL front end, the
-> storage engine, the write-ahead log and MVCC are done: data lives in
-> B+trees in a page file, a committed transaction survives the server being
-> killed or the power failing, and concurrent transactions are isolated
-> from each other by snapshots. What is left is making queries fast: there
-> is **no query planner yet**, so every query scans. See
+> **Status: milestone 6 of 7.** The wire protocol, the SQL front end, the
+> storage engine, the write-ahead log, MVCC and the query planner are done:
+> data lives in B+trees in a page file, a committed transaction survives
+> the server being killed or the power failing, concurrent transactions are
+> isolated from each other by snapshots, and queries are planned by cost —
+> which index to use, in what order to join. What is left is the executor:
+> joins are still nested loops and every step is held in memory. See
 > [Limitations](#limitations) for exactly what that means.
 
 ![a server killed mid-transaction, and what the next one finds](docs/screenshots/m4-recovery.svg)
@@ -29,8 +30,8 @@ CI fails if one is added.
 | 3 | Storage engine: slotted pages, buffer pool, B+tree tables and secondary indexes, persistent catalog | **done** |
 | 4 | Write-ahead log, ARIES-style recovery, crash tests on a simulated disk and by killing the process | **done** |
 | 5 | MVCC: snapshot isolation, waiting writers, deadlock detection, vacuum, isolation tests | **done** |
-| 6 | Cost-based planner: index selection, join ordering, `EXPLAIN` | next |
-| 7 | Volcano executor: hash and merge joins, aggregation, external sort, set operations | planned |
+| 6 | Cost-based planner: predicate pushdown, index selection, join ordering, statistics, `EXPLAIN ANALYZE` | **done** |
+| 7 | Volcano executor: hash and merge joins, aggregation, external sort, set operations | next |
 
 Details in [docs/roadmap.md](docs/roadmap.md).
 
@@ -84,6 +85,7 @@ offline; `-nosync` trades the power-failure guarantee for speed.
   `DROP TABLE`, `DROP INDEX`.
 - **Transactions:** `BEGIN` / `COMMIT` / `ROLLBACK`, with real rollback
   (including of DDL) and statement atomicity.
+- **Utility:** `EXPLAIN [ANALYZE]`, `ANALYZE`, `VACUUM`.
 - **Types:** `integer`, `bigint`, `double precision`, `text`, `boolean`.
 
 The semantics follow PostgreSQL where the two could differ: what `GROUP BY`
@@ -117,6 +119,27 @@ the repository — and all of sqllogictest — goes through the pager and the
 B+tree.
 
 ![a second server process reading what the first one wrote](docs/screenshots/m3-restart-after.svg)
+
+### Query planning ([details](docs/planner.md))
+
+- Conditions are checked as early as they can be: in the scan of the table
+  they mention, or in the first join that has all their tables.
+- A table is read through its primary key or an index when that is
+  estimated to be cheaper than scanning it; `UPDATE` and `DELETE` find
+  their rows the same way.
+- Joins are reordered: exactly, by dynamic programming, up to ten tables;
+  greedily beyond. A join can look its inner rows up through an index.
+- Estimates come from statistics gathered by `ANALYZE`, which also runs by
+  itself as tables change.
+- `EXPLAIN` shows the plan and `EXPLAIN ANALYZE` what running it really
+  did, in PostgreSQL's format.
+
+![EXPLAIN in psql: the chosen plan, and the same query with the planner switched off](docs/screenshots/m6-explain.svg)
+
+Measured on 20 000 orders, against the plan the planner rejected
+([benchmarks](docs/benchmarks.md)): a lookup by primary key takes 6 µs
+instead of 4.8 ms, and a three-table join for one customer 144 µs instead
+of 5.4 ms.
 
 ### Isolation ([details](docs/mvcc.md))
 
@@ -165,14 +188,15 @@ skew; `SHOW transaction_isolation` therefore answers `repeatable read`.
 
 | What | How | Where |
 |------|-----|-------|
-| Compatibility of results | **104 121 sqllogictest records, 99.99% passing**; CI fails on any regression | [docs/sqllogictest.md](docs/sqllogictest.md) |
+| Compatibility of results | **109 414 sqllogictest records, 99.07% passing**; CI fails on any regression | [docs/sqllogictest.md](docs/sqllogictest.md) |
 | The parser | A corpus pinned to its canonical form, a parse → print → parse round trip, and a fuzzer that checks both on arbitrary input | [internal/sql](internal/sql) |
 | The binder and executor | Table-driven tests of every construct, including the error cases | [internal/engine](internal/engine) |
 | The B+tree and buffer pool | Long random operation sequences checked against a map, with a 16-page pool to force eviction; a fuzzer; invariants verified throughout; no page may leak | [internal/storage](internal/storage) |
 | **Crash recovery** | A simulated disk that loses any subset of unsynced writes and tears the rest: ~800 crashes per run under a random workload, some during recovery itself, each compared with a shadow database | [docs/recovery.md](docs/recovery.md) |
 | Crash recovery, for real | A writer process killed with `SIGKILL` a dozen times; every acknowledged commit must be there, whole | [internal/engine](internal/engine), [compat/restart](compat/restart) |
+| **The planner** | 400 random queries each run under every combination of the planner's switches: the rows must be identical. Plan tests pin the `EXPLAIN` output of representative queries | [docs/planner.md](docs/planner.md) |
 | **Isolation** | Transcripts of interleaved sessions for each anomaly, deadlocks, unique conflicts and vacuum; concurrent transfers from eight goroutines with readers checking the total at every moment | [docs/mvcc.md](docs/mvcc.md) |
-| The crash and isolation tests themselves | Mutation testing: nineteen ways of breaking the durability and isolation rules, each of which the tests must catch | `scripts/mutation-test.sh` |
+| The tests themselves | Mutation testing: twenty-five ways of breaking the durability and isolation rules and the planner, each of which the tests must catch | `scripts/mutation-test.sh` |
 | Persistence | Restart tests at the engine level; corruption must be detected by checksum | [internal/engine](internal/engine) |
 | Storage integrity under SQL | The consistency checker runs after every engine test and after each sqllogictest script | `DB.Verify` |
 | The protocol | A raw client written in the test from the specification, asserting exact message sequences | [internal/pgwire](internal/pgwire) |
@@ -180,12 +204,21 @@ skew; `SHOW transaction_isolation` therefore answers `repeatable read`.
 | pgx v5 (Go) | Every query execution mode, prepared statements, batches, transactions, cancellation, `database/sql` | [compat/pgx](compat/pgx) |
 | pgjdbc 42.7 (Java) | Typed parameters, server-side prepare threshold, batches, autocommit off | [compat/jdbc](compat/jdbc) |
 
-![sqllogictest report](docs/screenshots/m2-slt.svg)
+![sqllogictest report](docs/screenshots/m6-slt.svg)
 
 The sqllogictest number needs its caveat next to it: it covers one script of
-each family in the corpus, on small in-memory tables. Two harder scripts are
-measured separately and do much worse — 39% and 51% — because they
-need set operations and a planner that do not exist yet.
+each family in the corpus, on small in-memory tables. The rate went *down*
+in milestone 6, from 99.99% to 99.07%, because two harder scripts joined
+the run. Their queries join up to fifteen tables, and before the planner
+most of them timed out:
+
+| Script | Before the planner | With the planner |
+|---|---|---|
+| `select5.test` | 51.5% in 217 s | **100%** in 1 s |
+| `select4.test` | 39.0% in 441 s | 74.1% in 2 s |
+
+All of what `select4.test` still fails needs `UNION`, `EXCEPT` or
+`INTERSECT`, which arrive with the executor.
 [docs/sqllogictest.md](docs/sqllogictest.md) has the full picture.
 
 The fuzzer feeds arbitrary bytes to the parser. It must never panic, and
@@ -208,7 +241,12 @@ rule is broken in turn and the suite must notice. It found three blind
 spots in the crash tests while they were being written, all described in
 [docs/recovery.md](docs/recovery.md).
 
-![mutation testing of the crash and isolation tests](docs/screenshots/m5-mutation.svg)
+![mutation testing](docs/screenshots/m6-mutation.svg)
+
+The planner is tested through the one property it must never break: any
+plan, same answer.
+
+![planner tests](docs/screenshots/m6-planner-tests.svg)
 
 Isolation is tested with transcripts: several sessions scripted one
 statement at a time, with the expected result of each — including that a
@@ -221,8 +259,10 @@ thousands of entries kept correct through tens of thousands of evictions:
 
 ![storage engine tests](docs/screenshots/m3-storage-tests.svg)
 
-B+tree benchmarks, with their conditions and caveats, are in
+Benchmarks, with their conditions and caveats, are in
 [docs/benchmarks.md](docs/benchmarks.md).
+
+![the chosen plan against the rejected one](docs/screenshots/m6-bench.svg)
 
 Screenshots from the first milestone (protocol, JDBC) are in
 [docs/screenshots](docs/screenshots).
@@ -240,6 +280,7 @@ Screenshots from the first milestone (protocol, JDBC) are in
         ┌──────────▼──────────┐
         │   internal/engine   │──▶ internal/sql: lexer, parser, printer
         │                     │  binder: scopes, types, grouping rules
+        │                     │  planner: pushdown, indexes, join order
         │                     │  executor: materialising, nested loops (for now)
         │                     │  rows ⇄ keys and tuples, catalog
         └──────────┬──────────┘
@@ -266,8 +307,8 @@ bash scripts/slt.sh                    # sqllogictest; downloads the scripts onc
 bash scripts/jdbc-smoke.sh             # pgjdbc; needs a JDK and curl
 bash scripts/psql-smoke.sh             # psql; uses Docker if psql is not installed
 bash scripts/restart-smoke.sh          # kill the server mid-transaction, recover, read
-bash scripts/mutation-test.sh          # break the durability and isolation rules; the tests must fail
-bash scripts/bench.sh                  # B+tree benchmarks
+bash scripts/mutation-test.sh          # break durability, isolation and planner rules; the tests must fail
+bash scripts/bench.sh                  # B+tree, commit and planner benchmarks
 go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m
 go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m
 ```
@@ -299,17 +340,20 @@ worse than useless.
   [docs/benchmarks.md](docs/benchmarks.md)). The log cannot be discarded
   while a transaction is open, and a single value must fit in half the
   buffer pool.
-- **No planner.** Joins are nested loops in the order written, the `WHERE`
-  clause is applied after the joins, and every scan is a full scan. A join
-  that would materialise more than two million intermediate rows is refused
-  rather than allowed to exhaust memory. Correlated subqueries are
-  re-executed for every outer row. (Milestones 6 and 7.)
-- **Indexes are maintained but not used by queries.** They enforce
-  uniqueness with a B+tree lookup; no `SELECT` reads through one until the
-  planner can choose to. (Milestone 6.)
-- **Queries hold whole tables in memory.** The executor materialises every
-  table it reads, so the buffer pool bounds the storage engine's memory but
-  not a query's. (Milestone 7.)
+- **Joins are nested loops only.** With an index on the inner side that is
+  fast; without one, two large tables are compared pair by pair. There are
+  no hash or merge joins yet. A join that would materialise more than two
+  million intermediate rows is refused rather than allowed to exhaust
+  memory. (Milestone 7.)
+- **The planner is simple.** Plans are left-deep and nothing is reordered
+  across a `LEFT JOIN`. Statistics are row counts, distinct values and
+  numeric ranges — no histograms — so estimates on skewed data can be far
+  off. Indexes are not used for `ORDER BY`, `IN` lists or `OR`. Correlated
+  subqueries are re-executed for every outer row, never turned into joins.
+  A prepared statement keeps the plan it was given.
+- **Queries hold their intermediate results in memory.** Every step of a
+  plan materialises its output, so the buffer pool bounds the storage
+  engine's memory but not a query's. (Milestone 7.)
 - **Storage details:** a key (primary key or indexed columns) may be at most
   1024 bytes; pages are freed when empty but never merged; the file does
   not shrink; an `UPDATE` rewrites the whole row and its index entries.
@@ -334,7 +378,7 @@ worse than useless.
 cmd/capivaradb     the server binary
 internal/pgwire    PostgreSQL wire protocol
 internal/sql       lexer, AST, parser, printer
-internal/engine    binder, executor, MVCC, row and key encoding, catalog
+internal/engine    binder, planner, executor, MVCC, row and key encoding, catalog
 internal/storage   page file, buffer pool, B+tree, write-ahead log, recovery,
                    consistency checker, simulated disk for crash tests
 internal/pgerr     errors with SQLSTATE codes

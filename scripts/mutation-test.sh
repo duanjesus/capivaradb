@@ -17,7 +17,8 @@ RECOVERY=internal/storage/recovery.go
 MVCC=internal/engine/mvcc.go
 STORE=internal/engine/store.go
 DB=internal/engine/db.go
-FILES=("$PAGER" "$RECOVERY" "$MVCC" "$STORE" "$DB")
+PLAN=internal/engine/plan.go
+FILES=("$PAGER" "$RECOVERY" "$MVCC" "$STORE" "$DB" "$PLAN")
 
 BACKUP="$CACHE/mutation"
 mkdir -p "$BACKUP"
@@ -124,6 +125,30 @@ mutant "vacuum removes versions that an open snapshot can still see" "$STORE" \
 mutant "a transaction's versions become visible to others before it commits" "$MVCC" \
   's|^\t\t\tif tx != self {$|\t\t\tif false {|'
 
+
+echo
+echo "== planner =="
+# The planner may choose any plan, never a different answer.
+TESTS=(go test -count=1 -timeout 120s -run 'TestIndexScanResults|TestLeftJoinPlans|TestPlansAgree|TestJoins|TestSubquer|TestIndexScanRespects' ./internal/engine)
+baseline
+
+mutant "a WHERE condition on the nullable side of a LEFT JOIN is pushed below the join" "$PLAN" \
+  's|^\t\tif !c.opaque \&\& inside(c.cols, loff, lend) {$|\t\tif !c.opaque {|'
+
+mutant "a LEFT JOIN drops the rows that have no match" "$PLAN" \
+  's|if !matched {$|if false {|'
+
+mutant "a condition with a subquery is applied before all tables are joined" "$PLAN" \
+  's|^\t\tif c.opaque {$|\t\tif false {|'
+
+mutant "an index scan returns versions the snapshot cannot see" "$STORE" \
+  's|^\t\tif sn != nil \&\& !sn.visible(xmin, binary.BigEndian.Uint64(val)) {$|\t\tif false {|'
+
+mutant "an inclusive upper bound of an index range is treated as exclusive" "$STORE" \
+  's|^\t\t\t\tif !kb.hiIncl {$|\t\t\t\tif true {|'
+
+mutant "a join condition is not checked when the inner table is reached through an index" "$PLAN" \
+  's|^\t\t\t\t\t\t\tok, err = allMatch(evals, en)$|\t\t\t\t\t\t\tok = true|'
 echo
 if [ "$survivors" -gt 0 ]; then
   echo "$survivors mutant(s) survived"

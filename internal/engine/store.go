@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -282,6 +283,8 @@ func (t *table) insertRow(vals []any, ch *changes) error {
 	if err := t.checkUnique(ch.db, vals, me); err != nil {
 		return err
 	}
+	t.delta++
+	t.mods++
 	return t.storeVersion(base, vals, ch)
 }
 
@@ -323,6 +326,7 @@ func (t *table) retire(v rowRef, ch *changes) error {
 
 // updateRow replaces the version old with a new one holding vals.
 func (t *table) updateRow(old rowRef, vals []any, ch *changes) error {
+	t.mods++
 	if err := t.checkNotNull(vals); err != nil {
 		return err
 	}
@@ -348,6 +352,8 @@ func (t *table) updateRow(old rowRef, vals []any, ch *changes) error {
 
 // deleteRow deletes the version old.
 func (t *table) deleteRow(old rowRef, ch *changes) error {
+	t.delta--
+	t.mods++
 	return t.retire(old, ch)
 }
 
@@ -497,7 +503,7 @@ func (db *DB) loadCatalog() error {
 		name string
 		rec  []byte
 	}
-	var tables, indexes []entry
+	var tables, indexes, stats []entry
 	c := db.catalog.Seek(nil)
 	for {
 		key, rec, ok := c.Next()
@@ -508,9 +514,12 @@ func (db *DB) loadCatalog() error {
 			return fmt.Errorf("corrupt catalog: unexpected key %q", key)
 		}
 		e := entry{string(key[2:]), rec}
-		if key[0] == 't' {
+		switch key[0] {
+		case 't':
 			tables = append(tables, e)
-		} else {
+		case 's':
+			stats = append(stats, e)
+		default:
 			indexes = append(indexes, e)
 		}
 	}
@@ -567,6 +576,13 @@ func (db *DB) loadCatalog() error {
 		}
 		t.indexes = append(t.indexes, ix)
 		db.indexes[ix.name] = ix
+	}
+	for _, e := range stats {
+		// Statistics that do not fit the table are ignored rather than
+		// trusted: the planner can do without, and ANALYZE replaces them.
+		if t := db.tables[e.name]; t != nil {
+			t.stats = decodeStats(e.rec, len(t.cols))
+		}
 	}
 	return nil
 }
@@ -688,4 +704,144 @@ func (db *DB) tableNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func (w *recWriter) float(v float64) {
+	w.b = binary.BigEndian.AppendUint64(w.b, math.Float64bits(v))
+}
+
+func (r *recReader) float() float64 {
+	if len(r.b) < 8 {
+		r.bad = true
+		return 0
+	}
+	v := math.Float64frombits(binary.BigEndian.Uint64(r.b))
+	r.b = r.b[8:]
+	return v
+}
+
+// keyBounds describes a range of an index (or of a table's primary key) to
+// read: every entry whose leading columns encode to prefix and whose next
+// column lies between lo and hi. A nil bound is open.
+//
+// The bounds only have to be loose enough: whoever asks for a range checks
+// the rows it gets against the full condition anyway.
+type keyBounds struct {
+	prefix         []byte
+	lo, hi         []byte
+	loIncl, hiIncl bool
+}
+
+// rangeScan returns the versions of t the snapshot sees whose key in ix (or
+// in the table itself, if ix is nil) falls within the bounds, in key order.
+func (db *DB) rangeScan(t *table, ix *index, sn *snapshot, kb keyBounds, locked bool) ([]rowRef, error) {
+	if !locked {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+	}
+	if err := db.stillCurrent(t); err != nil {
+		return nil, err
+	}
+	tree := t.tree
+	if ix != nil {
+		tree = ix.tree
+	}
+	var rows []rowRef
+	start := append(append([]byte(nil), kb.prefix...), kb.lo...)
+	if kb.lo == nil && kb.hi != nil {
+		// NULL sorts before every value and satisfies no comparison:
+		// a range with only an upper bound starts after the NULLs.
+		start = append(start, 1)
+	}
+	c := tree.Seek(start)
+	for {
+		key, val, ok := c.Next()
+		if !ok || !bytes.HasPrefix(key, kb.prefix) {
+			break
+		}
+		rest := key[len(kb.prefix):]
+		if kb.lo != nil && !kb.loIncl && bytes.HasPrefix(rest, kb.lo) {
+			continue
+		}
+		if kb.hi != nil {
+			// Encoded values are self-delimiting, so "starts with the
+			// bound" means "equals the bound".
+			if bytes.HasPrefix(rest, kb.hi) {
+				if !kb.hiIncl {
+					break
+				}
+			} else if bytes.Compare(rest, kb.hi) > 0 {
+				break
+			}
+		}
+
+		rowKey := key
+		if ix != nil {
+			// An index entry is the indexed columns followed by the key
+			// of the version it points at, which holds the rest.
+			n, err := keyPartsLen(key, ix.cols, t)
+			if err != nil {
+				return nil, err
+			}
+			rowKey = key[n:]
+			var found bool
+			if val, found, err = t.tree.Get(rowKey); err != nil {
+				return nil, err
+			} else if !found {
+				return nil, fmt.Errorf("index %s has an entry for a row version that does not exist", ix.name)
+			}
+		}
+		if len(rowKey) < versionTagSize || len(val) < 8 {
+			return nil, fmt.Errorf("corrupt row version in table %s", t.name)
+		}
+		_, xmin := splitVersionKey(rowKey)
+		if sn != nil && !sn.visible(xmin, binary.BigEndian.Uint64(val)) {
+			continue
+		}
+		ref, err := t.decodeVersion(rowKey, val)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, ref)
+	}
+	return rows, c.Err()
+}
+
+// keyPartsLen returns how many bytes of key the encodings of the given
+// columns take up.
+func keyPartsLen(key []byte, cols []int, t *table) (int, error) {
+	n := 0
+	for _, c := range cols {
+		if n >= len(key) {
+			return 0, fmt.Errorf("corrupt index key in table %s", t.name)
+		}
+		if key[n] == 0 { // NULL
+			n++
+			continue
+		}
+		n++
+		switch t.cols[c].typ {
+		case sql.Bool:
+			n++
+		case sql.Text:
+			// Up to the 0x00 0x01 terminator; 0x00 0xFF is an escaped
+			// zero byte inside the text.
+			for {
+				i := bytes.IndexByte(key[n:], 0)
+				if i < 0 || n+i+1 >= len(key) {
+					return 0, fmt.Errorf("corrupt index key in table %s", t.name)
+				}
+				n += i + 2
+				if key[n-1] == 1 {
+					break
+				}
+			}
+		default:
+			n += 8
+		}
+	}
+	if n > len(key) {
+		return 0, fmt.Errorf("corrupt index key in table %s", t.name)
+	}
+	return n, nil
 }

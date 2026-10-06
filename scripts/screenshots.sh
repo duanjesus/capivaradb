@@ -9,7 +9,7 @@
 # looked like at the time.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4|m5}"
+MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4|m5|m6}"
 OUT="$ROOT/docs/screenshots"
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -135,6 +135,38 @@ m5)
     go test -count=1 ./internal/engine -v -run 'TestConcurrentTransfers|TestVacuum|TestAutoVacuum|TestUnique' 2>&1 |
       grep -E '^(---|    ---|PASS|ok|FAIL)|transfers by' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +[a-z_]+_test.go:[0-9]+: /        /' | fold -s -w 110
   } | shot concurrency "concurrent transfers, unique conflicts, vacuum"
+
+  { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
+    shot mutation "mutation testing: break a rule, the tests must fail"
+  ;;
+
+m6)
+  # EXPLAIN through psql: the chosen plan, then the same query with the
+  # planner's switches off.
+  bash scripts/psql-smoke.sh >/dev/null
+  sed -n '/^-- A join written orders-first/,/^set enable_indexscan = on/p' "$CACHE/psql-planner.out" | sed '$d' |
+    shot explain "psql: the plan chosen, and the plan rejected"
+  sed -n '/^-- The primary key finds/,/^-- A join written orders-first/p' "$CACHE/psql-planner.out" | sed '$d' |
+    shot access-paths "psql: primary key, secondary index, sequential scan"
+  sed -n '/^-- EXPLAIN ANALYZE runs/,$p' "$CACHE/psql-planner.out" |
+    shot explain-analyze "psql: EXPLAIN ANALYZE, and plans of UPDATE and DELETE"
+
+  # The planner tests, with what the random comparison reports.
+  {
+    echo '$ go test ./internal/engine -v -run "TestAccessPath|TestIndexScan|TestPredicatePushdown|TestJoinOrder|TestLeftJoinPlans|TestExplain|TestStatistics|TestPlansAgree|TestSubqueryConditions"'
+    go test -count=1 ./internal/engine -v -run 'TestAccessPath|TestIndexScan|TestPredicatePushdown|TestJoinOrder|TestLeftJoinPlans|TestExplain|TestStatistics|TestPlansAgree|TestSubqueryConditions' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +[a-z_]+_test.go:[0-9]+: /    /' | fold -s -w 110
+  } | shot planner-tests "planner tests: any plan, same answer"
+
+  # sqllogictest: the report of the regular run, without the timing column.
+  { echo '$ scripts/slt.sh'; bash scripts/slt.sh 2>/dev/null | sed -E 's/ +[0-9.]+s$//; s/ +time$//'; } |
+    shot slt "sqllogictest, with the two many-table join scripts"
+
+  {
+    echo '$ go test ./internal/engine -run XXX -bench "PointLookup|SecondaryIndex|UpdateByKey|ThreeTableJoin"'
+    go test ./internal/engine -run XXX -bench 'PointLookup|SecondaryIndex|UpdateByKey|ThreeTableJoin' -benchtime "${BENCHTIME:-2s}" 2>&1 |
+      grep -E '^(cpu|Benchmark)' | sed -E 's/-8 +/  /; s/\t+/  /g'
+  } | shot bench "benchmarks: the chosen plan against the rejected one"
 
   { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
     shot mutation "mutation testing: break a rule, the tests must fail"
