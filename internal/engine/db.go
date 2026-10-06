@@ -11,11 +11,14 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
@@ -32,6 +35,10 @@ const DefaultPoolPages = 4096
 // taken on its own. A larger value means fewer checkpoints and a longer
 // recovery.
 const DefaultCheckpointBytes = 16 << 20
+
+// autoVacuumThreshold is how many dead row versions a table accumulates
+// before it is vacuumed after a commit.
+const autoVacuumThreshold = 2000
 
 // Options configures a database.
 type Options struct {
@@ -66,9 +73,8 @@ type DB struct {
 	tables  map[string]*table
 	indexes map[string]*index
 
-	// nextTx numbers transactions. IDs need not survive a restart: after
-	// recovery no transaction of an earlier run is left in the log.
-	nextTx uint64
+	// txs knows the transactions in progress and the snapshots in use.
+	txs txRegistry
 	// writers holds the sessions with an open transaction that has changed
 	// something.
 	writers map[*Session]bool
@@ -136,7 +142,12 @@ func OpenFiles(file, logFile storage.File, opts Options) (*DB, error) {
 		tables:  make(map[string]*table),
 		indexes: make(map[string]*index),
 		writers: make(map[*Session]bool),
+		txs:     newTxRegistry(),
 	}
+	// Everything in the file was written by transactions that are over,
+	// so every ID it contains must count as past: IDs carry on from the
+	// log position, which is at least as large as any of them.
+	db.txs.last = pager.LSN()
 	if root := pager.CatalogRoot(); root != 0 {
 		db.catalog = storage.OpenTree(pager, root)
 		return db, db.loadCatalog()
@@ -194,6 +205,9 @@ type table struct {
 	// indexes are the secondary indexes, including the ones that back
 	// UNIQUE constraints. The slice is replaced, never modified in place.
 	indexes []*index
+	// dead counts the versions deleted since the table was last vacuumed;
+	// vacuumAt is the count at which it is vacuumed again.
+	dead, vacuumAt int
 }
 
 type column struct {
@@ -238,9 +252,9 @@ func (t *table) colNames(cols []int, sep string) string {
 // changes collects what a statement or a transaction did, so that it can be
 // undone or, at commit, finished.
 type changes struct {
-	db *DB
-	// tx is the transaction's ID in the log; zero until it first changes
-	// something.
+	db   *DB
+	sess *Session
+	// tx is the transaction's ID; zero until it first changes something.
 	tx uint64
 	// undo lists how to reverse each change; rolling back runs it newest
 	// first.
@@ -260,11 +274,22 @@ type undoEntry struct {
 	mem func()
 }
 
-// begin gives the transaction an ID the first time it needs one.
+// begin gives the transaction an ID the first time it needs one, which is
+// when it first changes something: a transaction that only reads never
+// appears in anyone's snapshot.
 func (ch *changes) begin() uint64 {
 	if ch.tx == 0 {
-		ch.db.nextTx++
-		ch.tx = ch.db.nextTx
+		ch.tx = ch.db.startTx()
+		// From now on the session's snapshots must recognise the
+		// transaction's own versions.
+		if s := ch.sess; s != nil {
+			if s.snap != nil {
+				s.snap.self = ch.tx
+			}
+			if s.txSnap != nil {
+				s.txSnap.self = ch.tx
+			}
+		}
 	}
 	return ch.tx
 }
@@ -283,6 +308,14 @@ func (ch *changes) del(tree *storage.Tree, key, old []byte) error {
 	ch.undo = append(ch.undo, undoEntry{lsn: ch.db.pager.LogUndo(rec), rec: rec})
 	_, err := tree.Delete(key)
 	return err
+}
+
+// replace overwrites the value of key in tree, logging how to restore the
+// old one.
+func (ch *changes) replace(tree *storage.Tree, key, old, val []byte) error {
+	rec := storage.UndoRec{Tx: ch.begin(), Root: tree.Root(), Kind: storage.UndoPut, Key: key, Val: old}
+	ch.undo = append(ch.undo, undoEntry{lsn: ch.db.pager.LogUndo(rec), rec: rec})
+	return storageError(tree.Put(key, val))
 }
 
 // createTree allocates a tree that is freed again if the changes are undone.
@@ -325,6 +358,25 @@ type Session struct {
 	failed bool
 	// tx accumulates the changes of the open transaction block.
 	tx changes
+
+	// defaultLevel applies to transactions that do not choose a level;
+	// level is that of the open transaction block.
+	defaultLevel isoLevel
+	level        isoLevel
+	// snap is the snapshot of the statement being executed. Under read
+	// committed it is new for every statement; under repeatable read it
+	// is txSnap, taken by the transaction's first statement and kept
+	// (and held against vacuum) until the transaction ends.
+	snap        *snapshot
+	txSnap      *snapshot
+	releaseSnap func()
+	// started is set once a statement has run in the transaction block,
+	// after which its isolation level can no longer be changed.
+	started bool
+	// blocked is set while a statement waits for another transaction to
+	// end. Nothing depends on it but tests, which need to tell "still
+	// running" from "waiting".
+	blocked atomic.Bool
 }
 
 // NewSession implements pgwire.Handler.
@@ -343,13 +395,9 @@ func (db *DB) NewSession(params map[string]string) (pgwire.Session, error) {
 			"standard_conforming_strings": "on",
 			"search_path":                 "public",
 			"application_name":            params["application_name"],
-			// Honest answer until MVCC lands: statements from other
-			// sessions are visible as soon as they run, committed or not.
-			// Requesting another level is accepted and changes nothing.
-			"transaction_isolation": "read uncommitted",
 		},
 	}
-	s.tx.db = db
+	s.tx = changes{db: db, sess: s}
 	return s, nil
 }
 
@@ -380,8 +428,15 @@ func (s *Session) TxStatus() byte {
 // OnError implements pgwire.Session: an error inside a transaction block
 // poisons it until the client issues ROLLBACK.
 func (s *Session) OnError() {
-	if s.inTx {
+	if s.inTx && !s.failed {
 		s.failed = true
+		// The transaction is over in all but name: its work is undone
+		// now, not when the client gets round to saying ROLLBACK, so
+		// that nobody is left waiting for a transaction that can no
+		// longer commit.
+		s.db.mu.Lock()
+		s.abandon()
+		s.db.mu.Unlock()
 	}
 }
 
@@ -392,18 +447,65 @@ func (s *Session) Close() {
 	}
 }
 
-func (s *Session) begin() {
+func (s *Session) begin(level string) {
 	s.inTx = true
+	s.level = s.defaultLevel
+	if level != "" {
+		s.level = parseLevel(level)
+	}
+}
+
+// isolation is the level that applies to the next statement.
+func (s *Session) isolation() isoLevel {
+	if s.inTx {
+		return s.level
+	}
+	return s.defaultLevel
+}
+
+// takeSnapshot sets s.snap for the statement about to run and returns the
+// function to call when the statement is over. The caller must hold db.mu,
+// shared or exclusive.
+func (s *Session) takeSnapshot() (release func()) {
+	s.started = s.inTx
+	if s.inTx && s.level == repeatableRead {
+		if s.txSnap == nil {
+			s.txSnap = s.db.newSnapshot(s.tx.tx)
+			s.releaseSnap = s.db.hold(s.txSnap)
+		}
+		s.snap = s.txSnap
+		return func() {}
+	}
+	s.snap = s.db.newSnapshot(s.tx.tx)
+	return s.db.hold(s.snap)
+}
+
+// read runs a query under a snapshot of its own (or the transaction's).
+func (s *Session) read(fn func() ([][]any, error)) ([][]any, error) {
+	s.db.mu.RLock()
+	release := s.takeSnapshot()
+	s.db.mu.RUnlock()
+	defer release()
+	return fn()
 }
 
 // endTx forgets the transaction block. The caller must hold db.mu.
 func (s *Session) endTx() {
+	if s.tx.tx != 0 {
+		s.db.finishTx(s.tx.tx)
+	}
+	if s.releaseSnap != nil {
+		s.releaseSnap()
+	}
 	delete(s.db.writers, s)
-	s.inTx, s.failed, s.tx = false, false, changes{db: s.db}
+	s.inTx, s.failed = false, false
+	s.tx = changes{db: s.db, sess: s}
+	s.snap, s.txSnap, s.releaseSnap, s.started = nil, nil, nil, false
 }
 
 // commit makes the transaction block durable. When it returns without
-// error, the transaction survives a crash.
+// error, the transaction survives a crash, and from that moment its
+// versions are visible to every snapshot taken afterwards.
 func (s *Session) commit() error {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
@@ -414,43 +516,119 @@ func (s *Session) commit() error {
 	if err := s.db.pager.Commit(s.tx.tx, s.tx.drops); err != nil {
 		return err
 	}
-	return s.db.maybeCheckpoint()
+	// The transaction is over as far as everyone else is concerned before
+	// the housekeeping below, which may be slow, begins.
+	s.db.finishTx(s.tx.tx)
+	s.tx.tx = 0
+	return s.db.housekeeping()
+}
+
+// abandon undoes the transaction's work and lets go of everything it
+// held, without ending the transaction block. The caller must hold db.mu.
+func (s *Session) abandon() {
+	s.tx.revert()
+	if s.tx.tx != 0 {
+		s.db.pager.End(s.tx.tx)
+		s.db.finishTx(s.tx.tx)
+	}
+	if s.releaseSnap != nil {
+		s.releaseSnap()
+	}
+	delete(s.db.writers, s)
+	s.tx = changes{db: s.db, sess: s}
+	s.snap, s.txSnap, s.releaseSnap = nil, nil, nil
 }
 
 func (s *Session) rollback() {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
-	defer s.endTx()
-	s.tx.revert()
-	if s.tx.tx != 0 {
-		s.db.pager.End(s.tx.tx)
+	s.abandon()
+	s.endTx()
+}
+
+// write runs a data-modifying statement. fn records every change it makes.
+// If fn fails, its changes are undone on the spot, so a statement either
+// happens entirely or not at all. Outside a transaction block the statement
+// is a transaction of its own and is committed before write returns; inside
+// one, the record is kept for COMMIT or ROLLBACK.
+//
+// If fn runs into the uncommitted work of another transaction, the
+// statement is undone, the database lock is released until that
+// transaction ends, and the statement starts over.
+func (s *Session) write(ctx context.Context, fn func(ch *changes) (string, error)) (*result, error) {
+	for {
+		tag, wait, err := s.attempt(fn)
+		if wait == nil {
+			if err != nil {
+				return nil, err
+			}
+			return &result{tag: tag}, nil
+		}
+		s.blocked.Store(true)
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+		s.blocked.Store(false)
+		s.db.mu.Lock()
+		delete(s.db.txs.waiting, s.tx.tx)
+		s.db.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 	}
 }
 
-// write runs a data-modifying statement under the write lock. fn records
-// every change it makes. If fn fails, its changes are undone on the spot,
-// so a statement either happens entirely or not at all. Outside a
-// transaction block the statement is a transaction of its own and is
-// committed before write returns; inside one, the record is kept for COMMIT
-// or ROLLBACK.
-func (s *Session) write(fn func(ch *changes) (string, error)) (*result, error) {
+// attempt runs fn once under the database lock. If the statement has to
+// wait for another transaction, it returns the channel that is closed when
+// that transaction ends.
+func (s *Session) attempt(fn func(ch *changes) (string, error)) (tag string, wait <-chan struct{}, err error) {
 	s.db.mu.Lock()
 	defer s.db.mu.Unlock()
-	ch := changes{db: s.db}
+	release := s.takeSnapshot()
+	defer release()
+
+	ch := changes{db: s.db, sess: s}
 	if s.inTx {
 		ch.tx = s.tx.tx
 	}
-	tag, err := fn(&ch)
+	tag, err = fn(&ch)
 	if err != nil {
 		ch.revert()
-		if !s.inTx && ch.tx != 0 {
-			s.db.pager.End(ch.tx)
-		}
 		if s.inTx {
 			s.tx.tx = ch.tx
+			if ch.tx != 0 {
+				s.db.writers[s] = true
+			}
+		} else if ch.tx != 0 {
+			// The statement was a transaction of its own, now undone.
+			s.db.pager.End(ch.tx)
+			s.db.finishTx(ch.tx)
+			s.snap.self = 0
 		}
-		return nil, err
+		var w *waitError
+		if !errors.As(err, &w) {
+			return "", nil, err
+		}
+		done, running := s.db.txs.active[w.tx]
+		if !running {
+			// It ended between the check and here; just go again.
+			closed := make(chan struct{})
+			close(closed)
+			return "", closed, nil
+		}
+		// Only a transaction that has changed something can be waited
+		// for, so only then can waiting close a cycle.
+		if me := s.tx.tx; me != 0 {
+			if s.db.deadlocked(me, w.tx) {
+				return "", nil, errDeadlock()
+			}
+			s.db.txs.waiting[me] = w.tx
+		}
+		return "", done, nil
 	}
+
 	if s.inTx {
 		s.tx.tx = ch.tx
 		s.tx.undo = append(s.tx.undo, ch.undo...)
@@ -458,17 +636,51 @@ func (s *Session) write(fn func(ch *changes) (string, error)) (*result, error) {
 		if ch.tx != 0 {
 			s.db.writers[s] = true
 		}
-		return &result{tag: tag}, nil
+		return tag, nil, nil
 	}
 	if ch.tx != 0 {
 		if err := s.db.pager.Commit(ch.tx, ch.drops); err != nil {
-			return nil, err
+			return "", nil, err
 		}
-		if err := s.db.maybeCheckpoint(); err != nil {
-			return nil, err
+		s.db.finishTx(ch.tx)
+		if err := s.db.housekeeping(); err != nil {
+			return "", nil, err
 		}
 	}
-	return &result{tag: tag}, nil
+	return tag, nil, nil
+}
+
+// housekeeping does the periodic work that follows a commit: vacuuming
+// tables that have accumulated dead versions, and checkpointing if enough
+// log has built up. The caller must hold db.mu.
+func (db *DB) housekeeping() error {
+	for _, name := range db.tableNames() {
+		t := db.tables[name]
+		if t.dead < max(t.vacuumAt, autoVacuumThreshold) {
+			continue
+		}
+		ch := changes{db: db}
+		removed, err := db.vacuum(t, &ch)
+		if err != nil {
+			ch.revert()
+		}
+		if ch.tx != 0 {
+			if err == nil {
+				err = db.pager.Commit(ch.tx, nil)
+			} else {
+				db.pager.End(ch.tx)
+			}
+			db.finishTx(ch.tx)
+		}
+		if err != nil {
+			return err
+		}
+		// What could not be removed is still wanted by some snapshot;
+		// wait for as many new dead versions again before retrying.
+		t.dead -= removed
+		t.vacuumAt = t.dead + autoVacuumThreshold
+	}
+	return db.maybeCheckpoint()
 }
 
 // othersWriting reports whether a session other than s has uncommitted

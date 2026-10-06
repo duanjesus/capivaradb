@@ -389,7 +389,7 @@ func TestSessionCloseRollsBack(t *testing.T) {
 func TestSetShow(t *testing.T) {
 	h := newHarness(t, New())
 	h.expect("show server_version", "16.0")
-	h.expect("show transaction isolation level", "read uncommitted")
+	h.expect("show transaction isolation level", "read committed")
 	h.mustRun("set application_name = 'tests'; set extra_float_digits to 3")
 	h.expect("show application_name", "tests")
 	h.expect("show extra_float_digits", "3")

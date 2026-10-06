@@ -329,3 +329,52 @@ func TestBrokenAfterFailedWrite(t *testing.T) {
 		t.Errorf("after recovery: %.40q", got)
 	}
 }
+
+// TestUndoIsNotRepeatedByRecovery pins down the case that makes "this undo
+// has been carried out" worth writing in the log.
+//
+// A transaction creates a tree and then takes the creation back — a
+// statement being rolled back, or a recovery that got this far before
+// being interrupted. The tree's pages are freed, but the transaction has
+// no END record yet. Someone else's committed work then reuses the freed
+// pages. If the server crashes now, the transaction is a loser and
+// recovery walks its undo records, including "free the tree it created".
+// Were that not marked as already done, recovery would free pages that by
+// now belong to another, committed, tree.
+func TestUndoIsNotRepeatedByRecovery(t *testing.T) {
+	r := newWALRig(t)
+	keep := r.setup()
+
+	doomed, lsn, err := CreateTreeLogged(r.p, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 500; i++ {
+		if err := doomed.Put([]byte(fmt.Sprint("key", i)), bytes.Repeat([]byte("x"), 100)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The creation is undone, and nothing says the transaction is over.
+	if err := r.p.ApplyUndo(UndoRec{Tx: 2, Root: doomed.Root(), Kind: UndoDropTree}, lsn); err != nil {
+		t.Fatal(err)
+	}
+
+	// A committed transaction fills the freed pages with its own data.
+	for i := 0; i < 500; i++ {
+		r.put(3, keep, fmt.Sprint("kept", i), "value")
+	}
+	r.commit(3)
+	want := contents(t, keep)
+
+	if info := r.crash(); info.RolledBack != 1 {
+		t.Errorf("recovery: %+v", info)
+	}
+	keep = OpenTree(r.p, keep.Root())
+	if _, err := keep.Verify(); err != nil {
+		t.Fatalf("after recovery: %v", err)
+	}
+	if got := contents(t, keep); got != want {
+		t.Error("committed data changed during recovery")
+	}
+	checkNoLeaks(t, r.p, keep)
+}

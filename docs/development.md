@@ -22,11 +22,12 @@
 | Accept new psql output | `bash scripts/psql-smoke.sh --update` |
 | Kill-and-recover test through psql | `bash scripts/restart-smoke.sh` |
 | Crash tests (simulated disk, real kill) | `go test ./internal/engine -run "TestCrashRecovery|TestKillProcess" -v` |
-| Mutation-test the crash tests | `bash scripts/mutation-test.sh` |
+| Mutation-test the crash and isolation tests | `bash scripts/mutation-test.sh` |
+| Isolation transcripts | `go test ./internal/engine -v -run "TestNoDirtyRead|TestDeadlock|TestWriteSkew"` |
 | Fuzz the B+tree | `go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m` |
 | Benchmarks | `bash scripts/bench.sh` |
 | Check a database file | `go run ./cmd/capivaradb -data file.cdb -check` |
-| Regenerate screenshots | `bash scripts/screenshots.sh m4` |
+| Regenerate screenshots | `bash scripts/screenshots.sh m5` |
 | Format check | `gofmt -l .` (must print nothing) |
 
 The scripts are bash and run unchanged on Linux and under Git Bash on

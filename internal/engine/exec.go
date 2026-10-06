@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/duanjesus/capivaradb/internal/pgerr"
 	"github.com/duanjesus/capivaradb/internal/pgwire"
@@ -139,7 +138,9 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 			return nil, err
 		}
 		return &prepared{cols: plan.cols, run: func(ctx context.Context, params []any) (*result, error) {
-			rows, err := plan.run(&env{ctx: ctx, params: params})
+			rows, err := s.read(func() ([][]any, error) {
+				return plan.run(&env{ctx: ctx, params: params})
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -160,11 +161,9 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 	case *sql.DropIndex:
 		return s.buildDropIndex(n)
 	case *sql.Begin:
-		// The requested isolation level is accepted and ignored: there is
-		// only one behaviour until MVCC exists, and SHOW reports it.
-		return command(func() string { s.begin(); return "BEGIN" }), nil
+		return command(func() string { s.begin(n.Isolation); return "BEGIN" }), nil
 	case *sql.Commit:
-		return &prepared{run: func(context.Context, []any) (*result, error) {
+		return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
 			// COMMIT of a failed transaction rolls it back and says so.
 			if s.failed {
 				s.rollback()
@@ -176,7 +175,7 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 			return &result{tag: "COMMIT"}, nil
 		}}, nil
 	case *sql.Checkpoint:
-		return &prepared{run: func(context.Context, []any) (*result, error) {
+		return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
 			if err := s.db.Checkpoint(); err != nil {
 				return nil, err
 			}
@@ -185,37 +184,88 @@ func (s *Session) build(node sql.Node, ptypes []sql.Type) (*prepared, error) {
 	case *sql.Rollback:
 		return command(func() string { s.rollback(); return "ROLLBACK" }), nil
 	case *sql.Set:
-		return command(func() string {
-			// Isolation settings are parsed for the benefit of drivers,
-			// but must not overwrite the honest answer SHOW gives.
-			if !strings.HasSuffix(n.Name, "transaction_isolation") {
+		return &prepared{run: func(context.Context, []any) (*result, error) {
+			switch n.Name {
+			case "default_transaction_isolation":
+				s.defaultLevel = parseLevel(n.Value)
+			case "transaction_isolation":
+				// SET TRANSACTION applies to the current transaction
+				// and must come before it has looked at anything.
+				switch {
+				case !s.inTx:
+					// PostgreSQL warns and does nothing.
+				case s.started:
+					return nil, pgerr.New(pgerr.ActiveSQLTransaction,
+						"SET TRANSACTION ISOLATION LEVEL must be called before any query")
+				default:
+					s.level = parseLevel(n.Value)
+				}
+			default:
 				s.vars[n.Name] = n.Value
 			}
-			return "SET"
-		}), nil
+			return &result{tag: "SET"}, nil
+		}}, nil
 	case *sql.Show:
 		return s.buildShow(n)
+	case *sql.Vacuum:
+		return s.buildVacuum(n)
 	}
 	return nil, pgerr.New(pgerr.InternalError, "unhandled statement node %T", node)
 }
 
 // command wraps a statement that cannot fail and returns no rows.
 func command(fn func() string) *prepared {
-	return &prepared{run: func(context.Context, []any) (*result, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
 		return &result{tag: fn()}, nil
 	}}
 }
 
 func (s *Session) buildShow(n *sql.Show) (*prepared, error) {
-	if _, ok := s.vars[n.Name]; !ok {
-		return nil, pgerr.New(pgerr.UndefinedObject, "unrecognized configuration parameter %q", n.Name).At(n.Pos)
+	value := func() string { return s.vars[n.Name] }
+	switch n.Name {
+	case "transaction_isolation":
+		value = func() string { return s.isolation().String() }
+	case "default_transaction_isolation":
+		value = func() string { return s.defaultLevel.String() }
+	default:
+		if _, ok := s.vars[n.Name]; !ok {
+			return nil, pgerr.New(pgerr.UndefinedObject, "unrecognized configuration parameter %q", n.Name).At(n.Pos)
+		}
 	}
 	return &prepared{
 		cols: []pgwire.Column{{Name: n.Name, OID: pgwire.OIDText}},
-		run: func(context.Context, []any) (*result, error) {
-			return &result{rows: [][]any{{s.vars[n.Name]}}, tag: "SHOW"}, nil
+		run: func(ctx context.Context, _ []any) (*result, error) {
+			return &result{rows: [][]any{{value()}}, tag: "SHOW"}, nil
 		},
 	}, nil
+}
+
+// buildVacuum removes dead row versions from one table or from all.
+func (s *Session) buildVacuum(n *sql.Vacuum) (*prepared, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
+		if s.inTx {
+			return nil, pgerr.New(pgerr.ActiveSQLTransaction, "VACUUM cannot run inside a transaction block")
+		}
+		return s.write(ctx, func(ch *changes) (string, error) {
+			names := s.db.tableNames()
+			if n.Table != "" {
+				if _, err := s.db.lookup(sql.TableRef{Name: n.Table, Pos: n.Pos}); err != nil {
+					return "", err
+				}
+				names = []string{n.Table}
+			}
+			for _, name := range names {
+				t := s.db.tables[name]
+				removed, err := s.db.vacuum(t, ch)
+				if err != nil {
+					return "", err
+				}
+				t.dead = max(t.dead-removed, 0)
+				t.vacuumAt = t.dead + autoVacuumThreshold
+			}
+			return "VACUUM", nil
+		})
+	}}, nil
 }
 
 // targetTable resolves the table a data-modifying statement works on and
@@ -348,7 +398,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 			}
 		}
 		return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-			return s.write(func(ch *changes) (string, error) {
+			return s.write(ctx, func(ch *changes) (string, error) {
 				if err := s.db.stillCurrent(t); err != nil {
 					return "", err
 				}
@@ -395,7 +445,7 @@ func (s *Session) buildInsert(n *sql.Insert, ptypes []sql.Type) (*prepared, erro
 		}
 	}
 	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
@@ -446,13 +496,13 @@ func (s *Session) buildUpdate(n *sql.Update, ptypes []sql.Type) (*prepared, erro
 	}
 
 	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
 			// The rows are read in full before any is changed: an updated
 			// row may move in the tree, and must not be met a second time.
-			rows, err := s.db.scan(t)
+			rows, err := s.db.scan(t, s.snap)
 			if err != nil {
 				return "", err
 			}
@@ -496,11 +546,11 @@ func (s *Session) buildDelete(n *sql.Delete, ptypes []sql.Type) (*prepared, erro
 	}
 
 	return &prepared{run: func(ctx context.Context, params []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			if err := s.db.stillCurrent(t); err != nil {
 				return "", err
 			}
-			rows, err := s.db.scan(t)
+			rows, err := s.db.scan(t, s.snap)
 			if err != nil {
 				return "", err
 			}
@@ -596,8 +646,8 @@ func (s *Session) buildCreateTable(n *sql.CreateTable, ptypes []sql.Type) (*prep
 		draft.cols[c].notNull = true
 	}
 
-	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			if s.db.nameTaken(name) {
 				if n.IfNotExists {
 					return "CREATE TABLE", nil
@@ -704,8 +754,8 @@ func errOthersWriting(what, name string) error {
 
 func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
 	name := n.Name.Name
-	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			t, exists := s.db.tables[name]
 			if !exists {
 				if n.IfExists {
@@ -733,8 +783,8 @@ func (s *Session) buildDropTable(n *sql.DropTable) (*prepared, error) {
 
 func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 	name := n.Name.Name
-	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			t, err := s.db.lookup(n.Table)
 			if err != nil {
 				return "", err
@@ -774,7 +824,9 @@ func (s *Session) buildCreateIndex(n *sql.CreateIndex) (*prepared, error) {
 // For a unique index the existing rows must already satisfy it.
 func (db *DB) buildIndex(ix *index, ch *changes) error {
 	t := ix.table
-	rows, err := db.scan(t)
+	// Every version gets an entry, visible or not: an index points at
+	// versions, and which of them a reader sees is decided in the table.
+	rows, err := db.scan(t, nil)
 	if err != nil {
 		return err
 	}
@@ -783,7 +835,9 @@ func (db *DB) buildIndex(ix *index, ch *changes) error {
 	}
 	seen := make(map[string]bool)
 	for _, r := range rows {
-		if ix.unique && !hasNull(ix.cols, r.vals) {
+		// Only versions nobody has deleted count for uniqueness: a deleted
+		// version and its successor would otherwise look like duplicates.
+		if ix.unique && r.xmax == 0 && !hasNull(ix.cols, r.vals) {
 			prefix := string(encodeKey(ix.cols, r.vals))
 			if seen[prefix] {
 				return pgerr.New(pgerr.UniqueViolation, "could not create unique index %q", ix.name).
@@ -823,8 +877,8 @@ func (db *DB) removeIndex(ix *index) {
 
 func (s *Session) buildDropIndex(n *sql.DropIndex) (*prepared, error) {
 	name := n.Name.Name
-	return &prepared{run: func(context.Context, []any) (*result, error) {
-		return s.write(func(ch *changes) (string, error) {
+	return &prepared{run: func(ctx context.Context, _ []any) (*result, error) {
+		return s.write(ctx, func(ch *changes) (string, error) {
 			ix, exists := s.db.indexes[name]
 			if !exists {
 				if n.IfExists {

@@ -182,6 +182,11 @@ func (f *formatter) stmt(node Node) {
 		}
 	case *Commit:
 		f.w("commit")
+	case *Vacuum:
+		f.w("vacuum")
+		if n.Table != "" {
+			f.w(" ", QuoteIdent(n.Table))
+		}
 	case *Checkpoint:
 		f.w("checkpoint")
 	case *Rollback:

@@ -311,15 +311,6 @@ func TestInsertSelect(t *testing.T) {
 	h.expectError("insert into archive select name, id, salary from emp", pgerr.DatatypeMismatch)
 }
 
-func TestIsolationSyntaxIsAcceptedButNotHonoured(t *testing.T) {
-	h := newHarness(t, New())
-	h.mustRun("begin isolation level serializable; commit")
-	h.mustRun("set transaction isolation level repeatable read")
-	h.mustRun("set session characteristics as transaction isolation level serializable")
-	// SHOW keeps telling the truth about what the engine actually does.
-	h.expect("show transaction isolation level", "read uncommitted")
-}
-
 func TestParametersAcrossQueryLevels(t *testing.T) {
 	h := company(t)
 	// $1 is typed by its use inside the subquery, $2 by the outer query.

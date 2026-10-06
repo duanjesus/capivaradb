@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1022" height="990" viewBox="0 0 1022 990" role="img" aria-label="isolation transcripts">
+<rect width="1022" height="990" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h1002 a10 10 0 0 1 10 10v24 h-1022 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="511" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">isolation transcripts</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ go test ./internal/engine -v -run &#34;TestNoDirtyRead|TestRepeatableReadIsStable|TestDeadlockIsDetected|TestWriteSkew&#34;</text>
+<text x="18" y="86" fill="#e6edf3">    a:  begin                                                          BEGIN</text>
+<text x="18" y="106" fill="#e6edf3">    a:  update acct set bal = 0 where id = 1                           UPDATE 1</text>
+<text x="18" y="126" fill="#e6edf3">    a:  insert into acct values (3, 999)                               INSERT 0 1</text>
+<text x="18" y="146" fill="#e6edf3">    b:  select * from acct order by id                                 1|100;2|100</text>
+<text x="18" y="166" fill="#e6edf3">    a:  select * from acct order by id                                 1|0;2|100;3|999</text>
+<text x="18" y="186" fill="#e6edf3">    a:  rollback                                                       ROLLBACK</text>
+<text x="18" y="206" fill="#e6edf3">    b:  select * from acct order by id                                 1|100;2|100</text>
+<text x="18" y="226" fill="#e6edf3">    a:  select * from acct order by id                                 1|100;2|100</text>
+<text x="18" y="246" fill="#7ee787">--- PASS: TestNoDirtyRead</text>
+<text x="18" y="266" fill="#e6edf3">    a:  begin isolation level repeatable read                          BEGIN</text>
+<text x="18" y="286" fill="#e6edf3">    a:  show transaction isolation level                               repeatable read</text>
+<text x="18" y="306" fill="#e6edf3">    a:  select bal from acct where id = 1                              100</text>
+<text x="18" y="326" fill="#e6edf3">    b:  update acct set bal = 50 where id = 1                          UPDATE 1</text>
+<text x="18" y="346" fill="#e6edf3">    b:  insert into acct values (3, 1)                                 INSERT 0 1</text>
+<text x="18" y="366" fill="#e6edf3">    b:  delete from acct where id = 2                                  DELETE 1</text>
+<text x="18" y="386" fill="#e6edf3">    a:  select bal from acct where id = 1                              100</text>
+<text x="18" y="406" fill="#e6edf3">    a:  select count(*), sum(bal) from acct                            2|200</text>
+<text x="18" y="426" fill="#e6edf3">    a:  select * from acct order by id                                 1|100;2|100</text>
+<text x="18" y="446" fill="#e6edf3">    a:  commit                                                         COMMIT</text>
+<text x="18" y="466" fill="#e6edf3">    a:  select * from acct order by id                                 1|50;3|1</text>
+<text x="18" y="486" fill="#7ee787">--- PASS: TestRepeatableReadIsStable</text>
+<text x="18" y="506" fill="#e6edf3">    a:  begin isolation level serializable                             BEGIN</text>
+<text x="18" y="526" fill="#e6edf3">    b:  begin isolation level serializable                             BEGIN</text>
+<text x="18" y="546" fill="#e6edf3">    a:  show transaction isolation level                               repeatable read</text>
+<text x="18" y="566" fill="#e6edf3">    a:  select count(*) from doctors where on_call                     2</text>
+<text x="18" y="586" fill="#e6edf3">    b:  select count(*) from doctors where on_call                     2</text>
+<text x="18" y="606" fill="#e6edf3">    a:  update doctors set on_call = false where name = &#39;ana&#39;          UPDATE 1</text>
+<text x="18" y="626" fill="#e6edf3">    b:  update doctors set on_call = false where name = &#39;bia&#39;          UPDATE 1</text>
+<text x="18" y="646" fill="#e6edf3">    a:  commit                                                         COMMIT</text>
+<text x="18" y="666" fill="#e6edf3">    b:  commit                                                         COMMIT</text>
+<text x="18" y="686" fill="#e6edf3">    a:  select count(*) from doctors where on_call                     0</text>
+<text x="18" y="706" fill="#7ee787">--- PASS: TestWriteSkewIsPossible</text>
+<text x="18" y="726" fill="#e6edf3">    a:  begin                                                          BEGIN</text>
+<text x="18" y="746" fill="#e6edf3">    b:  begin                                                          BEGIN</text>
+<text x="18" y="766" fill="#e6edf3">    a:  update acct set bal = bal - 1 where id = 1                     UPDATE 1</text>
+<text x="18" y="786" fill="#e6edf3">    b:  update acct set bal = bal - 1 where id = 2                     UPDATE 1</text>
+<text x="18" y="806" fill="#e6edf3">    a:  update acct set bal = bal + 1 where id = 2                     waits</text>
+<text x="18" y="826" fill="#e6edf3">    b:  update acct set bal = bal + 1 where id = 1                     ERROR 40P01</text>
+<text x="18" y="846" fill="#e6edf3">    b:  rollback                                                       ROLLBACK</text>
+<text x="18" y="866" fill="#e6edf3">    a:                                                                 UPDATE 1</text>
+<text x="18" y="886" fill="#e6edf3">    a:  commit                                                         COMMIT</text>
+<text x="18" y="906" fill="#e6edf3">    a:  select * from acct order by id                                 1|99;2|101</text>
+<text x="18" y="926" fill="#7ee787">--- PASS: TestDeadlockIsDetected</text>
+<text x="18" y="946" fill="#7ee787">PASS</text>
+<text x="18" y="966" fill="#7ee787">ok      github.com/duanjesus/capivaradb/internal/engine</text>
+</g>
+</svg>

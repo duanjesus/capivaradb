@@ -80,7 +80,8 @@ func dump(t *testing.T, db *DB) string {
 		}
 		sort.Strings(indexes)
 		fmt.Fprintf(&sb, "table %s indexes %v\n", name, indexes)
-		rows, err := db.scan(tbl)
+		// Only what is committed: the view of a transaction starting now.
+		rows, err := db.scan(tbl, db.newSnapshot(0))
 		if err != nil {
 			t.Fatalf("scanning %s: %v", name, err)
 		}
@@ -123,7 +124,10 @@ type crashRig struct {
 	txLog       [crashClients][]string
 	metaRebuilt int
 	crashes     int
-	recoveries  storage.RecoveryInfo
+	// trace lists the statements run since the last crash, for the report
+	// of a failure.
+	trace      []string
+	recoveries storage.RecoveryInfo
 }
 
 const crashClients = 3
@@ -208,6 +212,11 @@ func (r *crashRig) run(client int, query string) (err error, crashed bool) {
 		}
 	}()
 	err = execSQL(r.sess[client], query)
+	short := query
+	if len(short) > 90 {
+		short = short[:90] + "..."
+	}
+	r.trace = append(r.trace, fmt.Sprintf("client %d: %s -> %v", client, short, err))
 	return err, err != nil && r.disk.Crashed()
 }
 
@@ -413,22 +422,6 @@ func (r *crashRig) step() (crashed bool, allowed []string) {
 	return false, nil
 }
 
-// shadowWithout returns what the shadow would hold if the client's open
-// transaction did not commit, and leaves the shadow as it found it. The
-// shadow has no isolation either, so the only way to see the state without
-// that transaction is to roll it back; its statements are then replayed.
-// Clients work on disjoint keys, so replaying them after the fact gives the
-// same result as their original interleaving.
-func (r *crashRig) shadowWithout(client int) string {
-	execSQL(r.shadowSess[client], "rollback")
-	without := dump(r.t, r.shadow)
-	execSQL(r.shadowSess[client], "begin")
-	for _, q := range r.txLog[client] {
-		execSQL(r.shadowSess[client], q)
-	}
-	return without
-}
-
 func testCrashes(t *testing.T, seeds, rounds int) {
 	var crashes, undone, redone, torn, completed, meta, commits int
 	for seed := int64(1); seed <= int64(seeds); seed++ {
@@ -439,6 +432,7 @@ func testCrashes(t *testing.T, seeds, rounds int) {
 		}
 
 		for round := 0; round < rounds; round++ {
+			r.trace = nil
 			r.disk.CrashAfter(r.rng.Intn(250))
 			var allowed []string
 			for crashed := false; !crashed; {
@@ -462,6 +456,11 @@ func testCrashes(t *testing.T, seeds, rounds int) {
 				}
 			}
 			if match < 0 {
+				tail := r.trace
+				if len(tail) > 30 {
+					tail = tail[len(tail)-30:]
+				}
+				t.Logf("last statements before the crash:\n%s", strings.Join(tail, "\n"))
 				t.Fatalf("seed %d round %d: the recovered database matches none of the %d allowed states.\n--- recovered:\n%s--- allowed[0]:\n%s--- allowed[last]:\n%s",
 					seed, round, len(allowed), got, allowed[0], allowed[len(allowed)-1])
 			}
@@ -531,7 +530,7 @@ func copyDatabase(t *testing.T, src, dst *DB) {
 			create = "create table acct (id int primary key, bal int not null, note text)"
 		}
 		run(create)
-		rows, err := src.scan(tbl)
+		rows, err := src.scan(tbl, src.newSnapshot(0))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -569,65 +568,22 @@ func TestCrashRecovery(t *testing.T) {
 	testCrashes(t, seeds, rounds)
 }
 
-// TestStatementRollbackIsNotRepeatedByRecovery pins down the case that makes
-// "this undo has been carried out" worth writing in the log.
+// shadowWithout returns what the shadow would hold if the client's open
+// transaction did not commit, and leaves the shadow as it found it.
 //
-// A statement fails after allocating a tree, and is rolled back on the
-// spot: the tree's page is freed. The transaction stays open. Another
-// session then commits work that reuses the freed page. If the server now
-// crashes, the open transaction is a loser and recovery walks its undo
-// records — including "free the tree created by that statement". Were it
-// not marked as already done, recovery would free a page that by now
-// belongs to someone else's committed table.
-func TestStatementRollbackIsNotRepeatedByRecovery(t *testing.T) {
-	disk := storage.NewSimDisk(1)
-	open := func() *DB {
-		db, err := OpenFiles(disk.Open("data"), disk.Open("wal"), Options{PoolPages: 64})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return db
+// Rows of an open transaction are invisible to the dump anyway, but schema
+// changes are not: the catalog is not versioned, so a table the client
+// created is already listed. The only way to see the state without the
+// transaction is to roll it back; its statements are then replayed.
+// Clients work on disjoint keys, so replaying them after the fact gives the
+// same result as their original interleaving.
+func (r *crashRig) shadowWithout(client int) string {
+	replay := append([]string(nil), r.txLog[client]...)
+	execSQL(r.shadowSess[client], "rollback")
+	without := dump(r.t, r.shadow)
+	execSQL(r.shadowSess[client], "begin")
+	for _, q := range replay {
+		execSQL(r.shadowSess[client], q)
 	}
-	db := open()
-	a, _ := db.NewSession(map[string]string{"user": "a"})
-	b, _ := db.NewSession(map[string]string{"user": "b"})
-	run := func(sess pgwire.Session, q string) {
-		t.Helper()
-		if err := execSQL(sess, q); err != nil {
-			t.Fatalf("%s: %v", q, err)
-		}
-	}
-
-	// The name the second CREATE TABLE's unique index would need is taken,
-	// which is only discovered after the table's own tree was allocated.
-	run(a, "create table t_v_key (x int)")
-	run(a, "begin")
-	run(a, "insert into t_v_key values (1)")
-	if err := execSQL(a, "create table t (k int primary key, v text unique)"); code(err) != pgerr.DuplicateTable {
-		t.Fatalf("expected the statement to fail on the index name, got %v", err)
-	}
-
-	// Another session's committed work takes over the freed page and more.
-	run(b, "create table keep (id int primary key, payload text)")
-	for i := 0; i < 400; i++ {
-		run(b, fmt.Sprintf("insert into keep values (%d, '%s')", i, strings.Repeat("x", 200)))
-	}
-	want := dump(t, db)
-
-	// Power failure with session a's transaction still open. Everything
-	// session b did was committed, hence synced.
-	disk.Crash()
-	db = open()
-	if info := db.Recovery(); info.RolledBack != 1 {
-		t.Errorf("recovery: %+v", info)
-	}
-	if _, err := db.Verify(); err != nil {
-		t.Fatalf("after recovery: %v", err)
-	}
-	// Session a's insert is gone, session b's table is intact.
-	got := dump(t, db)
-	want = strings.Replace(want, "  [1]\n", "", 1)
-	if got != want {
-		t.Errorf("after recovery:\n%s\nwant:\n%s", got, want)
-	}
+	return without
 }

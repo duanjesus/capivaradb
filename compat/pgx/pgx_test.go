@@ -441,3 +441,78 @@ func TestAnalyticalQueries(t *testing.T) {
 		t.Errorf("got %q, %v", name, err)
 	}
 }
+
+// Two real connections contending for a row: the second UPDATE blocks on
+// the wire until the first transaction commits, then applies on top of it.
+// Under repeatable read the loser gets a serialization failure with the
+// SQLSTATE applications retry on.
+func TestConcurrentTransactions(t *testing.T) {
+	url := startServer(t)
+	a, ctx := connect(t, url)
+	b, _ := connect(t, url)
+	if _, err := a.Exec(ctx, "create table acct (id int primary key, bal int not null); insert into acct values (1, 100)"); err != nil {
+		t.Fatal(err)
+	}
+	balance := func(conn *pgx.Conn) (bal int) {
+		t.Helper()
+		if err := conn.QueryRow(ctx, "select bal from acct where id = 1").Scan(&bal); err != nil {
+			t.Fatal(err)
+		}
+		return bal
+	}
+
+	txA, err := a.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txA.Exec(ctx, "update acct set bal = bal + 10 where id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	// Uncommitted work is invisible to the other connection.
+	if got := balance(b); got != 100 {
+		t.Errorf("b sees %d while a's update is uncommitted", got)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.Exec(ctx, "update acct set bal = bal + 10 where id = 1")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("b's update should have blocked on a's, but returned: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("b's update after a committed: %v", err)
+	}
+	if got := balance(a); got != 120 {
+		t.Errorf("balance after both updates: %d, want 120", got)
+	}
+
+	// Repeatable read: a change committed after the snapshot cannot be
+	// overwritten.
+	txB, err := b.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen int
+	if err := txB.QueryRow(ctx, "select bal from acct where id = 1").Scan(&seen); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Exec(ctx, "update acct set bal = 0 where id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := txB.QueryRow(ctx, "select bal from acct where id = 1").Scan(&seen); err != nil || seen != 120 {
+		t.Errorf("b's snapshot moved: %d, %v", seen, err)
+	}
+	_, err = txB.Exec(ctx, "update acct set bal = bal + 1 where id = 1")
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "40001" {
+		t.Errorf("expected a serialization failure, got %v", err)
+	}
+	txB.Rollback(ctx)
+}

@@ -48,7 +48,7 @@ func (s *Session) planFrom(te sql.TableExpr, parent *scope, ptypes []sql.Type) (
 			return nil, err
 		}
 		return &relation{cols: t.scopeCols(te.Alias), rows: func(cx *env) ([][]any, error) {
-			return s.db.snapshot(t, cx.locked)
+			return s.db.rows(t, s.snap, cx.locked)
 		}}, nil
 
 	case *sql.DerivedTable:

@@ -357,3 +357,10 @@ func WalkExpr(e Expr, fn func(Expr) bool) {
 		WalkExpr(e.Pattern, fn)
 	}
 }
+
+// Vacuum removes dead row versions, from one table or, with an empty Table,
+// from all of them.
+type Vacuum struct {
+	Table string
+	Pos   int
+}

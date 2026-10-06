@@ -115,19 +115,23 @@ pinned between calls.
 
 ## How rows are stored
 
-A **table** is one B+tree.
+A **table** is one B+tree, holding every *version* of every row (see
+[mvcc.md](mvcc.md) for why rows have versions).
 
-- The key is the primary key, in an *order-preserving encoding*: comparing
-  two encoded keys byte by byte gives the same result as comparing the
-  values. That is what lets the tree stay ignorant of types.
+- The row's key is the primary key, in an *order-preserving encoding*:
+  comparing two encoded keys byte by byte gives the same result as
+  comparing the values. That is what lets the tree stay ignorant of types.
 - A table without a primary key is keyed by a hidden, ever-increasing row
   ID.
-- The value is the row as a *tuple*: a null bitmap followed by the non-NULL
+- A version's key is the row's key followed by eight bytes: the complement
+  of the ID of the transaction that created it. The versions of a row are
+  therefore adjacent, newest first.
+- The value is the ID of the transaction that deleted the version (zero if
+  none), then the row as a *tuple*: a null bitmap followed by the non-NULL
   columns in a compact, fixed layout per type.
 
 The table is therefore *clustered*: rows live in the leaves in key order,
 and a primary-key lookup is a single descent.
-
 | Type | Key encoding (after a 0x01 "not NULL" byte; NULL is 0x00) |
 |------|-----------------------------------------------------------|
 | `integer`, `bigint` | 8 bytes big-endian with the sign bit flipped, so negatives sort first |
@@ -135,7 +139,8 @@ and a primary-key lookup is a single descent.
 | `boolean` | 1 byte |
 | `text` | the bytes, `0x00` escaped as `0x00 0xFF`, terminated by `0x00 0x01` — so `'ab'` sorts before `'abc'` and an embedded NUL is harmless |
 
-A **secondary index** is another B+tree whose key is *the indexed columns
+A **secondary index** is another B+tree, with one entry per row version,
+whose key is *the indexed columns
 followed by the row's table key*, with an empty value. Appending the table
 key makes every entry distinct even when indexed values repeat, and looking
 a value up is a seek to the prefix. `UNIQUE` constraints are unique indexes;
@@ -176,8 +181,8 @@ It runs:
 - **Streaming scans.** The executor materialises each table it reads, so a
   query needs memory proportional to the tables it touches regardless of
   the buffer pool. The iterator executor (milestone 7) removes that.
-- **Page-level concurrency.** One database-wide lock still serialises
-  writers. Latches come with MVCC (milestone 5).
+- **Parallel writes.** One database-wide lock still serialises
+  statements that write; MVCC (milestone 5) added isolation, not this.
 - An `UPDATE` rewrites the row and all its index entries even when only an
   unindexed column changed.
 - Ascending inserts leave pages half full, because every split is at the

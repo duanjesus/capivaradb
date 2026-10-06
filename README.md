@@ -10,12 +10,13 @@ logging with crash recovery, MVCC transactions, and a query planner and
 executor. **The core has no dependencies outside the Go standard library**;
 CI fails if one is added.
 
-> **Status: milestone 4 of 7.** The wire protocol, the SQL front end, the
-> storage engine and the write-ahead log are done: data lives in B+trees in
-> a page file, and a committed transaction survives the server being killed
-> or the power failing. Transactions are **not isolated from each other
-> yet** — that is MVCC, next. See [Limitations](#limitations) for exactly
-> what that means.
+> **Status: milestone 5 of 7.** The wire protocol, the SQL front end, the
+> storage engine, the write-ahead log and MVCC are done: data lives in
+> B+trees in a page file, a committed transaction survives the server being
+> killed or the power failing, and concurrent transactions are isolated
+> from each other by snapshots. What is left is making queries fast: there
+> is **no query planner yet**, so every query scans. See
+> [Limitations](#limitations) for exactly what that means.
 
 ![a server killed mid-transaction, and what the next one finds](docs/screenshots/m4-recovery.svg)
 
@@ -27,8 +28,8 @@ CI fails if one is added.
 | 2 | Hand-written SQL parser and binder: joins, grouping, subqueries, DDL; fuzzing; sqllogictest | **done** |
 | 3 | Storage engine: slotted pages, buffer pool, B+tree tables and secondary indexes, persistent catalog | **done** |
 | 4 | Write-ahead log, ARIES-style recovery, crash tests on a simulated disk and by killing the process | **done** |
-| 5 | MVCC with snapshot isolation, concurrent transactions, isolation tests | next |
-| 6 | Cost-based planner: index selection, join ordering, `EXPLAIN` | planned |
+| 5 | MVCC: snapshot isolation, waiting writers, deadlock detection, vacuum, isolation tests | **done** |
+| 6 | Cost-based planner: index selection, join ordering, `EXPLAIN` | next |
 | 7 | Volcano executor: hash and merge joins, aggregation, external sort, set operations | planned |
 
 Details in [docs/roadmap.md](docs/roadmap.md).
@@ -117,6 +118,25 @@ B+tree.
 
 ![a second server process reading what the first one wrote](docs/screenshots/m3-restart-after.svg)
 
+### Isolation ([details](docs/mvcc.md))
+
+- Multi-version concurrency control in PostgreSQL's style: every row
+  version records who created and who deleted it, and every statement
+  reads through a snapshot. Readers never wait for writers.
+- Two levels: **read committed** (the default; a snapshot per statement)
+  and **repeatable read** (a snapshot per transaction: snapshot isolation).
+- Writers that want the same row wait for each other; a deadlock is
+  detected and one of the statements fails with `40P01`.
+- Under repeatable read, a transaction that would overwrite a change it
+  cannot see fails with `40001` instead of losing the update.
+- Unique constraints hold across concurrent transactions.
+- `VACUUM`, and automatic vacuuming of dead versions.
+
+`SERIALIZABLE` is accepted and gives snapshot isolation, which allows write
+skew; `SHOW transaction_isolation` therefore answers `repeatable read`.
+
+![two sessions and a lost update that does not happen](docs/screenshots/m5-isolation.svg)
+
 ### Durability ([details](docs/recovery.md))
 
 - A write-ahead log with physical redo and logical undo; `fsync` at commit
@@ -151,7 +171,8 @@ B+tree.
 | The B+tree and buffer pool | Long random operation sequences checked against a map, with a 16-page pool to force eviction; a fuzzer; invariants verified throughout; no page may leak | [internal/storage](internal/storage) |
 | **Crash recovery** | A simulated disk that loses any subset of unsynced writes and tears the rest: ~800 crashes per run under a random workload, some during recovery itself, each compared with a shadow database | [docs/recovery.md](docs/recovery.md) |
 | Crash recovery, for real | A writer process killed with `SIGKILL` a dozen times; every acknowledged commit must be there, whole | [internal/engine](internal/engine), [compat/restart](compat/restart) |
-| The crash tests themselves | Mutation testing: nine ways of breaking the durability rules, each of which the tests must catch | `scripts/mutation-test.sh` |
+| **Isolation** | Transcripts of interleaved sessions for each anomaly, deadlocks, unique conflicts and vacuum; concurrent transfers from eight goroutines with readers checking the total at every moment | [docs/mvcc.md](docs/mvcc.md) |
+| The crash and isolation tests themselves | Mutation testing: nineteen ways of breaking the durability and isolation rules, each of which the tests must catch | `scripts/mutation-test.sh` |
 | Persistence | Restart tests at the engine level; corruption must be detected by checksum | [internal/engine](internal/engine) |
 | Storage integrity under SQL | The consistency checker runs after every engine test and after each sqllogictest script | `DB.Verify` |
 | The protocol | A raw client written in the test from the specification, asserting exact message sequences | [internal/pgwire](internal/pgwire) |
@@ -181,12 +202,19 @@ shadow database that never crashed:
 
 ![crash tests](docs/screenshots/m4-crash-tests.svg)
 
-A crash test that passes proves little unless it would fail if the code
-were wrong, so the tests are tested: each durability rule is broken in turn
-and the suite must notice. It found two blind spots while it was being
-written, both described in [docs/recovery.md](docs/recovery.md).
+A test that passes proves little unless it would fail if the code were
+wrong, so the tests are tested: each durability rule and each isolation
+rule is broken in turn and the suite must notice. It found three blind
+spots in the crash tests while they were being written, all described in
+[docs/recovery.md](docs/recovery.md).
 
-![mutation testing of the crash tests](docs/screenshots/m4-mutation.svg)
+![mutation testing of the crash and isolation tests](docs/screenshots/m5-mutation.svg)
+
+Isolation is tested with transcripts: several sessions scripted one
+statement at a time, with the expected result of each — including that a
+statement *waits* when it must:
+
+![isolation transcripts](docs/screenshots/m5-transcripts.svg)
 
 The storage tests report what the tree and the pool did — here, trees of
 thousands of entries kept correct through tens of thousands of evictions:
@@ -238,7 +266,7 @@ bash scripts/slt.sh                    # sqllogictest; downloads the scripts onc
 bash scripts/jdbc-smoke.sh             # pgjdbc; needs a JDK and curl
 bash scripts/psql-smoke.sh             # psql; uses Docker if psql is not installed
 bash scripts/restart-smoke.sh          # kill the server mid-transaction, recover, read
-bash scripts/mutation-test.sh          # break the durability rules; the crash tests must fail
+bash scripts/mutation-test.sh          # break the durability and isolation rules; the tests must fail
 bash scripts/bench.sh                  # B+tree benchmarks
 go test ./internal/sql -run XXX -fuzz FuzzParse -fuzztime 1m
 go test ./internal/storage -run XXX -fuzz FuzzTree -fuzztime 1m
@@ -252,13 +280,16 @@ and pgx suites on Windows. See [docs/development.md](docs/development.md).
 Stated plainly, because a database that overstates what it guarantees is
 worse than useless.
 
-- **No isolation.** Changes are visible to other sessions the moment a
-  statement runs, before `COMMIT`. `BEGIN ISOLATION LEVEL ...` is parsed and
-  ignored; `SHOW transaction_isolation` answers `read uncommitted`, which is
-  the truth. Rollback does undo a transaction's changes, but if two open
-  transactions touched the same rows the result is not what a real database
-  would give. `DROP TABLE`, `DROP INDEX` and `CREATE INDEX` are refused
-  while another transaction has uncommitted changes. (Milestone 5.)
+- **Isolation stops at snapshot isolation.** There is no true
+  `SERIALIZABLE`: write skew is possible, and a test asserts that it is.
+  The catalog is not versioned, so a table created by an uncommitted
+  transaction is already visible to others (empty), and `DROP TABLE`,
+  `DROP INDEX` and `CREATE INDEX` are refused while another transaction has
+  uncommitted changes. There is no `SELECT ... FOR UPDATE` and no lock
+  timeout.
+- **Writes do not run in parallel.** MVCC makes readers independent of
+  writers, but statements that write are still serialised by one
+  database-wide lock.
 - **Durability has edges.** Crash safety covers the server dying and the
   power failing. It does not cover the disk itself failing: a damaged page
   with no image in the current log is detected and reported, not repaired,
@@ -268,8 +299,6 @@ worse than useless.
   [docs/benchmarks.md](docs/benchmarks.md)). The log cannot be discarded
   while a transaction is open, and a single value must fit in half the
   buffer pool.
-- **One global lock.** Writers exclude everyone for the duration of a
-  statement.
 - **No planner.** Joins are nested loops in the order written, the `WHERE`
   clause is applied after the joins, and every scan is a full scan. A join
   that would materialise more than two million intermediate rows is refused
@@ -305,7 +334,7 @@ worse than useless.
 cmd/capivaradb     the server binary
 internal/pgwire    PostgreSQL wire protocol
 internal/sql       lexer, AST, parser, printer
-internal/engine    binder, executor, row and key encoding, catalog
+internal/engine    binder, executor, MVCC, row and key encoding, catalog
 internal/storage   page file, buffer pool, B+tree, write-ahead log, recovery,
                    consistency checker, simulated disk for crash tests
 internal/pgerr     errors with SQLSTATE codes

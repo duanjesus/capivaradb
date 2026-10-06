@@ -16,21 +16,23 @@ import (
 
 // This file is where rows meet B+trees.
 //
-// A table is one tree. Its key is the primary key, encoded so that byte
-// order is key order; a table without a primary key gets a hidden,
-// ever-increasing row ID instead. Its value is the row as a tuple. The table
-// is therefore "clustered": the rows live in the leaves, in key order, and
-// a lookup by primary key is a single descent.
+// A table is one tree, holding every version of every row (see mvcc.go for
+// how a version is keyed). The row's own key is the primary key, encoded so
+// that byte order is key order; a table without a primary key gets a
+// hidden, ever-increasing row ID instead. The table is therefore
+// "clustered": rows live in the leaves, in key order, with the versions of
+// a row side by side.
 //
 // A secondary index is another tree. Its key is the indexed columns followed
-// by the table key of the row, and its value is empty: an index entry is
-// just a pointer, and appending the table key makes every entry distinct
-// even when the indexed values repeat. Looking a value up is a seek to the
-// prefix made of the indexed columns.
+// by the table key of a version, and its value is empty: an index entry is
+// a pointer to one version. Looking a value up is a seek to the prefix made
+// of the indexed columns.
 
-// rowRef is a row together with the key it is stored under.
+// rowRef is one version of a row, with the key it is stored under.
 type rowRef struct {
-	key  []byte
+	key  []byte // the row's key followed by the version tag
+	xmin uint64
+	xmax uint64
 	vals []any
 }
 
@@ -55,26 +57,45 @@ func storageError(err error) error {
 	return err
 }
 
-// scan returns every row of t in key order. The caller must hold db.mu.
-func (db *DB) scan(t *table) ([]rowRef, error) {
+func (t *table) decodeVersion(key, val []byte) (rowRef, error) {
+	if len(key) < versionTagSize || len(val) < 8 {
+		return rowRef{}, fmt.Errorf("corrupt row version in table %s", t.name)
+	}
+	_, xmin := splitVersionKey(key)
+	vals, err := decodeTuple(t.cols, val[8:])
+	return rowRef{key: key, xmin: xmin, xmax: binary.BigEndian.Uint64(val), vals: vals}, err
+}
+
+// scan returns the versions of t that the snapshot can see, in key order. A
+// nil snapshot returns every version. The caller must hold db.mu.
+func (db *DB) scan(t *table, sn *snapshot) ([]rowRef, error) {
 	var rows []rowRef
 	c := t.tree.Seek(nil)
 	for {
-		key, tuple, ok := c.Next()
+		key, val, ok := c.Next()
 		if !ok {
 			break
 		}
-		vals, err := decodeTuple(t.cols, tuple)
+		// Visibility is decided from the eight bytes at either end before
+		// the tuple is decoded: most of the cost of skipping a dead
+		// version is avoided.
+		if sn != nil && len(key) >= versionTagSize && len(val) >= 8 {
+			_, xmin := splitVersionKey(key)
+			if !sn.visible(xmin, binary.BigEndian.Uint64(val)) {
+				continue
+			}
+		}
+		ref, err := t.decodeVersion(key, val)
 		if err != nil {
 			return nil, err
 		}
-		rows = append(rows, rowRef{key, vals})
+		rows = append(rows, ref)
 	}
 	return rows, c.Err()
 }
 
-// snapshot returns the current rows of t.
-func (db *DB) snapshot(t *table, locked bool) ([][]any, error) {
+// rows returns the rows of t as the snapshot sees them.
+func (db *DB) rows(t *table, sn *snapshot, locked bool) ([][]any, error) {
 	if !locked {
 		db.mu.RLock()
 		defer db.mu.RUnlock()
@@ -82,7 +103,7 @@ func (db *DB) snapshot(t *table, locked bool) ([][]any, error) {
 	if err := db.stillCurrent(t); err != nil {
 		return nil, err
 	}
-	refs, err := db.scan(t)
+	refs, err := db.scan(t, sn)
 	if err != nil {
 		return nil, err
 	}
@@ -93,14 +114,16 @@ func (db *DB) snapshot(t *table, locked bool) ([][]any, error) {
 	return rows, nil
 }
 
-// entryKey is the key of the index entry for a row.
+// entryKey is the key of the index entry for a version.
 func (ix *index) entryKey(vals []any, rowKey []byte) []byte {
 	return append(encodeKey(ix.cols, vals), rowKey...)
 }
 
-// storeRow writes a row and its index entries, without checking anything.
-func (t *table) storeRow(key []byte, vals []any, ch *changes) error {
-	if err := ch.put(t.tree, key, encodeTuple(t.cols, vals)); err != nil {
+// storeVersion writes a new version of the row with the given key, created
+// by the transaction, and its index entries.
+func (t *table) storeVersion(base []byte, vals []any, ch *changes) error {
+	key := versionKey(base, ch.begin())
+	if err := ch.put(t.tree, key, versionValue(0, encodeTuple(t.cols, vals))); err != nil {
 		return err
 	}
 	for _, ix := range t.indexes {
@@ -111,13 +134,13 @@ func (t *table) storeRow(key []byte, vals []any, ch *changes) error {
 	return nil
 }
 
-// removeRow deletes a row and its index entries.
-func (t *table) removeRow(key []byte, vals []any, ch *changes) error {
-	if err := ch.del(t.tree, key, encodeTuple(t.cols, vals)); err != nil {
+// removeVersion takes a version and its index entries out of the trees.
+func (t *table) removeVersion(v rowRef, ch *changes) error {
+	if err := ch.del(t.tree, v.key, versionValue(v.xmax, encodeTuple(t.cols, v.vals))); err != nil {
 		return err
 	}
 	for _, ix := range t.indexes {
-		if err := ch.del(ix.tree, ix.entryKey(vals, key), nil); err != nil {
+		if err := ch.del(ix.tree, ix.entryKey(v.vals, v.key), nil); err != nil {
 			return err
 		}
 	}
@@ -142,10 +165,57 @@ func (t *table) uniqueViolation(constraint string, cols []int, vals []any) error
 		WithDetail("Key (%s)=(%s) already exists.", strings.Join(names, ", "), strings.Join(key, ", "))
 }
 
-// checkUnique verifies that no row other than the one stored under self has
-// the same values in a unique index. As in PostgreSQL, NULLs are distinct
-// from each other, so a key containing one never conflicts.
-func (t *table) checkUnique(vals []any, self []byte) error {
+// occupies decides whether an existing version stands in the way of a new
+// row with the same unique key, for the transaction me.
+//
+// Uniqueness is not a matter of snapshots: a row committed after my
+// snapshot was taken is invisible to me and still makes my insert a
+// duplicate. What matters is whether the version is, or may yet turn out
+// to be, alive:
+//
+//   - created by a transaction still in progress: unknown, wait for it;
+//   - not deleted: alive, a duplicate;
+//   - deleted by me: gone, as far as I am concerned;
+//   - deleted by a transaction still in progress: unknown, wait for it;
+//   - deleted by a committed transaction: gone.
+func (db *DB) occupies(xmin, xmax, me uint64) (alive bool, err error) {
+	switch {
+	case xmin != me && db.isActive(xmin):
+		return false, &waitError{xmin}
+	case xmax == 0:
+		return true, nil
+	case xmax == me:
+		return false, nil
+	case db.isActive(xmax):
+		return false, &waitError{xmax}
+	}
+	return false, nil
+}
+
+// checkPrimaryKey verifies that no live version has the row key base.
+func (t *table) checkPrimaryKey(db *DB, base []byte, vals []any, me uint64) error {
+	c := t.tree.Seek(base)
+	for {
+		key, val, ok := c.Next()
+		if !ok || len(key) != len(base)+versionTagSize || !bytes.HasPrefix(key, base) {
+			break
+		}
+		_, xmin := splitVersionKey(key)
+		alive, err := db.occupies(xmin, binary.BigEndian.Uint64(val), me)
+		if err != nil {
+			return err
+		}
+		if alive {
+			return t.uniqueViolation(t.name+"_pkey", t.pk, vals)
+		}
+	}
+	return c.Err()
+}
+
+// checkUnique verifies that no live version has the same values in a unique
+// index. As in PostgreSQL, NULLs are distinct from each other, so a key
+// containing one never conflicts.
+func (t *table) checkUnique(db *DB, vals []any, me uint64) error {
 	for _, ix := range t.indexes {
 		if !ix.unique || hasNull(ix.cols, vals) {
 			continue
@@ -157,7 +227,22 @@ func (t *table) checkUnique(vals []any, self []byte) error {
 			if !ok || !bytes.HasPrefix(entry, prefix) {
 				break
 			}
-			if !bytes.Equal(entry[len(prefix):], self) {
+			// The entry points at a version; whether that version is
+			// alive is written in the table.
+			rowKey := entry[len(prefix):]
+			val, found, err := t.tree.Get(rowKey)
+			if err != nil {
+				return err
+			}
+			if !found || len(val) < 8 || len(rowKey) < versionTagSize {
+				return fmt.Errorf("index %s has an entry for a row version that does not exist", ix.name)
+			}
+			_, xmin := splitVersionKey(rowKey)
+			alive, err := db.occupies(xmin, binary.BigEndian.Uint64(val), me)
+			if err != nil {
+				return err
+			}
+			if alive {
 				return t.uniqueViolation(ix.name, ix.cols, vals)
 			}
 		}
@@ -183,60 +268,109 @@ func (t *table) insertRow(vals []any, ch *changes) error {
 	if err := t.checkNotNull(vals); err != nil {
 		return err
 	}
-	var key []byte
+	me := ch.begin()
+	var base []byte
 	if t.pk != nil {
-		key = encodeKey(t.pk, vals)
-		_, exists, err := t.tree.Get(key)
-		if err != nil {
+		base = encodeKey(t.pk, vals)
+		if err := t.checkPrimaryKey(ch.db, base, vals, me); err != nil {
 			return err
 		}
-		if exists {
-			return t.uniqueViolation(t.name+"_pkey", t.pk, vals)
-		}
 	} else {
-		key = rowIDKey(t.nextRowID)
+		base = rowIDKey(t.nextRowID)
 		t.nextRowID++
 	}
-	if err := t.checkUnique(vals, nil); err != nil {
+	if err := t.checkUnique(ch.db, vals, me); err != nil {
 		return err
 	}
-	return t.storeRow(key, vals, ch)
+	return t.storeVersion(base, vals, ch)
 }
 
-// updateRow replaces the row old with vals.
+// claim makes sure the transaction may delete or replace a version it can
+// see. If someone else already has, the two transactions are in conflict:
+//
+//   - the other is still in progress: wait for it. If it rolls back, the
+//     version is free again; if it commits, the statement runs again and
+//     decides anew.
+//   - the other committed: only possible when this transaction's snapshot
+//     predates that commit, that is, under repeatable read. Carrying on
+//     would overwrite a change this transaction never saw — a lost update
+//     — so it fails instead and the application retries.
+func (t *table) claim(v rowRef, ch *changes) error {
+	if v.xmax == 0 || v.xmax == ch.tx {
+		return nil
+	}
+	if ch.db.isActive(v.xmax) {
+		return &waitError{v.xmax}
+	}
+	return errSerialization()
+}
+
+// retire ends a version's life on behalf of the transaction: it marks it as
+// deleted by it, or, if the transaction created the version itself, removes
+// it outright — nobody else has ever been able to see it.
+func (t *table) retire(v rowRef, ch *changes) error {
+	if err := t.claim(v, ch); err != nil {
+		return err
+	}
+	me := ch.begin()
+	if v.xmin == me {
+		return t.removeVersion(v, ch)
+	}
+	tuple := encodeTuple(t.cols, v.vals)
+	t.dead++
+	return ch.replace(t.tree, v.key, versionValue(v.xmax, tuple), versionValue(me, tuple))
+}
+
+// updateRow replaces the version old with a new one holding vals.
 func (t *table) updateRow(old rowRef, vals []any, ch *changes) error {
 	if err := t.checkNotNull(vals); err != nil {
 		return err
 	}
-	key := old.key
+	// Retire the old version first: the uniqueness checks below then see
+	// it as deleted by this transaction and do not count it.
+	if err := t.retire(old, ch); err != nil {
+		return err
+	}
+	base, _ := splitVersionKey(old.key)
 	if t.pk != nil {
-		key = encodeKey(t.pk, vals)
-		if !bytes.Equal(key, old.key) {
-			_, exists, err := t.tree.Get(key)
-			if err != nil {
+		if newBase := encodeKey(t.pk, vals); !bytes.Equal(newBase, base) {
+			base = newBase
+			if err := t.checkPrimaryKey(ch.db, base, vals, ch.tx); err != nil {
 				return err
-			}
-			if exists {
-				return t.uniqueViolation(t.name+"_pkey", t.pk, vals)
 			}
 		}
 	}
-	if err := t.checkUnique(vals, old.key); err != nil {
+	if err := t.checkUnique(ch.db, vals, ch.tx); err != nil {
 		return err
 	}
-	// The row moves if its key changed, and its index entries embed the
-	// key, so the general case is delete-then-insert. When only non-key,
-	// non-indexed columns change this does more work than needed; the
-	// planner milestone can afford to be smarter.
-	if err := t.removeRow(old.key, old.vals, ch); err != nil {
-		return err
-	}
-	return t.storeRow(key, vals, ch)
+	return t.storeVersion(base, vals, ch)
 }
 
-// deleteRow removes a row.
+// deleteRow deletes the version old.
 func (t *table) deleteRow(old rowRef, ch *changes) error {
-	return t.removeRow(old.key, old.vals, ch)
+	return t.retire(old, ch)
+}
+
+// vacuum removes the versions of t that no snapshot, present or future,
+// can see: those deleted by a transaction whose commit every snapshot in
+// use already takes into account. It returns how many it removed. The
+// caller must hold db.mu.
+func (db *DB) vacuum(t *table, ch *changes) (int, error) {
+	versions, err := db.scan(t, nil)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, v := range versions {
+		if v.xmax == 0 || db.isActive(v.xmax) || !db.goneForEveryone(v.xmin, v.xmax) {
+			continue
+		}
+		if err := t.removeVersion(v, ch); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // ---- catalog ----
@@ -418,7 +552,7 @@ func (db *DB) loadCatalog() error {
 			if err != nil {
 				return err
 			}
-			if len(last) == 8 {
+			if len(last) == 8+versionTagSize {
 				t.nextRowID = int64(binary.BigEndian.Uint64(last)) + 1
 			}
 		}
@@ -440,7 +574,8 @@ func (db *DB) loadCatalog() error {
 // CheckReport summarises what Verify found.
 type CheckReport struct {
 	Tables, Indexes int
-	Rows            int
+	Rows            int // rows as a new transaction would see them, give or take uncommitted work
+	Versions        int // row versions stored, dead ones awaiting vacuum included
 	Pages           int // pages in the file
 	FreePages       int // of which on the free list
 }
@@ -448,7 +583,8 @@ type CheckReport struct {
 // Verify checks the whole database file for consistency:
 //
 //   - every B+tree (catalog, tables, indexes) satisfies its invariants;
-//   - every row decodes, and has exactly one entry in each index of its
+//   - every row version decodes, no row has two current versions, and each
+//     version has exactly one entry in each index of its
 //     table, with no entries left over;
 //   - every page of the file belongs to exactly one tree or to the free
 //     list: nothing is leaked, nothing is shared.
@@ -489,11 +625,30 @@ func (db *DB) Verify() (CheckReport, error) {
 		if _, err := check("table "+t.name, t.tree); err != nil {
 			return report, err
 		}
-		rows, err := db.scan(t)
+		// Every version, whatever any snapshot thinks of it.
+		rows, err := db.scan(t, nil)
 		if err != nil {
 			return report, fmt.Errorf("table %s: %w", t.name, err)
 		}
-		report.Rows += len(rows)
+		report.Versions += len(rows)
+		var current []byte
+		for _, r := range rows {
+			if r.xmax != 0 && !db.isActive(r.xmax) {
+				continue // dead, awaiting vacuum
+			}
+			if r.xmax == 0 {
+				report.Rows++
+			}
+			// A row has at most one version that nobody has deleted:
+			// two would be two rows with the same key.
+			base, _ := splitVersionKey(r.key)
+			if r.xmax == 0 && !db.isActive(r.xmin) {
+				if bytes.Equal(base, current) {
+					return report, fmt.Errorf("table %s has two current versions of one row", t.name)
+				}
+				current = base
+			}
+		}
 		for _, ix := range t.indexes {
 			report.Indexes++
 			info, err := check("index "+ix.name, ix.tree)
@@ -501,7 +656,7 @@ func (db *DB) Verify() (CheckReport, error) {
 				return report, err
 			}
 			if info.Entries != len(rows) {
-				return report, fmt.Errorf("index %s has %d entries for %d rows", ix.name, info.Entries, len(rows))
+				return report, fmt.Errorf("index %s has %d entries for %d row versions", ix.name, info.Entries, len(rows))
 			}
 			for _, r := range rows {
 				if _, found, err := ix.tree.Get(ix.entryKey(r.vals, r.key)); err != nil || !found {

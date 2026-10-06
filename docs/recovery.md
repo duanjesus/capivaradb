@@ -20,7 +20,8 @@ The code is `internal/storage/wal.go`, `pager.go` and `recovery.go`.
 - **Recovery is restartable.** A crash during recovery is recovered from
   like any other.
 
-What is *not* guaranteed yet is isolation: see the end of this page.
+Isolation between concurrent transactions is the subject of
+[mvcc.md](mvcc.md).
 
 ## The rule
 
@@ -199,7 +200,7 @@ It earned its keep while it was being written, three times:
   different writes from run to run, and whether the mutant was caught was
   luck. All three now iterate in a fixed order — a given seed replays
   exactly — and the case the mutant breaks has a test of its own,
-  `TestStatementRollbackIsNotRepeatedByRecovery`, that does not depend on
+  `TestUndoIsNotRepeatedByRecovery`, that does not depend on
   chance.
 
 None of these would have been noticed by looking at a green test run.
@@ -212,13 +213,14 @@ page started. The LSN check is an optimisation, not a correctness condition
 
 ## Limitations
 
-- **No isolation between transactions**, still. Two consequences here: a
-  rollback restores the values the transaction saw, which overwrites
-  anything another transaction wrote to the same rows in between; and
-  `DROP TABLE`, `DROP INDEX` and `CREATE INDEX` are refused while another
-  transaction has uncommitted changes, because nothing else stops that
-  transaction's rollback from touching what was dropped. MVCC and locks
-  (milestone 5) replace both.
+- **Rollback is work.** There is no commit log: a transaction that rolls
+  back removes what it wrote, through its undo records. That is what lets
+  recovery leave nothing but committed data behind, and it makes a rollback
+  cost in proportion to what the transaction did.
+- **Some schema changes are refused under concurrency.** `DROP TABLE`,
+  `DROP INDEX` and `CREATE INDEX` fail while another transaction has
+  uncommitted changes, because the catalog is not versioned and nothing
+  else stops that transaction's rollback from touching what was dropped.
 - **One fsync per commit.** There is no group commit: with a single writer
   at a time there is nobody to group with. Throughput for single-row
   transactions is therefore bounded by the disk's sync latency.

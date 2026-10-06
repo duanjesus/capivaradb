@@ -79,15 +79,33 @@ Acceptance — the centrepiece of the project:
 Details in [recovery.md](recovery.md) and
 [decisions/0006](decisions/0006-logging-scheme.md).
 
-## 5. MVCC
+## 5. MVCC — done
 
-- Row versions with creating/deleting transaction IDs
-- Snapshot isolation; first-committer-wins on write conflicts
-- Vacuum of dead versions
+- Row versions with creating and deleting transaction IDs, stored side by
+  side in the table's B+tree
+- Snapshots; read committed (a snapshot per statement) and repeatable read
+  (a snapshot per transaction, i.e. snapshot isolation)
+- Writers that conflict wait for each other, with deadlock detection;
+  under repeatable read a transaction that would overwrite a change it
+  cannot see fails with a serialization error
+- Uniqueness enforced against what is alive, not against what is visible
+- Vacuum of dead versions, on request and automatic
 
-Acceptance: concurrent tests for each anomaly — dirty read, non-repeatable
-read, phantom, lost update must not happen; write skew can, and is
-documented as the known gap between snapshot isolation and serializable.
+Acceptance:
+
+- a transcript per anomaly — dirty read, non-repeatable read, phantom, lost
+  update — showing it does not happen at the level that forbids it, and
+  one showing that write skew does, which is the documented gap between
+  snapshot isolation and serializable;
+- deadlocks between two and three transactions detected; waits cancellable;
+- concurrent transfers from eight goroutines with readers checking, at
+  every moment, that the total is unchanged;
+- the crash tests of milestone 4 still passing on versioned rows;
+- mutation testing extended with ten ways of breaking the isolation rules,
+  all caught.
+
+Details in [mvcc.md](mvcc.md) and
+[decisions/0007](decisions/0007-mvcc-design.md).
 
 ## 6. Planner
 

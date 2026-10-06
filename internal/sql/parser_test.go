@@ -248,6 +248,8 @@ var corpus = []struct{ src, canonical string }{
 	{"set search_path to public, extra", "set search_path = 'public, extra'"},
 	{"show time zone", "show timezone"},
 	{"CHECKPOINT", "checkpoint"},
+	{"VACUUM", "vacuum"},
+	{"vacuum \"My Table\"", "vacuum \"My Table\""},
 }
 
 func TestCorpus(t *testing.T) {

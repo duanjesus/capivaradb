@@ -23,6 +23,12 @@ primary key, through the binder, the B+tree and the write-ahead log.
 | File, `-nosync` | 9.8 µs/row | 4.6 µs/row (217 000 rows/s) |
 | File, fsync at commit | **614 µs/row** | 11.9 µs/row (84 000 rows/s) |
 
+With row versions (milestone 5) the same benchmark gives 6.0, 10.6 and
+639 µs per row for single-row transactions, and 5.1, 5.5 and 13.5 µs with
+100 rows per transaction. An insert now also checks whether any version of
+the key is alive and writes a slightly larger entry; that costs about a
+microsecond. The fsync still decides everything that matters.
+
 How to read them:
 
 - **The fsync is the commit.** A single-row transaction costs about 0.6 ms,
@@ -32,8 +38,8 @@ How to read them:
   an inefficiency to tune away. `-nosync` shows what is left without it.
 - **Batching amortises it.** With 100 rows per transaction the same fsync
   is shared by 100 rows, and throughput rises fifty-fold.
-- There is no group commit: with one writer at a time there is nobody to
-  share a sync with. That changes with concurrent writers (milestone 5).
+- There is no group commit. With one writer at a time there is nobody to
+  share a sync with, and writers are still serialised after milestone 5.
 
 ## B+tree
 
@@ -66,5 +72,6 @@ How to read them:
   because the "disk" is memory. On a real disk each miss is a read, and the
   device dominates.
 
-What none of this shows: SQL queries (the executor materialises whole
-tables and would dominate), or concurrency.
+What none of this shows: concurrency (readers do not block, but there is no
+benchmark of it yet), or SQL queries (the executor materialises whole
+tables and would dominate).

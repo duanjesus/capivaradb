@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="727" height="1030" viewBox="0 0 727 1030" role="img" aria-label="mutation testing: break a rule, the tests must fail">
+<rect width="727" height="1030" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h707 a10 10 0 0 1 10 10v24 h-727 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="363" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">mutation testing: break a rule, the tests must fail</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ scripts/mutation-test.sh</text>
+<text x="18" y="86" fill="#e6edf3">== durability ==</text>
+<text x="18" y="106" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="126" fill="#e6edf3">  passes</text>
+<text x="18" y="146" fill="#e6edf3">mutant: COMMIT returns without syncing the log</text>
+<text x="18" y="166" fill="#e6edf3">  killed</text>
+<text x="18" y="186" fill="#e6edf3">mutant: a page is written to the data file before its log record is durable</text>
+<text x="18" y="206" fill="#e6edf3">  killed</text>
+<text x="18" y="226" fill="#e6edf3">mutant: recovery skips the undo pass</text>
+<text x="18" y="246" fill="#e6edf3">  killed</text>
+<text x="18" y="266" fill="#e6edf3">mutant: recovery skips the redo pass</text>
+<text x="18" y="286" fill="#e6edf3">  killed</text>
+<text x="18" y="306" fill="#e6edf3">mutant: a page changed for the first time since a checkpoint is not logged in full</text>
+<text x="18" y="326" fill="#e6edf3">  killed</text>
+<text x="18" y="346" fill="#e6edf3">mutant: a checkpoint does not sync the data file</text>
+<text x="18" y="366" fill="#e6edf3">  killed</text>
+<text x="18" y="386" fill="#e6edf3">mutant: a checkpoint discards the log while a transaction is still open</text>
+<text x="18" y="406" fill="#e6edf3">  killed</text>
+<text x="18" y="426" fill="#e6edf3">mutant: undo steps are not marked as done in the log</text>
+<text x="18" y="446" fill="#e6edf3">  killed</text>
+<text x="18" y="466" fill="#e6edf3">mutant: trees dropped by a committed transaction are not freed after a crash</text>
+<text x="18" y="486" fill="#e6edf3">  killed</text>
+<text x="18" y="526" fill="#e6edf3">== isolation ==</text>
+<text x="18" y="546" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="566" fill="#e6edf3">  passes</text>
+<text x="18" y="586" fill="#e6edf3">mutant: a snapshot treats transactions still in progress as committed</text>
+<text x="18" y="606" fill="#e6edf3">  killed</text>
+<text x="18" y="626" fill="#e6edf3">mutant: a version marked deleted is hidden even if the deleter has not committed</text>
+<text x="18" y="646" fill="#e6edf3">  killed</text>
+<text x="18" y="666" fill="#e6edf3">mutant: repeatable read takes a new snapshot for every statement</text>
+<text x="18" y="686" fill="#e6edf3">  killed</text>
+<text x="18" y="706" fill="#e6edf3">mutant: a transaction overwrites a change it cannot see instead of failing</text>
+<text x="18" y="726" fill="#e6edf3">  killed</text>
+<text x="18" y="746" fill="#e6edf3">mutant: a write does not wait for the uncommitted change of another transaction</text>
+<text x="18" y="766" fill="#e6edf3">  killed</text>
+<text x="18" y="786" fill="#e6edf3">mutant: an insert does not wait for an uncommitted row with the same key</text>
+<text x="18" y="806" fill="#e6edf3">  killed</text>
+<text x="18" y="826" fill="#e6edf3">mutant: an insert ignores a key being deleted by a transaction still in progress</text>
+<text x="18" y="846" fill="#e6edf3">  killed</text>
+<text x="18" y="866" fill="#e6edf3">mutant: deadlocks are not detected</text>
+<text x="18" y="886" fill="#e6edf3">  killed</text>
+<text x="18" y="906" fill="#e6edf3">mutant: vacuum removes versions that an open snapshot can still see</text>
+<text x="18" y="926" fill="#e6edf3">  killed</text>
+<text x="18" y="946" fill="#e6edf3">mutant: a transaction&#39;s versions become visible to others before it commits</text>
+<text x="18" y="966" fill="#e6edf3">  killed</text>
+<text x="18" y="1006" fill="#e6edf3">every mutant was killed</text>
+</g>
+</svg>

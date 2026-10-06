@@ -103,6 +103,6 @@ ROLLBACK
 show transaction isolation level;
  transaction_isolation 
 -----------------------
- read uncommitted
+ read committed
 (1 row)
 

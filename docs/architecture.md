@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the code as it stands at milestone 4 and marks what
+This document describes the code as it stands at milestone 5 and marks what
 each later milestone changes. It is updated with every milestone.
 
 ## Layers
@@ -170,8 +170,14 @@ to a tree the transaction logs how to reverse it; `ROLLBACK`, a failed
 statement and crash recovery all reverse changes through that same log, so
 statements are atomic and so are transactions, across a crash. `COMMIT`
 makes the log durable. DDL is transactional too: a dropped table's pages are
-only freed after the commit. See [recovery.md](recovery.md). There is still
-no isolation between transactions: see the README.
+only freed after the commit. See [recovery.md](recovery.md).
+
+**Isolation.** Rows are versioned: each version records the transaction
+that created it and the one that deleted it, and every statement reads
+through a snapshot that decides which versions exist for it. Readers and
+writers do not block each other; writers that want the same row wait for
+one another, with deadlock detection. Two levels are offered, read
+committed and repeatable read (snapshot isolation). See [mvcc.md](mvcc.md).
 
 ## Values and types
 
@@ -193,7 +199,7 @@ otherwise, as in PostgreSQL.
 | Today | Replaced by |
 |-------|-------------|
 | Indexes maintained but never read by queries | Index scans chosen by the planner (M6) |
-| One global lock, no isolation | MVCC snapshots, row versions, vacuum (M5) |
+| One writer at a time under a database-wide lock | Not planned: MVCC gives isolation, not parallel writes |
 | Joins in the order written, filters applied last | Cost-based planner (M6) |
 | Every step materialised, nested-loop joins | Iterator tree behind the same `Rows` interface (M7) |
 

@@ -921,3 +921,11 @@ func (p *Pager) FreePages() ([]uint32, error) {
 	}
 	return ids, nil
 }
+
+// LSN returns the position the log has reached: the sequence number the
+// next record will get. It only ever grows, across restarts too.
+func (p *Pager) LSN() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.wal.next
+}

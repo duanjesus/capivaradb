@@ -244,6 +244,14 @@ func (p *parser) statement() (Node, error) {
 		p.i++
 		p.txnNoise()
 		return &Rollback{}, nil
+	case "vacuum":
+		p.i++
+		v := &Vacuum{}
+		if p.isIdent() {
+			t := p.next()
+			v.Table, v.Pos = t.Text, t.Pos
+		}
+		return v, nil
 	case "checkpoint":
 		p.i++
 		return &Checkpoint{}, nil
