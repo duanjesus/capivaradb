@@ -1,0 +1,149 @@
+-- Milestone 8: ORDER BY without a sort, and hash tables larger than memory.
+-- Checked against ordering.out by scripts/psql-smoke.sh.
+create table item (id int primary key, owner int not null, price int not null, label text not null);
+CREATE TABLE
+create index item_price on item (price);
+CREATE INDEX
+create index item_owner_price on item (owner, price);
+CREATE INDEX
+insert into item values (1, 1, 919, 'item 1'), (2, 2, 838, 'item 2'), (3, 3, 757, 'item 3'), (4, 4, 676, 'item 4');
+INSERT 0 4
+insert into item select id + 4, (id + 4) % 64, ((id + 4) * 7919) % 1000, 'item ' || cast(id + 4 as text) from item;
+INSERT 0 4
+insert into item select id + 8, (id + 8) % 64, ((id + 8) * 7919) % 1000, 'item ' || cast(id + 8 as text) from item;
+INSERT 0 8
+insert into item select id + 16, (id + 16) % 64, ((id + 16) * 7919) % 1000, 'item ' || cast(id + 16 as text) from item;
+INSERT 0 16
+insert into item select id + 32, (id + 32) % 64, ((id + 32) * 7919) % 1000, 'item ' || cast(id + 32 as text) from item;
+INSERT 0 32
+insert into item select id + 64, (id + 64) % 64, ((id + 64) * 7919) % 1000, 'item ' || cast(id + 64 as text) from item;
+INSERT 0 64
+insert into item select id + 128, (id + 128) % 64, ((id + 128) * 7919) % 1000, 'item ' || cast(id + 128 as text) from item;
+INSERT 0 128
+insert into item select id + 256, (id + 256) % 64, ((id + 256) * 7919) % 1000, 'item ' || cast(id + 256 as text) from item;
+INSERT 0 256
+insert into item select id + 512, (id + 512) % 64, ((id + 512) * 7919) % 1000, 'item ' || cast(id + 512 as text) from item;
+INSERT 0 512
+insert into item select id + 1024, (id + 1024) % 64, ((id + 1024) * 7919) % 1000, 'item ' || cast(id + 1024 as text) from item;
+INSERT 0 1024
+insert into item select id + 2048, (id + 2048) % 64, ((id + 2048) * 7919) % 1000, 'item ' || cast(id + 2048 as text) from item;
+INSERT 0 2048
+insert into item select id + 4096, (id + 4096) % 64, ((id + 4096) * 7919) % 1000, 'item ' || cast(id + 4096 as text) from item;
+INSERT 0 4096
+analyze;
+ANALYZE
+-- The table is stored in primary key order: nothing to sort, and with a
+-- LIMIT nothing to read beyond the rows wanted.
+explain (analyze, costs off, timing off) select id, price from item order by id limit 3;
+                   QUERY PLAN                   
+------------------------------------------------
+ Limit (actual rows=3 loops=1)
+   ->  Seq Scan on item (actual rows=3 loops=1)
+(2 rows)
+
+-- An index is in the order of its columns. Three entries are read from it
+-- instead of 8 192 rows being sorted.
+explain (analyze, costs off, timing off) select id, price from item order by price limit 3;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Limit (actual rows=3 loops=1)
+   ->  Index Scan using item_price on item (actual rows=3 loops=1)
+(2 rows)
+
+select id, price from item order by price limit 3;
+  id  | price 
+------+-------
+ 1000 |     0
+ 2000 |     0
+ 3000 |     0
+(3 rows)
+
+-- The column an equality fixes does not count: within one owner, the index
+-- on (owner, price) is in price order.
+explain (analyze, costs off, timing off) select id, price from item where owner = 5 order by price limit 3;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Limit (actual rows=3 loops=1)
+   ->  Index Scan using item_owner_price on item (actual rows=3 loops=1)
+         Index Cond: (owner = 5)
+(3 rows)
+
+-- Without a LIMIT every row is wanted, and going through a secondary index
+-- for each costs more than scanning and sorting.
+explain (costs off) select id, price from item order by price;
+       QUERY PLAN       
+------------------------
+ Sort
+   Sort Key: price
+   ->  Seq Scan on item
+(3 rows)
+
+-- Descending order still sorts (a heap of three rows, but the whole table
+-- is read).
+explain (analyze, costs off, timing off) select id, price from item order by price desc limit 3;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Limit (actual rows=3 loops=1)
+   ->  Sort (actual rows=3 loops=1)
+         Sort Key: price DESC
+         Sort Method: top-N heapsort  Memory: 1kB
+         ->  Seq Scan on item (actual rows=8192 loops=1)
+(5 rows)
+
+-- Grouping keeps one entry per group in a hash table. With room for all
+-- 8 192 groups it is done in one pass...
+explain (analyze, costs off, timing off) select label, count(*) from item group by label;
+                    QUERY PLAN                     
+---------------------------------------------------
+ HashAggregate (actual rows=8192 loops=1)
+   Group Key: label
+   Batches: 1  Memory Usage: 1782kB
+   ->  Seq Scan on item (actual rows=8192 loops=1)
+(4 rows)
+
+-- ...and without, the groups that do not fit are set aside on disk and
+-- grouped in later passes.
+set work_mem = '64kB';
+SET
+explain (analyze, costs off, timing off) select label, count(*) from item group by label;
+                    QUERY PLAN                     
+---------------------------------------------------
+ HashAggregate (actual rows=8192 loops=1)
+   Group Key: label
+   Batches: 49  Memory Usage: 65kB
+   ->  Seq Scan on item (actual rows=8192 loops=1)
+(4 rows)
+
+select count(*), sum(n) from (select label, count(*) as n from item group by label) g;
+ count | sum  
+-------+------
+  8192 | 8192
+(1 row)
+
+explain (analyze, costs off, timing off) select distinct label from item;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Unique (actual rows=8192 loops=1)
+   Batches: 17  Memory Usage: 65kB
+   ->  Seq Scan on item (actual rows=8192 loops=1)
+(3 rows)
+
+explain (analyze, costs off, timing off) select id from item except select id + 1 from item;
+                    QUERY PLAN                     
+---------------------------------------------------
+ HashSetOp Except (actual rows=1 loops=1)
+   Batches: 17  Memory Usage: 65kB
+   ->  Seq Scan on item (actual rows=8192 loops=1)
+   ->  Seq Scan on item (actual rows=8192 loops=1)
+(4 rows)
+
+select id from item except select id + 1 from item;
+ id 
+----
+  1
+(1 row)
+
+set work_mem = '4MB';
+SET
+drop table item;
+DROP TABLE

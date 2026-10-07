@@ -44,9 +44,13 @@ type planNode struct {
 	rows, cost float64
 	// open starts the step and returns the iterator over its rows.
 	open func(cx *env) (iter, error)
-	// orderedBy is 1 + the FROM column the rows come out sorted by, or 0
-	// if they come in no useful order. A table is stored in primary key
-	// order, so a scan of it is sorted for free; a merge join can use that.
+	// order lists the FROM columns the rows come out sorted by, ascending,
+	// most significant first; nil if they come in no useful order. A table
+	// is stored in primary key order and an index in the order of its
+	// columns, so a scan is sorted for free: a merge join can skip its
+	// sort, and an ORDER BY that asks for the same order needs none.
+	// orderedBy is 1 + the first of those columns, or 0.
+	order     []int
 	orderedBy int
 
 	// What actually happened, for EXPLAIN ANALYZE.
@@ -232,6 +236,10 @@ type planner struct {
 	owners []*relItem // for each column, the base table it belongs to, if any
 	conjs  map[sql.Expr]*conj
 	equis  map[*conj]*equiCond
+	// hint is the order the query would like, and hintItem the one
+	// relation whose scan can provide it: the only one of the FROM clause.
+	hint     *orderHint
+	hintItem *relItem
 }
 
 // conj is one AND-ed piece of a condition, analysed.
@@ -659,6 +667,15 @@ type access struct {
 	unique bool
 	// rows estimates how many rows one use of the access returns.
 	rows, cost float64
+	// bounded is set if a condition narrows the range read; an access that
+	// is not bounded reads the whole index, which is only worth it for the
+	// order the rows come in.
+	bounded bool
+	// order lists the FROM columns the rows come out sorted by: the key's
+	// columns after the ones fixed by an equality, then, for an index, the
+	// primary key, which is how entries with equal indexed values are
+	// arranged.
+	order []int
 }
 
 func (a *access) name() string {
@@ -716,6 +733,18 @@ func (a *access) bounds(en *env) (kb keyBounds, ok bool, err error) {
 // search argument's other side can be computed where the access would be
 // used.
 func (p *planner) bestAccess(it *relItem, sargs []sarg, available func(sarg) bool) *access {
+	var best *access
+	for _, a := range p.accesses(it, sargs, available) {
+		if a.bounded && (best == nil || a.cost < best.cost) {
+			best = a
+		}
+	}
+	return best
+}
+
+// accesses lists every way of reading a table through its primary key or
+// an index, with the search arguments each can use.
+func (p *planner) accesses(it *relItem, sargs []sarg, available func(sarg) bool) []*access {
 	if it.table == nil || p.s.vars["enable_indexscan"] == "off" {
 		return nil
 	}
@@ -733,7 +762,7 @@ func (p *planner) bestAccess(it *relItem, sargs []sarg, available func(sarg) boo
 		cands = append(cands, candidate{ix, ix.cols, ix.unique})
 	}
 
-	var best *access
+	var all []*access
 	for _, cand := range cands {
 		a := &access{item: it, index: cand.index}
 		sel := 1.0
@@ -777,9 +806,7 @@ func (p *planner) bestAccess(it *relItem, sargs []sarg, available func(sarg) boo
 				break
 			}
 		}
-		if len(a.eq) == 0 && a.lo == nil && a.hi == nil {
-			continue
-		}
+		a.bounded = len(a.eq) > 0 || a.lo != nil || a.hi != nil
 		a.unique = cand.uniq && len(a.eq) == len(cand.cols)
 		a.rows = math.Max(it.ps.rows*sel, 1)
 		if a.unique {
@@ -790,11 +817,46 @@ func (p *planner) bestAccess(it *relItem, sargs []sarg, available func(sarg) boo
 			perRow = costKeyRow
 		}
 		a.cost = costDescent + a.rows*perRow
-		if best == nil || a.cost < best.cost {
-			best = a
+		for _, col := range cand.cols[len(a.eq):] {
+			a.order = append(a.order, it.off+col)
+		}
+		if cand.index != nil {
+			for _, col := range t.pk {
+				a.order = append(a.order, it.off+col)
+			}
+		}
+		all = append(all, a)
+	}
+	return all
+}
+
+// orderHint is what the query would like from the plan of its FROM clause:
+// rows sorted by these columns, so that its ORDER BY needs no sort, and —
+// if it has a LIMIT — only the first rows of them.
+type orderHint struct {
+	cols []int
+	// rows is how many rows the query will read, or 0 for all of them.
+	rows float64
+}
+
+// inOrder reports whether rows sorted by order are sorted by want.
+func inOrder(order, want []int) bool {
+	if len(want) == 0 || len(want) > len(order) {
+		return false
+	}
+	for i, col := range want {
+		if order[i] != col {
+			return false
 		}
 	}
-	return best
+	return true
+}
+
+func (n *planNode) setOrder(order []int) {
+	n.order, n.orderedBy = order, 0
+	if len(order) > 0 {
+		n.orderedBy = 1 + order[0]
+	}
 }
 
 // without returns the conditions in all that are not among covered: what
@@ -967,20 +1029,53 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 		node.rows = math.Max(sp.rawRows*sel, 1)
 		seqCost := sp.rawRows * costSeqRow
 		// A table is stored in the order of its primary key.
-		if t.pk != nil {
-			node.orderedBy = 1 + it.off + t.pk[0]
+		var seqOrder []int
+		for _, col := range t.pk {
+			seqOrder = append(seqOrder, it.off+col)
 		}
 		// Only conditions on constants can drive a scan that stands alone.
-		acc := p.bestAccess(it, sp.sargs, func(sa sarg) bool { return len(sa.needs) == 0 })
-		if acc != nil && acc.cost < seqCost {
+		constant := func(sa sarg) bool { return len(sa.needs) == 0 }
+		acc := p.bestAccess(it, sp.sargs, constant)
+		if acc != nil && acc.cost >= seqCost {
+			acc = nil
+		}
+		// If the query wants the rows of this table in some order, a path
+		// that delivers them in it saves the sort — and, with a LIMIT,
+		// reading most of the table. Every path is costed with what the
+		// query would still have to do after it.
+		if hint := p.hint; hint != nil && it == p.hintItem {
+			after := func(cost float64, order []int) float64 {
+				switch {
+				case !inOrder(order, hint.cols):
+					return cost + sortCost(node.rows)
+				case hint.rows > 0 && hint.rows < node.rows:
+					// Only the first rows are read.
+					return costDescent + cost*hint.rows/node.rows
+				}
+				return cost
+			}
+			best := after(seqCost, seqOrder)
+			if acc != nil {
+				best = after(acc.cost, acc.order)
+			}
+			for _, a := range p.accesses(it, sp.sargs, constant) {
+				if c := after(a.cost, a.order); inOrder(a.order, hint.cols) && c < best {
+					best, acc = c, a
+				}
+			}
+			if acc != nil && after(seqCost, seqOrder) <= best {
+				acc = nil
+			}
+		}
+		if acc != nil {
 			node.op = fmt.Sprintf("Index Scan using %s on %s", acc.name(), it.label())
-			node.lines = []string{"Index Cond: " + exprList(acc.used)}
+			if acc.bounded {
+				node.lines = []string{"Index Cond: " + exprList(acc.used)}
+			}
 			filterLine(acc.used)
 			node.cost = acc.cost
 			node.rows = math.Min(node.rows, acc.rows)
-			if acc.index != nil {
-				node.orderedBy = 0
-			}
+			node.setOrder(acc.order)
 			node.open = func(cx *env) (iter, error) {
 				kb, ok, err := acc.bounds(cx.child())
 				if err != nil {
@@ -995,6 +1090,7 @@ func (p *planner) planScan(it *relItem, local []*conj) (*scanPlan, error) {
 			node.op = "Seq Scan on " + it.label()
 			filterLine(nil)
 			node.cost = seqCost
+			node.setOrder(seqOrder)
 			node.open = func(cx *env) (iter, error) {
 				return widen(cx, &scanIter{db: p.s.db, t: t, cx: cx}), nil
 			}
@@ -1122,8 +1218,12 @@ func (p *planner) hashJoinNode(spec *joinSpec, probe, build []hashKey, used []sq
 func nlJoinNode(spec *joinSpec, conds []*conj) *planNode {
 	evals, exprs := condEvals(conds)
 	spec.conds = evals
-	node := &planNode{op: "Nested Loop" + spec.kind.label() + joinWord(spec.kind), kids: []*planNode{spec.outer, spec.inner},
-		orderedBy: spec.outer.orderedBy}
+	node := &planNode{op: "Nested Loop" + spec.kind.label() + joinWord(spec.kind), kids: []*planNode{spec.outer, spec.inner}}
+	// The outer rows keep their order, unless the rows of the inner side
+	// that matched nothing are added at the end.
+	if spec.kind != joinFull {
+		node.setOrder(spec.outer.order)
+	}
 	if len(exprs) > 0 {
 		node.lines = []string{"Join Filter: " + exprList(exprs)}
 	}
@@ -1278,8 +1378,8 @@ func (p *planner) planUnit(it *relItem, outside []*conj) (*scanPlan, error) {
 				probe.lines = append(probe.lines, "Filter: "+exprList(localExprs))
 			}
 			ispec := &joinSpec{kind: joinLeft, outer: left, off: inner.off, width: width, conds: onEvals}
-			node = &planNode{op: "Nested Loop Left Join", kids: []*planNode{left, probe}, orderedBy: left.orderedBy,
-				cost: cost + left.rows*acc.cost}
+			node = &planNode{op: "Nested Loop Left Join", kids: []*planNode{left, probe}, cost: cost + left.rows*acc.cost}
+			node.setOrder(left.order)
 			if len(onExprs) > 0 {
 				node.lines = []string{"Join Filter: " + exprList(onExprs)}
 			}
@@ -1493,6 +1593,7 @@ func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 	width := len(p.cols)
 	node := scans[order[0].item].node
 	joined := bit(order[0].item)
+	sorted := node.order
 	for _, step := range order[1:] {
 		it, sp, outer := g.items[step.item], scans[step.item], node
 		spec := &joinSpec{kind: joinInner, outer: outer, inner: sp.node, off: it.off, end: it.off + it.width, width: width}
@@ -1562,7 +1663,20 @@ func (p *planner) planGroup(g *joinGroup, extra []sql.Expr) (*planNode, error) {
 		default:
 			join = nlJoinNode(spec, step.conds)
 		}
-		join.rows, join.cost, join.orderedBy = step.rows, step.cost, step.orderedBy
+		// Nested loops, with or without an index, return the outer rows
+		// in the order they came; a merge returns them in key order; a
+		// hash join that goes to disk returns them in no order at all.
+		switch step.method {
+		case hashJoin:
+			sorted = nil
+		case mergeJoin:
+			sorted = nil
+			if step.orderedBy != 0 {
+				sorted = []int{step.orderedBy - 1}
+			}
+		}
+		join.rows, join.cost = step.rows, step.cost
+		join.setOrder(sorted)
 		node = join
 		joined = joined.or(bit(step.item))
 	}
@@ -1704,7 +1818,9 @@ func (p *planner) orderGreedy(n int, first func(int) joinStep, extend func(bits,
 	return order
 }
 
-// fromPlan is a planned FROM clause.
+// fromPlan is a FROM clause being planned. Its columns are known as soon
+// as it is analysed; the plan comes second, once the rest of the query
+// has said what it would like from it.
 type fromPlan struct {
 	// cols are the columns the clause produces, in written order.
 	cols []scopeCol
@@ -1713,11 +1829,15 @@ type fromPlan struct {
 	// once, and first.
 	star []int
 	node *planNode
+
+	p     *planner
+	g     *joinGroup
+	where sql.Expr
 }
 
-// planFromWhere plans a FROM clause together with the WHERE clause that
-// filters it: the plan produces the rows that satisfy WHERE.
-func (s *Session) planFromWhere(from sql.TableExpr, where sql.Expr, parent *scope, ptypes []sql.Type) (*fromPlan, error) {
+// analyseFrom resolves a FROM clause and checks the WHERE clause that
+// filters it.
+func (s *Session) analyseFrom(from sql.TableExpr, where sql.Expr, parent *scope, ptypes []sql.Type) (*fromPlan, error) {
 	fb := &fromBuilder{s: s, parent: parent, ptypes: ptypes}
 	g, err := fb.build(from)
 	if err != nil {
@@ -1736,8 +1856,28 @@ func (s *Session) planFromWhere(from sql.TableExpr, where sql.Expr, parent *scop
 	if _, err := p.b.bindWhere(where, "WHERE"); err != nil {
 		return nil, err
 	}
-	node, err := p.planGroup(g, conjuncts(where))
-	return &fromPlan{cols: fb.cols, star: g.star, node: node}, err
+	return &fromPlan{cols: fb.cols, star: g.star, p: p, g: g, where: where}, nil
+}
+
+// sortable reports whether a scan can deliver rows in ascending order of
+// FROM column col the way ORDER BY means it. Keys are stored with NULL
+// before every value and ORDER BY puts NULLs last unless told otherwise,
+// so the column must be one that has no NULLs, or the query must have
+// asked for them first.
+func (fp *fromPlan) sortable(col int, nullsFirst bool) bool {
+	it, tcol, ok := fp.p.tableCol(col)
+	return ok && (nullsFirst || it.table.cols[tcol].notNull)
+}
+
+// plan plans the clause: the result produces the rows that satisfy WHERE.
+// hint, if not nil, is the order the query would like them in.
+func (fp *fromPlan) plan(hint *orderHint) error {
+	if hint != nil && len(fp.g.items) == 1 && fp.g.items[0].table != nil {
+		fp.p.hint, fp.p.hintItem = hint, fp.g.items[0]
+	}
+	node, err := fp.p.planGroup(fp.g, conjuncts(fp.where))
+	fp.node = node
+	return err
 }
 
 // targetScan is how an UPDATE or DELETE finds the rows it applies to. It is

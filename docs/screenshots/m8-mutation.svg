@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="794" height="2510" viewBox="0 0 794 2510" role="img" aria-label="mutation testing: break a rule, the tests must fail">
+<rect width="794" height="2510" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h774 a10 10 0 0 1 10 10v24 h-794 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="397" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">mutation testing: break a rule, the tests must fail</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#7ee787">$ scripts/mutation-test.sh</text>
+<text x="18" y="86" fill="#e6edf3">== durability ==</text>
+<text x="18" y="106" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="126" fill="#e6edf3">  passes</text>
+<text x="18" y="146" fill="#e6edf3">mutant: COMMIT returns without syncing the log</text>
+<text x="18" y="166" fill="#e6edf3">  killed</text>
+<text x="18" y="186" fill="#e6edf3">mutant: a page is written to the data file before its log record is durable</text>
+<text x="18" y="206" fill="#e6edf3">  killed</text>
+<text x="18" y="226" fill="#e6edf3">mutant: recovery skips the undo pass</text>
+<text x="18" y="246" fill="#e6edf3">  killed</text>
+<text x="18" y="266" fill="#e6edf3">mutant: recovery skips the redo pass</text>
+<text x="18" y="286" fill="#e6edf3">  killed</text>
+<text x="18" y="306" fill="#e6edf3">mutant: a page changed for the first time since a checkpoint is not logged in full</text>
+<text x="18" y="326" fill="#e6edf3">  killed</text>
+<text x="18" y="346" fill="#e6edf3">mutant: a checkpoint does not sync the data file</text>
+<text x="18" y="366" fill="#e6edf3">  killed</text>
+<text x="18" y="386" fill="#e6edf3">mutant: a checkpoint discards the log while a transaction is still open</text>
+<text x="18" y="406" fill="#e6edf3">  killed</text>
+<text x="18" y="426" fill="#e6edf3">mutant: undo steps are not marked as done in the log</text>
+<text x="18" y="446" fill="#e6edf3">  killed</text>
+<text x="18" y="466" fill="#e6edf3">mutant: trees dropped by a committed transaction are not freed after a crash</text>
+<text x="18" y="486" fill="#e6edf3">  killed</text>
+<text x="18" y="526" fill="#e6edf3">== isolation ==</text>
+<text x="18" y="546" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="566" fill="#e6edf3">  passes</text>
+<text x="18" y="586" fill="#e6edf3">mutant: a snapshot treats transactions still in progress as committed</text>
+<text x="18" y="606" fill="#e6edf3">  killed</text>
+<text x="18" y="626" fill="#e6edf3">mutant: a version marked deleted is hidden even if the deleter has not committed</text>
+<text x="18" y="646" fill="#e6edf3">  killed</text>
+<text x="18" y="666" fill="#e6edf3">mutant: repeatable read takes a new snapshot for every statement</text>
+<text x="18" y="686" fill="#e6edf3">  killed</text>
+<text x="18" y="706" fill="#e6edf3">mutant: a transaction overwrites a change it cannot see instead of failing</text>
+<text x="18" y="726" fill="#e6edf3">  killed</text>
+<text x="18" y="746" fill="#e6edf3">mutant: a write does not wait for the uncommitted change of another transaction</text>
+<text x="18" y="766" fill="#e6edf3">  killed</text>
+<text x="18" y="786" fill="#e6edf3">mutant: an insert does not wait for an uncommitted row with the same key</text>
+<text x="18" y="806" fill="#e6edf3">  killed</text>
+<text x="18" y="826" fill="#e6edf3">mutant: an insert ignores a key being deleted by a transaction still in progress</text>
+<text x="18" y="846" fill="#e6edf3">  killed</text>
+<text x="18" y="866" fill="#e6edf3">mutant: deadlocks are not detected</text>
+<text x="18" y="886" fill="#e6edf3">  killed</text>
+<text x="18" y="906" fill="#e6edf3">mutant: vacuum removes versions that an open snapshot can still see</text>
+<text x="18" y="926" fill="#e6edf3">  killed</text>
+<text x="18" y="946" fill="#e6edf3">mutant: a transaction&#39;s versions become visible to others before it commits</text>
+<text x="18" y="966" fill="#e6edf3">  killed</text>
+<text x="18" y="1006" fill="#e6edf3">== planner ==</text>
+<text x="18" y="1026" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="1046" fill="#e6edf3">  passes</text>
+<text x="18" y="1066" fill="#e6edf3">mutant: a WHERE condition on the nullable side of a LEFT JOIN is pushed below the join</text>
+<text x="18" y="1086" fill="#e6edf3">  killed</text>
+<text x="18" y="1106" fill="#e6edf3">mutant: a LEFT JOIN drops the rows that have no match</text>
+<text x="18" y="1126" fill="#e6edf3">  killed</text>
+<text x="18" y="1146" fill="#e6edf3">mutant: a condition with a subquery is applied before all tables are joined</text>
+<text x="18" y="1166" fill="#e6edf3">  killed</text>
+<text x="18" y="1186" fill="#e6edf3">mutant: an index scan returns versions the snapshot cannot see</text>
+<text x="18" y="1206" fill="#e6edf3">  killed</text>
+<text x="18" y="1226" fill="#e6edf3">mutant: an inclusive upper bound of an index range is treated as exclusive</text>
+<text x="18" y="1246" fill="#e6edf3">  killed</text>
+<text x="18" y="1266" fill="#e6edf3">mutant: a join condition is not checked when the inner table is reached through an index</text>
+<text x="18" y="1286" fill="#e6edf3">  killed</text>
+<text x="18" y="1326" fill="#e6edf3">== executor ==</text>
+<text x="18" y="1346" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="1366" fill="#e6edf3">  passes</text>
+<text x="18" y="1386" fill="#e6edf3">mutant: a scan that resumes returns again the row it stopped at</text>
+<text x="18" y="1406" fill="#e6edf3">  killed</text>
+<text x="18" y="1426" fill="#e6edf3">mutant: a cursor reads through the snapshot of the session&#39;s latest statement, not its own</text>
+<text x="18" y="1446" fill="#e6edf3">  killed</text>
+<text x="18" y="1466" fill="#e6edf3">mutant: a cursor&#39;s snapshot is released as soon as the query has started</text>
+<text x="18" y="1486" fill="#e6edf3">  killed</text>
+<text x="18" y="1506" fill="#e6edf3">mutant: a hash join compares an integer with a double precision by their encodings</text>
+<text x="18" y="1526" fill="#e6edf3">  killed</text>
+<text x="18" y="1546" fill="#e6edf3">mutant: a hash join takes two NULL keys for equal</text>
+<text x="18" y="1566" fill="#e6edf3">  killed</text>
+<text x="18" y="1586" fill="#e6edf3">mutant: a hash FULL JOIN forgets the rows of its hashed side that matched nothing</text>
+<text x="18" y="1606" fill="#e6edf3">  killed</text>
+<text x="18" y="1626" fill="#e6edf3">mutant: a nested-loop FULL JOIN forgets the inner rows that matched nothing</text>
+<text x="18" y="1646" fill="#e6edf3">  killed</text>
+<text x="18" y="1666" fill="#e6edf3">mutant: an outer hash join on disk drops the rows whose key is NULL</text>
+<text x="18" y="1686" fill="#e6edf3">  killed</text>
+<text x="18" y="1706" fill="#e6edf3">mutant: a hash join that splits a partition again sends the two sides to different places</text>
+<text x="18" y="1726" fill="#e6edf3">  killed</text>
+<text x="18" y="1746" fill="#e6edf3">mutant: a merge join matches only the first of several outer rows with the same key</text>
+<text x="18" y="1766" fill="#e6edf3">  killed</text>
+<text x="18" y="1786" fill="#e6edf3">mutant: an external sort is not stable: equal rows from later runs come first</text>
+<text x="18" y="1806" fill="#e6edf3">  killed</text>
+<text x="18" y="1826" fill="#e6edf3">mutant: ORDER BY with LIMIT keeps the last rows instead of the first</text>
+<text x="18" y="1846" fill="#e6edf3">  killed</text>
+<text x="18" y="1866" fill="#e6edf3">mutant: RIGHT JOIN keeps the rows of the left side</text>
+<text x="18" y="1886" fill="#e6edf3">  killed</text>
+<text x="18" y="1906" fill="#e6edf3">mutant: JOIN ... USING in a right join shows the left side&#39;s column</text>
+<text x="18" y="1926" fill="#e6edf3">  killed</text>
+<text x="18" y="1946" fill="#e6edf3">mutant: UNION does not remove duplicates</text>
+<text x="18" y="1966" fill="#e6edf3">  killed</text>
+<text x="18" y="1986" fill="#e6edf3">mutant: INTERSECT ALL returns a row as often as the left side has it</text>
+<text x="18" y="2006" fill="#e6edf3">  killed</text>
+<text x="18" y="2026" fill="#e6edf3">mutant: the rows of the right side of INTERSECT and EXCEPT are not recorded</text>
+<text x="18" y="2046" fill="#e6edf3">  killed</text>
+<text x="18" y="2086" fill="#e6edf3">== order and overflow ==</text>
+<text x="18" y="2106" fill="#e6edf3">baseline: the unmodified code must pass</text>
+<text x="18" y="2126" fill="#e6edf3">  passes</text>
+<text x="18" y="2146" fill="#e6edf3">mutant: an index is taken to be in ORDER BY order for a column that may be NULL</text>
+<text x="18" y="2166" fill="#e6edf3">  killed</text>
+<text x="18" y="2186" fill="#e6edf3">mutant: ORDER BY ... DESC is answered by a scan in ascending order</text>
+<text x="18" y="2206" fill="#e6edf3">  killed</text>
+<text x="18" y="2226" fill="#e6edf3">mutant: a FULL JOIN is taken to keep the order of its outer side</text>
+<text x="18" y="2246" fill="#e6edf3">  killed</text>
+<text x="18" y="2266" fill="#e6edf3">mutant: an index scan is taken to be sorted by a column an equality did not fix</text>
+<text x="18" y="2286" fill="#e6edf3">  killed</text>
+<text x="18" y="2306" fill="#e6edf3">mutant: the rows of groups that did not fit in memory are dropped</text>
+<text x="18" y="2326" fill="#e6edf3">  killed</text>
+<text x="18" y="2346" fill="#e6edf3">mutant: DISTINCT never returns to the rows it set aside</text>
+<text x="18" y="2366" fill="#e6edf3">  killed</text>
+<text x="18" y="2386" fill="#e6edf3">mutant: the two sides of a set operation on disk are split by different hashes</text>
+<text x="18" y="2406" fill="#e6edf3">  killed</text>
+<text x="18" y="2426" fill="#e6edf3">mutant: a left row whose equals on the right were set aside is decided without them</text>
+<text x="18" y="2446" fill="#e6edf3">  killed</text>
+<text x="18" y="2486" fill="#e6edf3">every mutant was killed</text>
+</g>
+</svg>

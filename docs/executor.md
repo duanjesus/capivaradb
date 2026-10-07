@@ -19,21 +19,24 @@ list, `DISTINCT`, limits, set operations).
 
 **1. Memory is bounded by `work_mem`, not by the data.**
 
-A scan holds one batch of rows. A sort or a hash join that has to remember
-more than `work_mem` moves the excess to temporary files. Measured on a
-table of 40 000 rows, as live heap while the rows are being read
-(`TestMemoryIsBoundedByWorkMem`):
+A scan holds one batch of rows. Anything that has to remember more than
+`work_mem` — a sort, a hash join, a grouping, a duplicate removal — moves
+the excess to temporary files. Measured on a table of 40 000 rows, as live
+heap while the rows are being read (`TestMemoryIsBoundedByWorkMem`):
 
 | Query | `work_mem = 1GB` | `work_mem = 256kB` |
 |---|---:|---:|
 | Scan | 64 kB | 64 kB |
 | Sort (`ORDER BY`) | 6.4 MB | 0.9 MB |
-| Hash join of the table with itself | 13.6 MB | 2.1 MB |
+| Hash join of the table with itself | 13.6 MB | 1.6 MB |
+| `GROUP BY`, 40 000 groups | 12.0 MB | 0.8 MB |
+| `DISTINCT` | 4.3 MB | 0.9 MB |
+| `EXCEPT` | 8.8 MB | 1.3 MB |
 
-The scan uses 64 kB whatever the table's size. The other two, with room,
-hold everything; without it they hold a few times `work_mem` — the
-allowance itself plus the read and write buffers of the files in use —
-and that does not grow with the table.
+The scan uses 64 kB whatever the table's size. The others, with room, hold
+everything; without it they hold a few times `work_mem` — the allowance
+itself plus the read and write buffers of the files in use — and that does
+not grow with the table.
 
 **2. A query that needs few rows reads few rows.**
 
@@ -100,7 +103,7 @@ in `work_mem`, both sides are first split into 16 partitions on disk by a
 hash of the key — rows that can match are then in partitions of the same
 number — and the partitions are joined one pair at a time: a *Grace* hash
 join. A partition that is still too large is split again with a different
-hash, up to three times.
+hash, into as many parts as its size calls for, up to three times.
 
 ```
  Hash Join (actual rows=5120 loops=1)
@@ -139,9 +142,56 @@ must encode alike (`1 = 1.0`), `-0.0` like `0.0`, and a NULL must never be
 looked up at all. `TestJoinKeysByEveryMethod` runs the same joins through
 each method and expects the same answer.
 
-## Sorting
+## Sorting, and not sorting
 
-`ORDER BY` uses one of three methods, shown by `EXPLAIN ANALYZE`:
+The cheapest sort is the one that does not happen. A table is stored in
+primary key order and an index in the order of its columns, so a scan
+returns its rows sorted by the key it reads through. When `ORDER BY` asks
+for columns of the `FROM` clause in ascending order, the planner is told,
+and if a scan can deliver that order there is no `Sort` in the plan:
+
+```
+explain (analyze, costs off, timing off) select id, price from item order by price limit 3;
+
+ Limit (actual rows=3 loops=1)
+   ->  Index Scan using item_price on item (actual rows=3 loops=1)
+```
+
+Three index entries read, where there were 8 192 rows to sort. Which
+orders a scan delivers:
+
+- the primary key, from a plain scan of the table;
+- the columns of an index, followed by the primary key (entries with
+  equal indexed values are arranged by the row they point at);
+- the same after the columns an equality fixes: with an index on
+  `(owner, price)`, `WHERE owner = 5 ORDER BY price` reads one owner's
+  entries, which are in price order.
+
+A nested loop returns its outer rows in the order they came, so the order
+survives joins of that kind.
+
+Every path is costed with what the query would still have to do after it:
+a path in the wrong order pays for a sort; a path in the right one, when
+there is a `LIMIT`, pays only for the rows that will be read. Without a
+`LIMIT`, reading a whole table through a secondary index — a lookup per
+row — is estimated dearer than scanning and sorting it, and the plan says
+so:
+
+```
+explain (costs off) select id, price from item order by price;
+
+ Sort
+   Sort Key: price
+   ->  Seq Scan on item
+```
+
+One trap had to be avoided. Keys are stored with NULL before every value,
+and `ORDER BY` puts NULLs *last* unless told otherwise. An index is
+therefore only taken as sorted for a column declared `NOT NULL`, or when
+the query says `NULLS FIRST`.
+
+When a sort is needed, `ORDER BY` uses one of three methods, shown by
+`EXPLAIN ANALYZE`:
 
 - **`quicksort`**: the rows fit in `work_mem` and are sorted in memory.
 - **`external merge`**: they do not. Each memory-full is sorted and written
@@ -191,6 +241,47 @@ through the left input once.
 They closed the last gap in the test corpus: the 1 000 records of
 `select4.test` that failed all used them, and it now passes in full.
 
+## Hash tables larger than memory
+
+`GROUP BY`, `DISTINCT`, `UNION`, `INTERSECT` and `EXCEPT` all keep a hash
+table with one entry per distinct group or row. When it outgrows
+`work_mem` they all do the same thing, which is the idea of the Grace hash
+join applied to one input:
+
+1. The table takes no new entries. Rows that belong to an entry already
+   in it are processed as usual; the others are **set aside** in temporary
+   files, each row in the file its key hashes to.
+2. When the input ends, what the table holds is complete — every row of
+   those groups went to it — and is returned.
+3. Each file is then a smaller instance of the same problem, with all the
+   rows of any one key in it, and is dealt with in a pass of its own. A
+   file that is still too large is split again, with a different hash.
+
+```
+set work_mem = '64kB';
+explain (analyze, costs off, timing off) select label, count(*) from item group by label;
+
+ HashAggregate (actual rows=8192 loops=1)
+   Group Key: label
+   Batches: 49  Memory Usage: 65kB
+   ->  Seq Scan on item (actual rows=8192 loops=1)
+```
+
+The two-input operations set aside rows of *both* sides, split by the same
+hash, so that equal rows meet again in files of the same number. A left
+row whose key is not in the table cannot be decided while right rows are
+waiting on disk — its equals may be among them — so it waits too.
+
+The number of files a split uses is chosen from the size of what is being
+split: enough for each part to fit, and no more, because a part that fits
+is done in one pass however small it is, and every extra file is a buffer
+and a pass.
+
+The price is real. Grouping 20 000 rows into 20 000 groups takes 11 ms in
+memory and 127 ms with `work_mem = 64kB`: forty-nine passes, each with
+files to create and remove. It is the price of a query that would
+otherwise need memory it was told it does not have.
+
 ## Settings
 
 | Setting | Default | |
@@ -213,9 +304,15 @@ tests and benchmarks.
   test now run under ten settings — each join method alone, joins as
   written, with and without indexes, with a `work_mem` small enough to
   send sorts and hash tables to disk — and all ten must agree.
-- **On disk against in memory.** The same sorts and joins with
-  `work_mem = 64kB` and `64MB` must return the same rows, and the test
-  checks that the small one really used temporary files.
+- **On disk against in memory.** The same sorts, joins, groupings,
+  duplicate removals and set operations with `work_mem = 64kB` and `64MB`
+  must return the same rows, and the tests check that the small one
+  really used temporary files and more than one pass.
+- **A scan's order against a sort.** Every query answered from the order
+  of a scan is compared with the same query whose `ORDER BY` is written
+  as expressions, which no scan can satisfy: the rows must be the same in
+  the same order, ties included, for every indexed type, with and without
+  conditions and limits.
 - **Cursors against a moving table**: a cursor reads a few rows, another
   session deletes, updates, inserts and vacuums under it, and the cursor
   must still return exactly the rows that existed when it was opened, in
@@ -235,7 +332,13 @@ tests and benchmarks.
   only the first of several equal rows, `UNION` keeping duplicates — each
   caught.
 
-That last run also found a flaw in itself. A mutant that does not compile
+- **Eight more mutants for milestone 8**: an index trusted for the order
+  of a column that may be NULL, `DESC` answered by an ascending scan, a
+  full join taken to keep the order of its outer side, rows set aside and
+  never picked up again, the two sides of a set operation split by
+  different hashes. Fifty mutants in all.
+
+The executor's first mutation run also found a flaw in itself. A mutant that does not compile
 fails every test without any test having looked at it, and one of the
 planner mutants of the previous milestone had been "killed" exactly that
 way. The script now builds each mutant before testing it and treats a
@@ -244,17 +347,18 @@ tests.
 
 ## Limitations
 
-- **Grouping and duplicate removal are in memory.** `GROUP BY`, `DISTINCT`,
-  `UNION`, `INTERSECT` and `EXCEPT` keep a hash table of the distinct
-  groups or rows, which does not spill. A query with millions of *groups*
-  needs memory for them; one with millions of *rows* in few groups does
-  not.
-- **A merge join keeps the rows of one key in memory**, and a hash join
-  whose build side is mostly one key cannot be partitioned: after three
-  attempts it joins that partition in memory.
-- **`ORDER BY` always sorts.** A scan in primary key order is known to be
-  sorted and a merge join uses that, but `ORDER BY id LIMIT 10` still
-  reads the table and keeps a heap of ten rows, where it could read ten.
+- **What still does not spill:** the values of `count(DISTINCT x)` within
+  a group, the rows of one key in a merge join, and a hash table whose
+  rows are mostly one key — hashing cannot split that, and after three
+  attempts it is processed in memory.
+- **A scan's order is used only ascending.** `ORDER BY id DESC LIMIT 10`
+  reads the table and keeps a heap of ten rows; the B+tree has no
+  backward scan.
+- **A join order is not chosen for the sake of `ORDER BY`.** A join keeps
+  the order of its first table when it is done by nested loops, and the
+  sort is skipped when that happens to be the order wanted; the planner
+  does not prefer such a plan, even with a `LIMIT` that would make it
+  much the cheapest.
 - **One row at a time.** There is no vectorised execution and no parallel
   query; every row passes through an interface call per plan step.
 - **Subquery plans are not shown by `EXPLAIN`**, and a correlated subquery

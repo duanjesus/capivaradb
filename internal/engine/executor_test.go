@@ -345,11 +345,11 @@ func TestSpillingGivesTheSameRows(t *testing.T) {
 		{"external sort", "", "select id, k from big order by k desc", "Sort Method: external merge"},
 		{"external sort, many keys", "", "select grp, pad, id from big order by grp desc, pad, id desc", "Sort Method: external merge"},
 		{"hash join", "set enable_mergejoin = off",
-			"select a.id, b.id from big a join big b on a.k = b.id", "Batches: 256"},
+			"select a.id, b.id from big a join big b on a.k = b.id", "Batches: 64"},
 		{"hash left join", "set enable_mergejoin = off",
-			"select s.label, b.id from small s left join big b on b.k = s.k", "Batches: 256"},
+			"select s.label, b.id from small s left join big b on b.k = s.k", "Batches: 64"},
 		{"hash full join", "set enable_mergejoin = off",
-			"select s.k, b.id from small s full join big b on b.k = s.k and b.grp < 50", "Batches: 256"},
+			"select s.k, b.id from small s full join big b on b.k = s.k and b.grp < 50", "Batches: 64"},
 		{"merge join with sorts", "set enable_hashjoin = off",
 			"select a.id, b.id from big a join big b on a.k = b.grp", "Sort Method: external merge"},
 		{"nested loop", "set enable_hashjoin = off; set enable_mergejoin = off",
@@ -622,6 +622,9 @@ func TestMemoryIsBoundedByWorkMem(t *testing.T) {
 		{"scan", "select id, pad from big"},
 		{"sort", "select id, pad from big order by k"},
 		{"hash join", "select a.id, b.pad from big a join big b on a.k = b.id"},
+		{"group by", "select k, count(*), min(pad) from big group by k"},
+		{"distinct", "select distinct k, pad from big"},
+		{"except", "select id, pad from big except select id + 1, pad from big"},
 	} {
 		h.mustRun("set work_mem = '1GB'")
 		roomy, n := heapDuring(t, h, q.query)
@@ -669,4 +672,201 @@ func TestJoinKeysByEveryMethod(t *testing.T) {
 		h.expect("select count(*) from i a join i b on a.tag = b.tag", "6")
 		h.expect("select a.tag, b.tag from i a join i b on a.k + 1 = b.k order by 1, 2", "i0|i1;i1|i2;i2|i3a;i2|i3b")
 	}
+}
+
+// ---- ORDER BY without a sort ----
+
+// A scan returns rows in the order of the key it reads through. When that
+// is the order the query asks for, there is no Sort in the plan, and with
+// a LIMIT the scan stops after the rows wanted.
+func TestOrderFromTheScan(t *testing.T) {
+	h := shop(t, New())
+	h.mustRun("create index orders_qty on orders (qty); analyze")
+	// By primary key: the table is already in that order.
+	h.expectPlan("select * from orders order by id limit 5", `
+		Limit
+		  ->  Seq Scan on orders`)
+	// By an indexed column: read the index instead of sorting the table.
+	h.expectPlan("select * from orders order by customer_id limit 5", `
+		Limit
+		  ->  Index Scan using orders_customer on orders`)
+	// Entries with equal indexed values are in primary key order.
+	h.expectPlan("select * from orders order by customer_id, id limit 5", `
+		Limit
+		  ->  Index Scan using orders_customer on orders`)
+	// The columns an equality fixes come first in the index and do not
+	// matter to the order of what is left.
+	h.expectPlan("select * from orders where product_id = 3 order by qty limit 5", `
+		Limit
+		  ->  Index Scan using orders_product_qty on orders
+		        Index Cond: (product_id = 3)`)
+	h.expectPlan("select * from orders where customer_id = 7 order by id", `
+		Index Scan using orders_customer on orders
+		  Index Cond: (customer_id = 7)`)
+	// A range on the ordering column narrows the same scan.
+	h.expectPlan("select id from orders where id > 990 order by id", `
+		Index Scan using orders_pkey on orders
+		  Index Cond: (id > 990)`)
+	// Without a LIMIT, reading 1000 rows through a secondary index costs
+	// more than scanning and sorting them.
+	h.expectPlan("select * from orders order by customer_id", `
+		Sort
+		  Sort Key: customer_id
+		  ->  Seq Scan on orders`)
+	// What a scan cannot deliver is sorted as before: descending order, an
+	// expression, a column that may be NULL (an index has NULLs first,
+	// ORDER BY wants them last) unless the query says NULLS FIRST.
+	for _, q := range []string{
+		"select * from orders order by id desc limit 5",
+		"select * from orders order by id + 0 limit 5",
+		"select * from orders order by qty, customer_id limit 5",
+		"select distinct customer_id from orders order by customer_id limit 5",
+		"select customer_id, count(*) from orders group by customer_id order by customer_id limit 5",
+	} {
+		if plan := h.plan(q); !strings.Contains(plan, "Sort") {
+			t.Errorf("%s has no Sort:\n%s", q, plan)
+		}
+	}
+	h.mustRun("create table n (id int primary key, v int); create index n_v on n (v)")
+	h.mustRun("insert into n values (1, 5), (2, null), (3, 1), (4, null), (5, 3), (6, 1)")
+	h.mustRun("insert into n select id + 100, id from orders; analyze")
+	if plan := h.plan("select * from n order by v limit 2"); !strings.Contains(plan, "Sort") {
+		t.Errorf("ORDER BY on a nullable column was left to an index:\n%s", plan)
+	}
+	h.expectPlan("select * from n order by v nulls first limit 3", `
+		Limit
+		  ->  Index Scan using n_v on n`)
+	h.expect("select id, v from n order by v nulls first limit 3", "2|NULL;4|NULL;100|0")
+	h.expect("select id, v from n order by v limit 3", "100|0;3|1;6|1")
+	// Through a join, when the plan keeps the order of its first table:
+	// nested loops do. (The planner does not yet choose a join order for
+	// the sake of an ORDER BY; here the order written is the one wanted.)
+	h.mustRun("set enable_hashjoin = off; set enable_mergejoin = off; set join_collapse_limit = 1")
+	h.expectPlan("select o.id, c.name from orders o join customer c on c.id = o.customer_id order by o.id limit 3", `
+		Limit
+		  ->  Nested Loop
+		        ->  Seq Scan on orders o
+		        ->  Index Scan using customer_pkey on customer c
+		              Index Cond: (c.id = o.customer_id)`)
+	// A full join returns the inner rows that matched nothing after all the
+	// others, with NULL where the outer columns would be: its output is
+	// not in the order of its outer side, and has to be sorted.
+	h.mustRun("set join_collapse_limit = 8")
+	h.expect("select c.id, p.id from customer c full join product p on p.id = c.id + 18 and c.id < 3 order by c.id nulls first limit 4",
+		"NULL|0;NULL|1;NULL|2;NULL|3")
+	h.mustRun("set enable_hashjoin = on; set enable_mergejoin = on")
+	// And it really stops: three rows leave the scan.
+	plan := explainAnalyze(h, "select * from orders order by customer_id limit 3")
+	if !strings.Contains(plan, "Index Scan using orders_customer on orders (actual rows=3 loops=1)") {
+		t.Errorf("the scan did not stop after three rows:\n%s", plan)
+	}
+}
+
+// Whatever path delivers the order, the rows must be the ones a sort would
+// have returned, in the same order — ties included. The reference is the
+// same query with its ORDER BY written as expressions, which no scan can
+// satisfy.
+func TestOrderFromTheScanMatchesASort(t *testing.T) {
+	h := newHarness(t, New())
+	h.mustRun(`
+		create table v (id int primary key, i int not null, f double precision not null, s text not null, b boolean not null, n int);
+		create index v_i on v (i);
+		create index v_f on v (f);
+		create index v_s on v (s);
+		create index v_b on v (b);
+		create index v_n on v (n);
+		create index v_si on v (s, i)`)
+	rng := rand.New(rand.NewSource(11))
+	words := []string{"", "a", "ab", "abc", "b", "B", "é", "a b", "a\tb", "z", "aa", "ba"}
+	for start := 0; start < 1500; start += 300 {
+		var sb strings.Builder
+		sb.WriteString("insert into v values ")
+		for id := start; id < start+300; id++ {
+			if id > start {
+				sb.WriteByte(',')
+			}
+			n := "null"
+			if rng.Intn(4) > 0 {
+				n = fmt.Sprint(rng.Intn(9) - 4)
+			}
+			fmt.Fprintf(&sb, "(%d, %d, %g, '%s', %v, %s)", id, rng.Intn(41)-20, float64(rng.Intn(2001)-1000)/8,
+				words[rng.Intn(len(words))], rng.Intn(2) == 0, n)
+		}
+		h.mustRun(sb.String())
+	}
+	h.mustRun("analyze")
+	cases := []struct{ order, forced string }{
+		{"id", "id + 0"},
+		{"i", "i + 0, id + 0"},
+		{"i, id", "i + 0, id + 0"},
+		{"f", "f + 0, id + 0"},
+		{"s", "s || '', id + 0"},
+		{"s, i", "s || '', i + 0, id + 0"},
+		{"b", "b and true, id + 0"},
+		{"n nulls first", "n + 0 nulls first, id + 0"},
+	}
+	for _, c := range cases {
+		for _, where := range []string{"", " where i > -5", " where s = 'ab'", " where id between 100 and 900 and f < 20"} {
+			for _, limit := range []string{" limit 7", " limit 40 offset 25", ""} {
+				query := "select id, i, f, s, b, n from v" + where + " order by " + c.order + limit
+				want := h.mustRun("select id, i, f, s, b, n from v" + where + " order by " + c.forced + limit)
+				if got := h.mustRun(query); got != want {
+					t.Fatalf("%s\n got %.200s\nwant %.200s\nplan:\n%s", query, got, want, h.plan(query))
+				}
+			}
+		}
+		// The comparison means something only if the short limit really
+		// was answered without a sort.
+		if plan := h.plan("select id from v order by " + c.order + " limit 7"); strings.Contains(plan, "Sort") {
+			t.Errorf("order by %s limit 7 sorts:\n%s", c.order, plan)
+		}
+	}
+}
+
+// Grouping, DISTINCT and the set operations keep a hash table of distinct
+// groups or rows. When it does not fit in work_mem the rest goes to disk,
+// and the answer must not change.
+func TestHashTablesSpill(t *testing.T) {
+	db := New()
+	h := newHarness(t, db)
+	big(t, h, "big", 6000)
+	h.mustRun("create table other (id int, grp int, k int, pad text); insert into other select id + 3000, grp, k, pad from big; insert into other select id, grp, k, pad from big where id % 5 = 0")
+	for _, q := range []struct{ name, query string }{
+		{"group by, one row per group", "select id, count(*), min(pad), sum(k) from big group by id"},
+		{"group by, several rows per group", "select k % 3000, count(*), max(id), avg(grp), count(distinct grp) from big group by k % 3000"},
+		{"group by with having", "select pad, k % 1500, count(*) from big group by pad, k % 1500 having count(*) > 1"},
+		{"distinct", "select distinct k % 4000, pad from big"},
+		{"union", "select id, pad from big union select id, pad from other"},
+		{"intersect", "select id, pad from big intersect select id, pad from other"},
+		{"intersect all", "select grp, k % 50 from big intersect all select grp, k % 50 from other"},
+		{"except", "select id, pad from big except select id, pad from other"},
+		{"except, left side larger than memory", "select id, pad from big except select id, pad from other where id < 10"},
+		{"except all", "select grp, k % 50 from other except all select grp, k % 50 from big where id % 2 = 0"},
+	} {
+		h.mustRun("set work_mem = '64MB'")
+		want := sortedRows(h.mustRun(q.query))
+		h.mustRun("set work_mem = '64kB'")
+		before := db.spills.Load()
+		got := sortedRows(h.mustRun(q.query))
+		if db.spills.Load() == before {
+			t.Errorf("%s: the query did not use temporary files", q.name)
+		}
+		if got != want {
+			t.Errorf("%s: %d rows on disk differ from %d rows in memory", q.name, strings.Count(got, ";")+1, strings.Count(want, ";")+1)
+		}
+		if strings.Count(want, ";") < 100 {
+			t.Errorf("%s: only %d rows; the test proves little", q.name, strings.Count(want, ";")+1)
+		}
+		plan := explainAnalyze(h, q.query)
+		if !strings.Contains(plan, "Batches: ") || strings.Contains(plan, "Batches: 1 ") {
+			t.Errorf("%s: no step of the plan reports more than one batch:\n%s", q.name, plan)
+		}
+	}
+	// A cursor over a grouped query abandoned half-way leaves no files.
+	rows := cursor(t, h, "select id, count(*) from big group by id")
+	fetch(t, rows, 5)
+	if db.openSpills.Load() == 0 {
+		t.Error("the open cursor was expected to hold temporary files")
+	}
+	rows.Close()
 }

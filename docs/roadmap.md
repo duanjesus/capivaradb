@@ -177,15 +177,38 @@ Not done: vectorised execution, which the plan had as "if time allows".
 Details in [executor.md](executor.md) and
 [decisions/0009](decisions/0009-executor-design.md).
 
-## After the seven
+## 8. Ordered scans and hash tables on disk — done
 
-The plan is complete. What a next round would take on, roughly in order of
-what it would buy:
+The first milestone beyond the original plan, taking the two limitations
+the seventh left most visible.
 
-- spilling for `GROUP BY` and `DISTINCT`, the one place a query's memory
-  still follows its data;
-- using index order for `ORDER BY`, so that `ORDER BY id LIMIT 10` reads
-  ten rows;
+- `ORDER BY` answered from the order of a scan — the primary key, an
+  index, an index after the columns an equality fixes — with no sort; the
+  access path is chosen with the sort it saves and the `LIMIT` it serves
+  in its cost
+- `GROUP BY`, `DISTINCT`, `UNION`, `INTERSECT` and `EXCEPT` no longer
+  bounded by memory: rows that do not fit their hash table are set aside
+  on disk, partitioned by hash, and processed in later passes
+- the number of partitions of any split chosen from the size of what is
+  split (also for the hash join, which used a fixed sixteen)
+
+Acceptance, as delivered:
+
+- every ordered scan compared, row for row and tie for tie, with the same
+  query forced to sort, across indexed types, conditions and limits;
+- `ORDER BY id LIMIT 10` on 20 000 rows in 13 µs, against 7 ms when a
+  sort is forced;
+- grouping 40 000 rows into 40 000 groups holds 12 MB with room and 0.8 MB
+  with `work_mem = 256kB`;
+- eight more mutants, fifty in all, all caught.
+
+Details in [executor.md](executor.md) and
+[decisions/0010](decisions/0010-order-and-overflow.md).
+
+## After that
+
+What a next round would take on, roughly in order of what it would buy:
+
 - writers in parallel: latches per page instead of one lock per database;
 - group commit, to get past one `fsync` per transaction;
 - system catalogs, so that `\d` and GUI tools work;

@@ -12,6 +12,42 @@ SSD, Windows 11, Go 1.27, single-threaded, 2 seconds per benchmark. One run
 on a laptop: repeat runs differ by up to a quarter, so read these as orders
 of magnitude.
 
+## Ordered scans and grouping on disk (milestone 8)
+
+Same tables as the next section: 20 000 orders. This machine was busier
+when these were taken than for the tables below, by something like a
+third; the reference rows are from the same run.
+
+**The first ten rows in some order:**
+
+| Query | Time |
+|---|---:|
+| `... limit 10`, no order (reference) | 12 µs |
+| `... order by id limit 10`: the table's own order | 13 µs |
+| `... order by customer_id limit 10`: an index's order | 17 µs |
+| `... order by customer_id + 0 limit 10`: forced to sort | 7.1 ms |
+
+**Grouping** (reference: sorting the same 20 000 rows in memory, 13.6 ms):
+
+| Query | Time |
+|---|---:|
+| 20 000 groups, in memory | 10.5 ms |
+| 20 000 groups, `work_mem = 64kB` | 127 ms |
+| 1 000 groups, `work_mem = 64kB` | 21 ms |
+| `DISTINCT` over 20 000 distinct rows, `work_mem = 64kB` | 44 ms |
+
+How to read them:
+
+- **An ordered scan makes `ORDER BY ... LIMIT` cost what `LIMIT` costs.**
+  Four hundred times faster than the sort it replaces, and the ratio is
+  the size of the table: the sort reads all of it, the scan ten rows.
+- **Grouping on disk is twelve times slower here**, which is the worst
+  case on purpose: every row its own group and a `work_mem` that holds
+  three hundred of them, so forty-nine passes, each creating and removing
+  temporary files. With a thousand groups it is twice the in-memory time.
+  `work_mem` is there to be set so that this does not happen; the point
+  is that when it does, the query finishes, in the memory it was given.
+
 ## What the executor buys (milestone 7)
 
 `internal/engine`: prepared statements on 20 000 orders, 1 000 customers

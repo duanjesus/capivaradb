@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"math"
 	"strings"
 
@@ -110,10 +111,11 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 	var source *planNode
 	if n.From != nil {
 		var err error
-		if from, err = s.planFromWhere(n.From, n.Where, parent, ptypes); err != nil {
+		// The plan itself is made further down, once it is known whether
+		// the query would like its rows in some order.
+		if from, err = s.analyseFrom(n.From, n.Where, parent, ptypes); err != nil {
 			return nil, err
 		}
-		source = from.node
 	} else {
 		// Without FROM a query produces exactly one row with no columns,
 		// or none if WHERE says so.
@@ -333,6 +335,55 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 		return vals, nil
 	}
 
+	// If ORDER BY asks for nothing but columns of the FROM clause, in
+	// ascending order, a scan may be able to deliver the rows already
+	// sorted: the plan is asked for that, and if it obliges there is no
+	// sort. With a LIMIT that is the difference between reading the table
+	// and reading the rows wanted.
+	ordered := false
+	if n.From != nil {
+		var hint *orderHint
+		if !grouped && !n.Distinct && len(n.OrderBy) > 0 {
+			hint = &orderHint{}
+			for i, o := range n.OrderBy {
+				e := o.Expr
+				if keys[i].out >= 0 {
+					e = items[keys[i].out].expr
+				}
+				col := -1
+				switch e := e.(type) {
+				case *colIdx:
+					col = e.idx
+				case *sql.ColumnRef:
+					col, _ = sc.find(e)
+				}
+				if col < 0 || o.Desc || !from.sortable(col, o.NullsFirst != nil && *o.NullsFirst) {
+					hint = nil
+					break
+				}
+				hint.cols = append(hint.cols, col)
+			}
+		}
+		if hint != nil {
+			if lit, ok := n.Limit.(*sql.Literal); ok && lit.Type.IsInt() {
+				hint.rows = float64(lit.Val.(int64))
+				if off, ok := n.Offset.(*sql.Literal); ok && off.Type.IsInt() {
+					hint.rows += float64(off.Val.(int64))
+				} else if n.Offset != nil {
+					hint.rows = 0
+				}
+			}
+		}
+		if err := from.plan(hint); err != nil {
+			return nil, err
+		}
+		source = from.node
+		ordered = hint != nil && inOrder(source.order, hint.cols)
+	}
+	if ordered {
+		keys, keyCols = nil, nil
+	}
+
 	root, cur := source, opener(source.start)
 	if grouped {
 		var lines []string
@@ -345,13 +396,13 @@ func (s *Session) planSelect(n *sql.Select, parent *scope, ptypes []sql.Type) (*
 			lines = append(lines, "Filter: "+sql.FormatExpr(n.Having))
 		}
 		root = &planNode{op: op, lines: lines, kids: []*planNode{source}, rows: math.Max(rows, 1), cost: source.cost + source.rows*0.1}
-		nCols := len(sc.cols)
+		nCols, node := len(sc.cols), root
 		root.open = func(cx *env) (iter, error) {
 			src, err := source.start(cx)
 			if err != nil {
 				return nil, err
 			}
-			return &aggIter{src: src, cx: cx, en: cx.child(), groupEvals: groupEvals, aggs: aggs,
+			return &aggIter{src: src, cx: cx, en: cx.child(), node: node, groupEvals: groupEvals, aggs: aggs,
 				having: having, project: project, nCols: nCols}, nil
 		}
 		cur = root.start
@@ -427,7 +478,7 @@ func (s *Session) planTail(root *planNode, cur opener, t tail, parent *scope, pt
 			if err != nil {
 				return nil, err
 			}
-			return &distinctIter{src: in, width: width, seen: make(map[string]struct{})}, nil
+			return &distinctIter{src: in, cx: cx, node: node, width: width}, nil
 		}
 		cur = node.start
 	}
@@ -518,21 +569,91 @@ func (p *projectIter) next() ([]any, error) {
 
 func (p *projectIter) close() { p.src.close() }
 
-// aggIter groups its input and computes the select list once per group. The
-// groups are kept in a hash table, in memory, and come out in the order
-// they were first seen.
+// overflow is where an operator that keeps a hash table puts the rows it
+// has no room for: sixteen temporary files, a row going to the one its key
+// hashes to. Rows with the same key end up in the same file, so each file
+// can be dealt with on its own afterwards, as a smaller instance of the
+// same problem — and split again, with a different hash, if it is still
+// too large.
+type overflow struct {
+	depth int
+	parts []*spillFile
+}
+
+// newOverflow creates the files. from is the file being read when memory
+// ran out, if it is one: its size says roughly how much is still to come,
+// and so how many files are worth opening.
+func newOverflow(q *query, depth int, from *spillFile) (*overflow, error) {
+	n := hashPartitions
+	if from != nil {
+		// A row takes about three times as much memory as it does on disk.
+		n = fanoutFor(3*from.size, q.workMem)
+	}
+	o := &overflow{depth: depth, parts: make([]*spillFile, n)}
+	for i := range o.parts {
+		f, err := q.newSpill()
+		if err != nil {
+			o.release()
+			return nil, err
+		}
+		o.parts[i] = f
+	}
+	return o, nil
+}
+
+func (o *overflow) add(key []byte, row []any) error {
+	return o.parts[partitionOf(key, o.depth)%len(o.parts)].write(row)
+}
+
+func (o *overflow) release() {
+	for _, f := range o.parts {
+		if f != nil {
+			f.remove()
+		}
+	}
+	o.parts = nil
+}
+
+// hashReport describes a hash-based step for EXPLAIN ANALYZE.
+func hashReport(node *planNode, batches, peak int) {
+	if node != nil && batches > 0 {
+		node.info = []string{fmt.Sprintf("Batches: %d  Memory Usage: %dkB", batches, (peak+1023)/1024)}
+	}
+}
+
+// hashEntryBytes is the memory charged for an entry of a hash table beyond
+// its key.
+const hashEntryBytes = 48
+
+// aggIter groups its input and computes the select list once per group.
+//
+// The groups are kept in a hash table. If they outgrow work_mem, no new
+// group is started: rows of groups already in the table go on being
+// aggregated, and the others are set aside in an overflow, to be grouped
+// in later passes. A group is therefore always completed within one pass,
+// and memory holds the groups of one pass at a time.
 type aggIter struct {
 	src        iter
 	cx, en     *env
+	node       *planNode
 	groupEvals []evalFn
 	aggs       []aggSpec
 	having     evalFn
 	project    func(*env) ([]any, error)
 	nCols      int
 
-	built  bool
-	groups []*aggGroup
-	pos    int
+	started bool
+	groups  []*aggGroup
+	pos     int
+	pending []spilled
+
+	batches, peak int
+}
+
+// spilled is a file of rows waiting for a pass of their own.
+type spilled struct {
+	file  *spillFile
+	depth int
 }
 
 type aggGroup struct {
@@ -540,13 +661,18 @@ type aggGroup struct {
 	states []aggState
 }
 
-func (a *aggIter) build() error {
-	a.built = true
-	defer a.src.close()
+// pass groups the rows of src, which are those of file from if it is not
+// the query's own input.
+func (a *aggIter) pass(src iter, depth int, from *spillFile) error {
+	defer src.close()
+	a.groups, a.pos = nil, 0
 	index := make(map[string]*aggGroup)
+	perGroup := hashEntryBytes + 64*len(a.aggs)
+	var over *overflow
 	var keyBuf []byte
+	mem := 0
 	for n := 0; ; n++ {
-		row, err := a.src.next()
+		row, err := src.next()
 		if err != nil {
 			return err
 		}
@@ -569,9 +695,24 @@ func (a *aggIter) build() error {
 		}
 		grp := index[string(keyBuf)]
 		if grp == nil {
+			if over == nil && mem > a.cx.q.workMem && depth < hashMaxDepth {
+				if over, err = newOverflow(a.cx.q, depth, from); err != nil {
+					return err
+				}
+				for _, f := range over.parts {
+					a.pending = append(a.pending, spilled{f, depth + 1})
+				}
+			}
+			if over != nil {
+				if err := over.add(keyBuf, row); err != nil {
+					return err
+				}
+				continue
+			}
 			grp = &aggGroup{first: row, states: make([]aggState, len(a.aggs))}
 			index[string(keyBuf)] = grp
 			a.groups = append(a.groups, grp)
+			mem += rowBytes(row) + len(keyBuf) + perGroup
 		}
 		for i := range a.aggs {
 			if err := grp.states[i].feed(&a.aggs[i], a.en); err != nil {
@@ -579,53 +720,87 @@ func (a *aggIter) build() error {
 			}
 		}
 	}
-	// Aggregating without GROUP BY always yields one row, even over no
-	// input: count(*) of an empty table is 0, not nothing.
-	if len(a.groupEvals) == 0 && len(a.groups) == 0 {
-		a.groups = append(a.groups, &aggGroup{first: make([]any, a.nCols), states: make([]aggState, len(a.aggs))})
-	}
-	a.en.aggs = make([]any, len(a.aggs))
+	a.batches++
+	a.peak = max(a.peak, mem)
 	return nil
 }
 
 func (a *aggIter) next() ([]any, error) {
-	if !a.built {
-		if err := a.build(); err != nil {
+	if !a.started {
+		a.started = true
+		if err := a.pass(a.src, 0, nil); err != nil {
 			return nil, err
 		}
-	}
-	for a.pos < len(a.groups) {
-		grp := a.groups[a.pos]
-		a.groups[a.pos] = nil
-		a.pos++
-		a.en.row = grp.first
-		for i := range a.aggs {
-			a.en.aggs[i] = grp.states[i].result(&a.aggs[i])
+		// Aggregating without GROUP BY always yields one row, even over
+		// no input: count(*) of an empty table is 0, not nothing.
+		if len(a.groupEvals) == 0 && len(a.groups) == 0 {
+			a.groups = append(a.groups, &aggGroup{first: make([]any, a.nCols), states: make([]aggState, len(a.aggs))})
 		}
-		ok, err := matches(a.having, a.en)
+		a.en.aggs = make([]any, len(a.aggs))
+	}
+	for {
+		for a.pos < len(a.groups) {
+			grp := a.groups[a.pos]
+			a.groups[a.pos] = nil
+			a.pos++
+			a.en.row = grp.first
+			for i := range a.aggs {
+				a.en.aggs[i] = grp.states[i].result(&a.aggs[i])
+			}
+			ok, err := matches(a.having, a.en)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				return a.project(a.en)
+			}
+		}
+		if len(a.pending) == 0 {
+			hashReport(a.node, a.batches, a.peak)
+			return nil, nil
+		}
+		next := a.pending[len(a.pending)-1]
+		a.pending = a.pending[:len(a.pending)-1]
+		src, err := next.file.reader()
+		if err == nil {
+			err = a.pass(src, next.depth, next.file)
+		}
+		next.file.remove()
 		if err != nil {
 			return nil, err
 		}
-		if ok {
-			return a.project(a.en)
-		}
 	}
-	return nil, nil
 }
 
 func (a *aggIter) close() {
-	if !a.built {
+	if !a.started {
 		a.src.close()
 	}
-	a.groups = nil
+	for _, p := range a.pending {
+		p.file.remove()
+	}
+	a.pending, a.groups = nil, nil
 }
 
-// distinctIter passes on the first of each set of equal rows.
+// distinctIter passes on the first of each set of equal rows. It remembers
+// the rows it has passed on in a hash table; when that outgrows work_mem,
+// rows it has not seen are set aside in an overflow instead of being
+// passed on, and are dealt with in later passes.
 type distinctIter struct {
-	src    iter
-	width  int
-	seen   map[string]struct{}
-	keyBuf []byte
+	src   iter
+	cx    *env
+	node  *planNode
+	width int
+
+	seen    map[string]struct{}
+	mem     int
+	depth   int
+	over    *overflow
+	pending []spilled
+	current *spillFile
+	keyBuf  []byte
+
+	batches, peak int
 }
 
 func rowKey(dst []byte, row []any) []byte {
@@ -636,20 +811,73 @@ func rowKey(dst []byte, row []any) []byte {
 }
 
 func (d *distinctIter) next() ([]any, error) {
+	if d.seen == nil {
+		d.seen = make(map[string]struct{})
+	}
 	for {
 		row, err := d.src.next()
-		if err != nil || row == nil {
+		if err != nil {
 			return nil, err
 		}
-		d.keyBuf = rowKey(d.keyBuf[:0], row[:d.width])
-		if _, dup := d.seen[string(d.keyBuf)]; !dup {
-			d.seen[string(d.keyBuf)] = struct{}{}
-			return row, nil
+		if row == nil {
+			// The pass is over. Go on with a file of rows set aside, if any.
+			d.src.close()
+			d.src = &sliceIter{}
+			if d.current != nil {
+				d.current.remove()
+				d.current = nil
+			}
+			d.batches++
+			d.peak = max(d.peak, d.mem)
+			d.over = nil
+			if len(d.pending) == 0 {
+				hashReport(d.node, d.batches, d.peak)
+				return nil, nil
+			}
+			next := d.pending[len(d.pending)-1]
+			d.pending = d.pending[:len(d.pending)-1]
+			if d.src, err = next.file.reader(); err != nil {
+				return nil, err
+			}
+			d.current, d.depth = next.file, next.depth
+			d.seen, d.mem = make(map[string]struct{}), 0
+			continue
 		}
+		d.keyBuf = rowKey(d.keyBuf[:0], row[:d.width])
+		if _, dup := d.seen[string(d.keyBuf)]; dup {
+			continue
+		}
+		if d.over == nil && d.mem > d.cx.q.workMem && d.depth < hashMaxDepth {
+			if d.over, err = newOverflow(d.cx.q, d.depth, d.current); err != nil {
+				return nil, err
+			}
+			for _, f := range d.over.parts {
+				d.pending = append(d.pending, spilled{f, d.depth + 1})
+			}
+		}
+		if d.over != nil {
+			if err := d.over.add(d.keyBuf, row); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		d.seen[string(d.keyBuf)] = struct{}{}
+		d.mem += len(d.keyBuf) + hashEntryBytes
+		return row, nil
 	}
 }
 
-func (d *distinctIter) close() { d.src.close(); d.seen = nil }
+func (d *distinctIter) close() {
+	d.src.close()
+	if d.current != nil {
+		d.current.remove()
+		d.current = nil
+	}
+	for _, p := range d.pending {
+		p.file.remove()
+	}
+	d.pending, d.seen = nil, nil
+}
 
 // limitIter skips rows, passes on at most take (all of them if take is
 // negative), and then stops its source: whatever is below does not run
@@ -772,13 +1000,14 @@ func (s *Session) planSetOp(n *sql.Select, parent *scope, ptypes []sql.Type) (*s
 			name += " All"
 		}
 		root = &planNode{op: name, kids: kids, rows: math.Max(rows/2, 1), cost: cost + right.root.rows*costHashRow + left.root.rows*costProbe}
-		except, all := n.Op == "except", n.All
+		except, all, node := n.Op == "except", n.All, root
 		root.open = func(cx *env) (iter, error) {
 			l, err := openLeft(cx)
 			if err != nil {
 				return nil, err
 			}
-			return &setOpIter{left: l, openRight: func() (iter, error) { return openRight(cx) }, except: except, all: all}, nil
+			return &setOpIter{left: l, openRight: func() (iter, error) { return openRight(cx) }, except: except, all: all,
+				cx: cx, node: node}, nil
 		}
 	}
 	cur := opener(root.start)
@@ -924,45 +1153,173 @@ func (a *appendIter) close() { a.cur.close() }
 //	EXCEPT ALL     as many times as it occurs more on the left than on the right
 //
 // Rows are compared as DISTINCT compares them: two NULLs are the same.
+//
+// If the table outgrows work_mem, it takes no new rows: the rows of both
+// inputs that are not in it are set aside, each in the overflow of its
+// side, split by the same hash. Equal rows are then in files of the same
+// number, and each pair of files is a smaller set operation, done in a
+// later pass.
 type setOpIter struct {
 	left        iter
 	openRight   func() (iter, error)
 	except, all bool
+	cx          *env
+	node        *planNode
 
-	counts map[string]int
-	keyBuf []byte
+	started bool
+	counts  map[string]int
+	mem     int
+	depth   int
+	// lover and rover hold the left and right rows set aside in this pass;
+	// both are nil until the table is full.
+	lover, rover *overflow
+	pending      []setPair
+	files        []*spillFile // of the pass in progress
+	keyBuf       []byte
+
+	batches, peak int
 }
 
-func (s *setOpIter) build() error {
-	s.counts = make(map[string]int)
-	right, err := s.openRight()
-	if err != nil {
-		return err
+type setPair struct {
+	left, right *spillFile
+	depth       int
+}
+
+// full reports whether the table can take another row, starting the
+// overflow of both sides if it cannot.
+func (s *setOpIter) full() (bool, error) {
+	if s.lover != nil {
+		return true, nil
 	}
+	if s.mem <= s.cx.q.workMem || s.depth >= hashMaxDepth {
+		return false, nil
+	}
+	// Both sides must be split into the same number of files.
+	var larger *spillFile
+	for _, f := range s.files {
+		if larger == nil || f.size > larger.size {
+			larger = f
+		}
+	}
+	var err error
+	if s.lover, err = newOverflow(s.cx.q, s.depth, larger); err != nil {
+		return false, err
+	}
+	if s.rover, err = newOverflow(s.cx.q, s.depth, larger); err != nil {
+		return false, err
+	}
+	for i := range s.lover.parts {
+		s.pending = append(s.pending, setPair{s.lover.parts[i], s.rover.parts[i], s.depth + 1})
+	}
+	return true, nil
+}
+
+// build counts the rows of the right input.
+func (s *setOpIter) build(right iter) error {
 	defer right.close()
+	s.counts, s.mem, s.lover, s.rover = make(map[string]int), 0, nil, nil
 	for {
 		row, err := right.next()
 		if err != nil || row == nil {
 			return err
 		}
 		s.keyBuf = rowKey(s.keyBuf[:0], row)
-		s.counts[string(s.keyBuf)]++
+		if n, ok := s.counts[string(s.keyBuf)]; ok {
+			s.counts[string(s.keyBuf)] = n + 1
+			continue
+		}
+		full, err := s.full()
+		if err != nil {
+			return err
+		}
+		if full {
+			if err := s.rover.add(s.keyBuf, row); err != nil {
+				return err
+			}
+			continue
+		}
+		s.counts[string(s.keyBuf)] = 1
+		s.mem += len(s.keyBuf) + hashEntryBytes
 	}
 }
 
 func (s *setOpIter) next() ([]any, error) {
-	if s.counts == nil {
-		if err := s.build(); err != nil {
+	if !s.started {
+		s.started = true
+		right, err := s.openRight()
+		if err != nil {
+			return nil, err
+		}
+		if err := s.build(right); err != nil {
 			return nil, err
 		}
 	}
 	for {
 		row, err := s.left.next()
-		if err != nil || row == nil {
+		if err != nil {
 			return nil, err
 		}
+		if row == nil {
+			// The pass is over. Go on with a pair of files, if any.
+			s.left.close()
+			s.left = &sliceIter{}
+			s.dropFiles()
+			s.batches++
+			s.peak = max(s.peak, s.mem)
+			if len(s.pending) == 0 {
+				hashReport(s.node, s.batches, s.peak)
+				return nil, nil
+			}
+			next := s.pending[len(s.pending)-1]
+			s.pending = s.pending[:len(s.pending)-1]
+			s.files, s.depth = []*spillFile{next.left, next.right}, next.depth
+			right, err := next.right.reader()
+			if err != nil {
+				return nil, err
+			}
+			if err := s.build(right); err != nil {
+				return nil, err
+			}
+			if s.left, err = next.left.reader(); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		s.keyBuf = rowKey(s.keyBuf[:0], row)
-		n, onRight := s.counts[string(s.keyBuf)]
+		n, known := s.counts[string(s.keyBuf)]
+		if !known {
+			// Not in the table. If right rows were set aside, this row's
+			// equals may be among them: it waits for their pass.
+			if s.rover != nil {
+				if err := s.lover.add(s.keyBuf, row); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			switch {
+			case !s.except:
+				// INTERSECT: not on the right, not in the result.
+			case s.all:
+				return row, nil
+			default:
+				// EXCEPT returns it once, so it has to be remembered —
+				// which takes room in the table like anything else.
+				full, err := s.full()
+				if err != nil {
+					return nil, err
+				}
+				if full {
+					if err := s.lover.add(s.keyBuf, row); err != nil {
+						return nil, err
+					}
+					continue
+				}
+				s.counts[string(s.keyBuf)] = 0
+				s.mem += len(s.keyBuf) + hashEntryBytes
+				return row, nil
+			}
+			continue
+		}
 		switch {
 		case s.all && n > 0:
 			// One occurrence on the right is used up by this one.
@@ -975,11 +1332,7 @@ func (s *setOpIter) next() ([]any, error) {
 				return row, nil
 			}
 		case s.except:
-			if !onRight {
-				// Remember it, so that it is returned only once.
-				s.counts[string(s.keyBuf)] = 0
-				return row, nil
-			}
+			// On the right, or returned already.
 		default:
 			if n > 0 {
 				s.counts[string(s.keyBuf)] = 0
@@ -989,7 +1342,22 @@ func (s *setOpIter) next() ([]any, error) {
 	}
 }
 
-func (s *setOpIter) close() { s.left.close(); s.counts = nil }
+func (s *setOpIter) dropFiles() {
+	for _, f := range s.files {
+		f.remove()
+	}
+	s.files = nil
+}
+
+func (s *setOpIter) close() {
+	s.left.close()
+	s.dropFiles()
+	for _, p := range s.pending {
+		p.left.remove()
+		p.right.remove()
+	}
+	s.pending, s.counts = nil, nil
+}
 
 // bindRowCount binds a LIMIT or OFFSET expression. The returned function
 // evaluates it, giving def when the clause is absent or NULL.

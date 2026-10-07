@@ -272,3 +272,34 @@ func BenchmarkSetOperation(b *testing.B) {
 		})
 	}
 }
+
+// The first ten rows in some order: read off a key that is already in that
+// order, or found by going through the whole table.
+func BenchmarkOrderByLimit(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, query string }{
+		{"primary key order", "select * from orders where qty > $1 order by id limit 10"},
+		{"index order", "select * from orders where qty > $1 order by customer_id limit 10"},
+		{"sorted (the same, defeated by an expression)", "select * from orders where qty > $1 order by customer_id + 0 limit 10"},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, planned, mode.query, func(i int) any { return int64(0) })
+		})
+	}
+}
+
+// One group per order: 20 000 groups, in memory and with a work_mem that
+// holds a few hundred of them.
+func BenchmarkGroupBy(b *testing.B) {
+	_, h := benchShop(b)
+	for _, mode := range []struct{ name, settings, query string }{
+		{"20000 groups in memory", everything, "select id, count(*) from orders where qty > $1 group by id"},
+		{"20000 groups, work_mem 64kB", everything + "set work_mem = '64kB'", "select id, count(*) from orders where qty > $1 group by id"},
+		{"1000 groups, work_mem 64kB", everything + "set work_mem = '64kB'", "select customer_id, count(*) from orders where qty > $1 group by customer_id"},
+		{"distinct, work_mem 64kB", everything + "set work_mem = '64kB'", "select distinct id from orders where qty > $1"},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			benchQuery(b, h, mode.settings, mode.query, func(i int) any { return int64(0) })
+		})
+	}
+}

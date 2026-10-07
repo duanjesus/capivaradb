@@ -9,7 +9,7 @@
 # looked like at the time.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4|m5|m6|m7}"
+MILESTONE="${1:?usage: screenshots.sh m1|m2|m3|m4|m5|m6|m7|m8}"
 OUT="$ROOT/docs/screenshots"
 mkdir -p "$OUT"
 cd "$ROOT"
@@ -205,6 +205,30 @@ m7)
     go test ./internal/engine -run XXX -bench 'JoinMethod|Sort|FirstRows|SetOperation' -benchtime "${BENCHTIME:-2s}" 2>&1 |
       grep -E '^(cpu|Benchmark)' | sed -E 's/-8 +/  /; s/	+/  /g'
   } | shot bench "benchmarks: join methods, sorts, early termination"
+
+  { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
+    shot mutation "mutation testing: break a rule, the tests must fail"
+  ;;
+
+m8)
+  # ORDER BY answered by scans, and grouping in passes on disk, through psql.
+  bash scripts/psql-smoke.sh >/dev/null
+  sed -n '/^-- The table is stored in primary key order/,/^-- Grouping keeps one entry/p' "$CACHE/psql-ordering.out" | sed '$d' |
+    shot order "psql: ORDER BY from the order of a scan"
+  sed -n '/^-- Grouping keeps one entry/,/^set work_mem = .4MB.;/p' "$CACHE/psql-ordering.out" | sed '$d' |
+    shot overflow "psql: GROUP BY, DISTINCT and EXCEPT with 64 kB of memory"
+
+  {
+    echo '$ go test ./internal/engine -v -run "TestOrderFromTheScan|TestHashTablesSpill|TestMemory"'
+    go test -count=1 ./internal/engine -v -run 'TestOrderFromTheScan|TestHashTablesSpill|TestMemory' 2>&1 |
+      grep -vE '^=== ' | sed -E 's/ \([0-9.]+s\)$//; s/\t[0-9.]+s$//; s/^ +[a-z_]+_test.go:[0-9]+: /    /' | fold -s -w 110
+  } | shot tests "ordered scans and overflow: tests, and memory measured"
+
+  {
+    echo '$ go test ./internal/engine -run XXX -bench "FirstRows|OrderByLimit|GroupBy"'
+    go test ./internal/engine -run XXX -bench 'FirstRows|OrderByLimit|GroupBy' -benchtime "${BENCHTIME:-2s}" 2>&1 |
+      grep -E '^(cpu|Benchmark)' | sed -E 's/-8 +/  /; s/\t+/  /g'
+  } | shot bench "benchmarks: ordered scans, grouping in memory and on disk"
 
   { echo '$ scripts/mutation-test.sh'; bash scripts/mutation-test.sh 2>&1; } |
     shot mutation "mutation testing: break a rule, the tests must fail"

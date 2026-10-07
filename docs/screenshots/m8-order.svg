@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="938" height="1210" viewBox="0 0 938 1210" role="img" aria-label="psql: ORDER BY from the order of a scan">
+<rect width="938" height="1210" rx="10" fill="#0d1117"/>
+<path d="M0 10a10 10 0 0 1 10-10h918 a10 10 0 0 1 10 10v24 h-938 z" fill="#161b22"/>
+<circle cx="20" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="40" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="60" cy="17" r="6" fill="#27c93f"/>
+<text x="469" y="22" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" fill="#8b949e">psql: ORDER BY from the order of a scan</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<text x="18" y="66" fill="#8b949e">-- The table is stored in primary key order: nothing to sort, and with a</text>
+<text x="18" y="86" fill="#8b949e">-- LIMIT nothing to read beyond the rows wanted.</text>
+<text x="18" y="106" fill="#e6edf3">explain (analyze, costs off, timing off) select id, price from item order by id limit 3;</text>
+<text x="18" y="126" fill="#e6edf3">                   QUERY PLAN</text>
+<text x="18" y="146" fill="#8b949e">------------------------------------------------</text>
+<text x="18" y="166" fill="#e6edf3"> Limit (actual rows=3 loops=1)</text>
+<text x="18" y="186" fill="#e6edf3">   -&gt;  Seq Scan on item (actual rows=3 loops=1)</text>
+<text x="18" y="206" fill="#e6edf3">(2 rows)</text>
+<text x="18" y="246" fill="#8b949e">-- An index is in the order of its columns. Three entries are read from it</text>
+<text x="18" y="266" fill="#8b949e">-- instead of 8 192 rows being sorted.</text>
+<text x="18" y="286" fill="#e6edf3">explain (analyze, costs off, timing off) select id, price from item order by price limit 3;</text>
+<text x="18" y="306" fill="#e6edf3">                            QUERY PLAN</text>
+<text x="18" y="326" fill="#8b949e">-------------------------------------------------------------------</text>
+<text x="18" y="346" fill="#e6edf3"> Limit (actual rows=3 loops=1)</text>
+<text x="18" y="366" fill="#e6edf3">   -&gt;  Index Scan using item_price on item (actual rows=3 loops=1)</text>
+<text x="18" y="386" fill="#e6edf3">(2 rows)</text>
+<text x="18" y="426" fill="#e6edf3">select id, price from item order by price limit 3;</text>
+<text x="18" y="446" fill="#e6edf3">  id  | price</text>
+<text x="18" y="466" fill="#8b949e">------+-------</text>
+<text x="18" y="486" fill="#e6edf3"> 1000 |     0</text>
+<text x="18" y="506" fill="#e6edf3"> 2000 |     0</text>
+<text x="18" y="526" fill="#e6edf3"> 3000 |     0</text>
+<text x="18" y="546" fill="#e6edf3">(3 rows)</text>
+<text x="18" y="586" fill="#8b949e">-- The column an equality fixes does not count: within one owner, the index</text>
+<text x="18" y="606" fill="#8b949e">-- on (owner, price) is in price order.</text>
+<text x="18" y="626" fill="#e6edf3">explain (analyze, costs off, timing off) select id, price from item where owner = 5 order by price limit 3;</text>
+<text x="18" y="646" fill="#e6edf3">                               QUERY PLAN</text>
+<text x="18" y="666" fill="#8b949e">-------------------------------------------------------------------------</text>
+<text x="18" y="686" fill="#e6edf3"> Limit (actual rows=3 loops=1)</text>
+<text x="18" y="706" fill="#e6edf3">   -&gt;  Index Scan using item_owner_price on item (actual rows=3 loops=1)</text>
+<text x="18" y="726" fill="#e6edf3">         Index Cond: (owner = 5)</text>
+<text x="18" y="746" fill="#e6edf3">(3 rows)</text>
+<text x="18" y="786" fill="#8b949e">-- Without a LIMIT every row is wanted, and going through a secondary index</text>
+<text x="18" y="806" fill="#8b949e">-- for each costs more than scanning and sorting.</text>
+<text x="18" y="826" fill="#e6edf3">explain (costs off) select id, price from item order by price;</text>
+<text x="18" y="846" fill="#e6edf3">       QUERY PLAN</text>
+<text x="18" y="866" fill="#8b949e">------------------------</text>
+<text x="18" y="886" fill="#e6edf3"> Sort</text>
+<text x="18" y="906" fill="#e6edf3">   Sort Key: price</text>
+<text x="18" y="926" fill="#e6edf3">   -&gt;  Seq Scan on item</text>
+<text x="18" y="946" fill="#e6edf3">(3 rows)</text>
+<text x="18" y="986" fill="#8b949e">-- Descending order still sorts (a heap of three rows, but the whole table</text>
+<text x="18" y="1006" fill="#8b949e">-- is read).</text>
+<text x="18" y="1026" fill="#e6edf3">explain (analyze, costs off, timing off) select id, price from item order by price desc limit 3;</text>
+<text x="18" y="1046" fill="#e6edf3">                       QUERY PLAN</text>
+<text x="18" y="1066" fill="#8b949e">---------------------------------------------------------</text>
+<text x="18" y="1086" fill="#e6edf3"> Limit (actual rows=3 loops=1)</text>
+<text x="18" y="1106" fill="#e6edf3">   -&gt;  Sort (actual rows=3 loops=1)</text>
+<text x="18" y="1126" fill="#e6edf3">         Sort Key: price DESC</text>
+<text x="18" y="1146" fill="#e6edf3">         Sort Method: top-N heapsort  Memory: 1kB</text>
+<text x="18" y="1166" fill="#e6edf3">         -&gt;  Seq Scan on item (actual rows=8192 loops=1)</text>
+<text x="18" y="1186" fill="#e6edf3">(5 rows)</text>
+</g>
+</svg>

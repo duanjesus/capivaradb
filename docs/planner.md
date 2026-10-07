@@ -74,6 +74,23 @@ cheaper.
 `UPDATE` and `DELETE` find their rows the same way, so changing one row by
 its key does not read the table.
 
+**Order counts too.** A scan returns rows in the order of the key it reads
+through, and if that is the order the query's `ORDER BY` asks for, the
+sort can be skipped — and with a `LIMIT`, most of the reading. So when a
+query has an `ORDER BY` on plain columns, each way of reading the table is
+costed with what would have to follow it: a sort, if its order is wrong;
+only the first rows, if its order is right and there is a `LIMIT`. An
+index nobody would use to filter can win on those terms:
+
+```sql
+explain select * from orders order by customer_id limit 5;
+--  Limit
+--    ->  Index Scan using orders_customer on orders
+```
+
+[executor.md](executor.md#sorting-and-not-sorting) has the details,
+including why a column that may be NULL does not qualify.
+
 With MVCC an index entry points at a row *version*; whether a reader may
 see it is decided in the table, as for a scan.
 
@@ -266,10 +283,13 @@ sqllogictest matters.
 ## Limitations
 
 - **Left-deep plans only**, and no reordering across an outer join.
-- **One sort order is tracked**: that a scan comes out in primary key
-  order. It lets a merge join skip a sort; nothing else uses it.
-- **Indexes are not used for `ORDER BY`**, for `IN` lists, for `OR`, or to
-  answer a query from the index alone.
+- **Order is used where it is found, not sought across joins.** A scan's
+  order lets a merge join or an `ORDER BY` skip a sort, and for a single
+  table the planner will pick a path for its order. For a join it will
+  not: the join order is chosen without regard to the `ORDER BY`. Only
+  ascending order is used.
+- **Indexes are not used** for `IN` lists, for `OR`, or to answer a query
+  from the index alone.
 - **Statistics are simple**: no histograms, no most-common values, no
   correlation between columns.
 - **Subqueries are not flattened**: a correlated subquery runs once per

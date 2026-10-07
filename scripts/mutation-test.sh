@@ -24,6 +24,14 @@ SELECT=internal/engine/select.go
 EXEC=internal/engine/exec.go
 FILES=("$PAGER" "$RECOVERY" "$MVCC" "$STORE" "$DB" "$PLAN" "$JOIN" "$ITER" "$SELECT" "$EXEC")
 
+# Two runs at once would mutate and restore the same files under each other,
+# and take each other's mutants for the original. One at a time.
+LOCK="$CACHE/mutation.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "another mutation run seems to be in progress ($LOCK exists); remove it if not" >&2
+  exit 2
+fi
+
 BACKUP="$CACHE/mutation"
 mkdir -p "$BACKUP"
 backup_of() { echo "$BACKUP/$(echo "$1" | tr '/' '_')"; }
@@ -31,7 +39,7 @@ for f in "${FILES[@]}"; do cp "$f" "$(backup_of "$f")"; done
 restore() {
   for f in "${FILES[@]}"; do cp "$(backup_of "$f")" "$f"; done
 }
-trap restore EXIT
+trap 'restore; rmdir "$LOCK"' EXIT
 
 survivors=0
 # mutant DESCRIPTION FILE SED-EXPRESSION
@@ -214,8 +222,39 @@ mutant "UNION does not remove duplicates" "$SELECT" \
 mutant "INTERSECT ALL returns a row as often as the left side has it" "$SELECT" \
   's|^\t\t\ts.counts\[string(s.keyBuf)\] = n - 1$|\t\t\ts.counts[string(s.keyBuf)] = n|'
 
-mutant "EXCEPT ignores the right side" "$SELECT" \
-  's|^\t\t\tif !onRight {$|\t\t\tif !onRight \|\| true {|'
+mutant "the rows of the right side of INTERSECT and EXCEPT are not recorded" "$SELECT" \
+  's|^\t\ts.counts\[string(s.keyBuf)\] = 1$|\t\ts.mem++|'
+
+echo
+echo "== order and overflow =="
+# Rows taken as sorted that are not, and rows set aside that are never
+# picked up again.
+TESTS=(go test -count=1 -timeout 180s -run 'TestOrderFromTheScan|TestHashTablesSpill|TestSetOperations|TestOuterJoins' ./internal/engine)
+baseline
+
+mutant "an index is taken to be in ORDER BY order for a column that may be NULL" "$PLAN" \
+  's|^\treturn ok \&\& (nullsFirst \|\| it.table.cols\[tcol\].notNull)$|\treturn ok \&\& (nullsFirst \|\| true \|\| it.table.cols[tcol].notNull)|'
+
+mutant "ORDER BY ... DESC is answered by a scan in ascending order" "$SELECT" \
+  's|if col < 0 \|\| o.Desc \|\| !from.sortable(|if col < 0 \|\| !from.sortable(|'
+
+mutant "a FULL JOIN is taken to keep the order of its outer side" "$PLAN" \
+  's|^\tif spec.kind != joinFull {$|\tif spec.kind != joinFull \|\| true {|'
+
+mutant "an index scan is taken to be sorted by a column an equality did not fix" "$PLAN" \
+  's|^\t\tfor _, col := range cand.cols\[len(a.eq):\] {$|\t\tfor _, col := range cand.cols[min(len(a.eq)+1, len(cand.cols)):] {|'
+
+mutant "the rows of groups that did not fit in memory are dropped" "$SELECT" \
+  's|if err := over.add(keyBuf, row); err != nil {|if err := error(nil); err != nil {|'
+
+mutant "DISTINCT never returns to the rows it set aside" "$SELECT" \
+  's|^\t\t\t\td.pending = append(d.pending, spilled{f, d.depth + 1})$|\t\t\t\tf.remove()|'
+
+mutant "the two sides of a set operation on disk are split by different hashes" "$SELECT" \
+  's|s.rover, err = newOverflow(s.cx.q, s.depth, larger)|s.rover, err = newOverflow(s.cx.q, s.depth+1, larger)|'
+
+mutant "a left row whose equals on the right were set aside is decided without them" "$SELECT" \
+  's|^\t\t\tif s.rover != nil {$|\t\t\tif s.rover != nil \&\& false {|'
 
 echo
 if [ "$survivors" -gt 0 ]; then

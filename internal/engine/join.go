@@ -293,7 +293,21 @@ const (
 	hashEntryOverhead = 64
 )
 
-// partitionOf assigns a key to a partition. depth changes the assignment,
+// fanoutFor chooses into how many files to split something that needs need
+// bytes of memory when workMem is what there is: enough for each part to
+// fit with room to spare, and no more — every file costs a buffer, and a
+// part that fits is done in one pass however small it is. A power of two,
+// so that taking a hash modulo it stays uniform.
+func fanoutFor(need int64, workMem int) int {
+	n := 2
+	for n < hashPartitions && int64(n)*int64(workMem) < 2*need {
+		n *= 2
+	}
+	return n
+}
+
+// partitionOf assigns a key to one of hashPartitions partitions; users with
+// fewer files take it modulo their number. depth changes the assignment,
 // so that splitting a partition again actually spreads it.
 func partitionOf(key []byte, depth int) int {
 	h := fnv.New64a()
@@ -390,7 +404,7 @@ func (h *hashJoinIter) init() error {
 			continue
 		}
 		// Too much for memory: from here on the build side goes to disk.
-		if parts, err = h.newParts(); err != nil {
+		if parts, err = h.newParts(hashPartitions); err != nil {
 			return err
 		}
 		for _, r := range h.rows {
@@ -409,7 +423,7 @@ func (h *hashJoinIter) init() error {
 
 	// The probe side has to be split the same way before any of it can be
 	// joined.
-	probeParts, err := h.newParts()
+	probeParts, err := h.newParts(len(parts))
 	if err != nil {
 		return err
 	}
@@ -430,8 +444,8 @@ func (h *hashJoinIter) init() error {
 	return nil
 }
 
-func (h *hashJoinIter) newParts() ([]*spillFile, error) {
-	parts := make([]*spillFile, hashPartitions)
+func (h *hashJoinIter) newParts(n int) ([]*spillFile, error) {
+	parts := make([]*spillFile, n)
 	for i := range parts {
 		f, err := h.cx.q.newSpill()
 		if err != nil {
@@ -458,7 +472,7 @@ func (h *hashJoinIter) route(parts []*spillFile, row []any, keys []hashKey, dept
 		}
 		return parts[0].write(row)
 	}
-	return parts[partitionOf(key, depth)].write(row)
+	return parts[partitionOf(key, depth)%len(parts)].write(row)
 }
 
 func (h *hashJoinIter) buildTable() error {
@@ -498,7 +512,7 @@ func (h *hashJoinIter) load(pp partPair) error {
 		mem += rowBytes(r) + hashEntryOverhead
 	}
 	if mem > h.cx.q.workMem && pp.depth < hashMaxDepth && len(rows) > 1 {
-		build, err := h.newParts()
+		build, err := h.newParts(fanoutFor(int64(mem), h.cx.q.workMem))
 		if err != nil {
 			return err
 		}
@@ -507,7 +521,7 @@ func (h *hashJoinIter) load(pp partPair) error {
 				return err
 			}
 		}
-		probe, err := h.newParts()
+		probe, err := h.newParts(len(build))
 		if err != nil {
 			return err
 		}

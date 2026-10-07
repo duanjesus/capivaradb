@@ -10,7 +10,7 @@ logging with crash recovery, MVCC transactions, and a query planner and
 executor. **The core has no dependencies outside the Go standard library**;
 CI fails if one is added.
 
-> **Status: all seven planned milestones are done.** Data lives in B+trees
+> **Status: all seven planned milestones are done, and an eighth.** Data lives in B+trees
 > in a page file; a committed transaction survives the server being killed
 > or the power failing; concurrent transactions are isolated from each
 > other by snapshots; queries are planned by cost and run by an iterator
@@ -31,6 +31,7 @@ CI fails if one is added.
 | 5 | MVCC: snapshot isolation, waiting writers, deadlock detection, vacuum, isolation tests | **done** |
 | 6 | Cost-based planner: predicate pushdown, index selection, join ordering, statistics, `EXPLAIN ANALYZE` | **done** |
 | 7 | Volcano executor: streaming cursors, hash and merge joins, external sort, set operations, outer joins | **done** |
+| 8 | `ORDER BY` from the order of a scan; `GROUP BY`, `DISTINCT` and set operations on disk past `work_mem` | **done** |
 
 Details in [docs/roadmap.md](docs/roadmap.md).
 
@@ -148,12 +149,16 @@ of 5.4 ms.
 - A plan runs as a tree of iterators: each step produces a row when asked.
   A result is a cursor, and rows reach the client while the query runs.
 - **Memory is bounded by `work_mem`, not by the data.** A scan holds one
-  batch of rows; sorts and hash joins that need more move to temporary
-  files (external merge sort, Grace hash join). Sorting 40 000 rows holds
-  6.4 MB with room and 0.9 MB with `work_mem = 256kB`.
+  batch of rows; sorts, hash joins, groupings, `DISTINCT` and set
+  operations that need more move to temporary files. Sorting 40 000 rows
+  holds 6.4 MB with room and 0.9 MB with `work_mem = 256kB`; grouping them
+  into 40 000 groups, 12 MB and 0.8 MB.
 - **A query that needs few rows reads few rows**: `LIMIT` stops the scan
   under it, `EXISTS` stops at the first row. `LIMIT 10` on 20 000 rows
   takes 12 µs instead of 5 ms.
+- **`ORDER BY` does not sort when a scan is already in that order** — the
+  table's primary key, or an index. `ORDER BY customer_id LIMIT 10` reads
+  ten index entries: 17 µs, against 7 ms with a sort.
 - A cursor left open keeps reading the state it started in, whatever
   happens meanwhile: its scan holds no lock between batches, only a key,
   and MVCC guarantees the rest.
@@ -161,6 +166,8 @@ of 5.4 ms.
   × 1 000 rows.
 
 ![EXPLAIN ANALYZE of the same query with memory to spare and with almost none](docs/screenshots/m7-work-mem.svg)
+
+![ORDER BY answered by scans, and a GROUP BY done in passes on disk](docs/screenshots/m8-order.svg)
 
 ### Isolation ([details](docs/mvcc.md))
 
@@ -218,7 +225,7 @@ skew; `SHOW transaction_isolation` therefore answers `repeatable read`.
 | **The planner** | 400 random queries each run under ten settings of the planner and executor, down to "exactly as written": the rows must be identical. Plan tests pin the `EXPLAIN` output of representative queries | [docs/planner.md](docs/planner.md) |
 | **The executor** | Known answers for every join kind and set operation; the same sorts and joins on disk and in memory; cursors read while another session deletes and vacuums under them; live heap measured against `work_mem`; no temporary file may outlive its query | [docs/executor.md](docs/executor.md) |
 | **Isolation** | Transcripts of interleaved sessions for each anomaly, deadlocks, unique conflicts and vacuum; concurrent transfers from eight goroutines with readers checking the total at every moment | [docs/mvcc.md](docs/mvcc.md) |
-| The tests themselves | Mutation testing: forty-two ways of breaking the durability and isolation rules, the planner and the executor, each of which the tests must catch | `scripts/mutation-test.sh` |
+| The tests themselves | Mutation testing: fifty ways of breaking the durability and isolation rules, the planner and the executor, each of which the tests must catch | `scripts/mutation-test.sh` |
 | Persistence | Restart tests at the engine level; corruption must be detected by checksum | [internal/engine](internal/engine) |
 | Storage integrity under SQL | The consistency checker runs after every engine test and after each sqllogictest script | `DB.Verify` |
 | The protocol | A raw client written in the test from the specification, asserting exact message sequences | [internal/pgwire](internal/pgwire) |
@@ -264,7 +271,7 @@ rule is broken in turn and the suite must notice. It found three blind
 spots in the crash tests while they were being written, all described in
 [docs/recovery.md](docs/recovery.md).
 
-![mutation testing](docs/screenshots/m7-mutation.svg)
+![mutation testing](docs/screenshots/m8-mutation.svg)
 
 The script found a flaw in itself in the last milestone: a mutant that does
 not compile fails every test without any test having looked at it, and one
@@ -378,14 +385,14 @@ worse than useless.
 - **The planner is simple.** Plans are left-deep and nothing is reordered
   across an outer join. Statistics are row counts, distinct values and
   numeric ranges — no histograms — so estimates on skewed data can be far
-  off. Indexes are not used for `ORDER BY`, `IN` lists or `OR`, so
-  `ORDER BY id LIMIT 10` reads the whole table. Correlated subqueries are
-  re-executed for every outer row, never turned into joins. A prepared
-  statement keeps the plan it was given.
-- **Not every operation spills.** Sorts, hash joins and nested loops are
-  bounded by `work_mem`. `GROUP BY`, `DISTINCT`, `UNION`, `INTERSECT` and
-  `EXCEPT` keep their distinct groups or rows in memory, and `UPDATE` and
-  `DELETE` collect the rows they will change before changing any.
+  off. Indexes are not used for `IN` lists or `OR`. A scan's order is used
+  for `ORDER BY` only ascending, and a join order is never chosen for it.
+  Correlated subqueries are re-executed for every outer row, never turned
+  into joins. A prepared statement keeps the plan it was given.
+- **A few things still do not spill.** `UPDATE` and `DELETE` collect the
+  rows they will change before changing any; `count(DISTINCT x)` keeps
+  its values per group in memory; a hash table whose rows are mostly one
+  key cannot be split by hashing.
 - **Execution is one row at a time**, on one core: no vectorisation, no
   parallel query.
 - **Storage details:** a key (primary key or indexed columns) may be at most
